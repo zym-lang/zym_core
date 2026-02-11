@@ -1,0 +1,104 @@
+#pragma once
+
+#include <stdio.h>
+
+typedef enum {
+    // Single-character tokens.
+    TOKEN_LEFT_PAREN,
+    TOKEN_RIGHT_PAREN,
+    TOKEN_LEFT_BRACE,
+    TOKEN_RIGHT_BRACE,
+    TOKEN_LEFT_BRACKET,
+    TOKEN_RIGHT_BRACKET,
+    TOKEN_COLON,
+    TOKEN_COMMA,
+    TOKEN_DOT,
+    TOKEN_DOT_DOT_DOT,
+    TOKEN_MINUS,
+    TOKEN_PERCENT,
+    TOKEN_PLUS,
+    TOKEN_QUESTION,
+    TOKEN_SEMICOLON,
+    TOKEN_SLASH,
+    TOKEN_STAR,
+    TOKEN_AT,
+
+    // One or two character tokens.
+    TOKEN_BANG,
+    TOKEN_BANG_EQUAL,
+    TOKEN_EQUAL,
+    TOKEN_EQUAL_EQUAL,
+    TOKEN_GREATER,
+    TOKEN_GREATER_EQUAL,
+    TOKEN_LESS,
+    TOKEN_LESS_EQUAL,
+    TOKEN_ARROW,
+    TOKEN_FAT_ARROW,
+    TOKEN_PLUS_PLUS,
+    TOKEN_MINUS_MINUS,
+    TOKEN_PLUS_EQUAL,
+    TOKEN_MINUS_EQUAL,
+    TOKEN_STAR_EQUAL,
+    TOKEN_SLASH_EQUAL,
+    TOKEN_PERCENT_EQUAL,
+    TOKEN_BINARY_AND_EQUAL,
+    TOKEN_BINARY_OR_EQUAL,
+    TOKEN_BINARY_XOR_EQUAL,
+    TOKEN_LEFT_SHIFT_EQUAL,
+    TOKEN_RIGHT_SHIFT_EQUAL,
+    TOKEN_UNSIGNED_RIGHT_SHIFT_EQUAL,
+    TOKEN_LEFT_SHIFT,
+    TOKEN_RIGHT_SHIFT,
+    TOKEN_UNSIGNED_RIGHT_SHIFT,
+
+    // Literals.
+    TOKEN_IDENTIFIER,
+    TOKEN_NUMBER,
+    TOKEN_STRING,
+
+    // Bitwise operators.
+    TOKEN_BINARY_AND,
+    TOKEN_BINARY_OR,
+    TOKEN_BINARY_XOR,
+    TOKEN_BINARY_NOT,
+
+    // Zym Keywords (alphabetical)
+    TOKEN_AND,
+    TOKEN_BITWISE,
+    TOKEN_BREAK,
+    TOKEN_CASE,
+    TOKEN_CLONE,
+    TOKEN_CONTINUE,
+    TOKEN_DEFAULT,
+    TOKEN_DO,
+    TOKEN_ELSE,
+    TOKEN_ENUM,
+    TOKEN_FALSE,
+    TOKEN_FOR,
+    TOKEN_FUNC,
+    TOKEN_GOTO,
+    TOKEN_IF,
+    TOKEN_NULL,
+    TOKEN_OR,
+    TOKEN_REF,
+    TOKEN_RETURN,
+    TOKEN_SLOT,
+    TOKEN_STRUCT,
+    TOKEN_SWITCH,
+    TOKEN_TRUE,
+    TOKEN_TYPEOF,
+    TOKEN_VAL,
+    TOKEN_VAR,
+    TOKEN_WHILE,
+
+    // Special tokens.
+    TOKEN_ERROR,
+    TOKEN_EOF
+  } TokenType;
+
+typedef struct {
+    TokenType type;
+    const char* start;
+    int length;
+    int line;
+} Token;
