@@ -5,8 +5,6 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
-#include "./config.h"
-
 // =============================================================================
 // CORE TYPES
 // =============================================================================
@@ -14,8 +12,11 @@
 typedef struct VM ZymVM;
 typedef struct Chunk ZymChunk;
 typedef struct LineMap ZymLineMap;
-typedef struct CompilerConfig ZymCompilerConfig;
 typedef uint64_t ZymValue;
+
+typedef struct CompilerConfig {
+    bool include_line_info;
+} ZymCompilerConfig;
 
 typedef enum {
     ZYM_STATUS_OK,
@@ -130,6 +131,10 @@ bool zym_isStruct(ZymValue value);
 bool zym_isEnum(ZymValue value);
 bool zym_isFunction(ZymValue value);
 bool zym_isReference(ZymValue value);
+bool zym_isNativeReference(ZymValue value);
+bool zym_isClosure(ZymValue value);
+bool zym_isPromptTag(ZymValue value);
+bool zym_isContinuation(ZymValue value);
 
 // =============================================================================
 // VALUE EXTRACTION (SAFE)
@@ -150,6 +155,30 @@ bool zym_toStringBytes(ZymValue value, const char** out, int* byte_length); // R
 double zym_asNumber(ZymValue value);
 bool zym_asBool(ZymValue value);
 const char* zym_asCString(ZymValue value);  // Null-terminated, VM-owned
+
+// =============================================================================
+// VALUE INSPECTION
+// =============================================================================
+
+// Get the type name of a value as a string (e.g. "string", "number", "list")
+const char* zym_typeName(ZymValue value);
+
+// Get string length in UTF-8 characters (assumes value is a string)
+int zym_stringLength(ZymValue value);
+
+// Get string length in bytes (assumes value is a string)
+int zym_stringByteLength(ZymValue value);
+
+// =============================================================================
+// VALUE DISPLAY
+// =============================================================================
+
+// Convert any value to its string representation (like the VM's print output)
+// Returns a VM-managed ZymValue string. Returns ZYM_ERROR on failure.
+ZymValue zym_valueToString(ZymVM* vm, ZymValue value);
+
+// Print any value to stdout (same format as the VM's print statement)
+void zym_printValue(ZymVM* vm, ZymValue value);
 
 // =============================================================================
 // VALUE CREATION

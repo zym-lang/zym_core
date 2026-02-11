@@ -1,8 +1,8 @@
 #pragma once
-
 #include <stdio.h>
-#include "./chunk.h"
 
-void disassembleChunk(Chunk* chunk, const char* name);
-void disassembleChunkToFile(Chunk* chunk, const char* name, FILE* file);
-int disassembleInstruction(Chunk* chunk, int offset);
+typedef struct Chunk ZymChunk;
+
+void disassembleChunk(ZymChunk* chunk, const char* name);
+void disassembleChunkToFile(ZymChunk* chunk, const char* name, FILE* file);
+int disassembleInstruction(ZymChunk* chunk, int offset);

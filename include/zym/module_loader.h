@@ -1,21 +1,20 @@
 #pragma once
-
 #include <stdbool.h>
 #include <stddef.h>
 
-typedef struct VM VM;
-typedef struct LineMap LineMap;
+typedef struct VM ZymVM;
+typedef struct LineMap ZymLineMap;
 
 typedef struct {
     char* source;
-    LineMap* line_map;
+    ZymLineMap* line_map;
 } ModuleReadResult;
 
 typedef ModuleReadResult (*ModuleReadCallback)(const char* path, void* user_data);
 
 typedef struct {
     char* combined_source;
-    LineMap* line_map;
+    ZymLineMap* line_map;
     char** module_paths;
     int module_count;
     bool has_error;
@@ -23,9 +22,9 @@ typedef struct {
 } ModuleLoadResult;
 
 ModuleLoadResult* loadModules(
-    VM* vm,
+    ZymVM* vm,
     const char* entry_source,
-    LineMap* entry_line_map,
+    ZymLineMap* entry_line_map,
     const char* entry_path,
     ModuleReadCallback read_callback,
     void* user_data,
@@ -34,4 +33,4 @@ ModuleLoadResult* loadModules(
     const char* debug_output_path
 );
 
-void freeModuleLoadResult(VM* vm, ModuleLoadResult* result);
+void freeModuleLoadResult(ZymVM* vm, ModuleLoadResult* result);

@@ -334,6 +334,10 @@ bool zym_isFunction(ZymValue value) {
     return IS_FUNCTION(value) || IS_CLOSURE(value) || IS_NATIVE_FUNCTION(value) || IS_NATIVE_CLOSURE(value);
 }
 bool zym_isReference(ZymValue value) { return IS_REFERENCE(value); }
+bool zym_isNativeReference(ZymValue value) { return IS_OBJ(value) && IS_NATIVE_REFERENCE(value); }
+bool zym_isClosure(ZymValue value) { return IS_CLOSURE(value); }
+bool zym_isPromptTag(ZymValue value) { return IS_OBJ(value) && IS_PROMPT_TAG(value); }
+bool zym_isContinuation(ZymValue value) { return IS_OBJ(value) && IS_CONTINUATION(value); }
 
 // =============================================================================
 // VALUE EXTRACTION (SAFE)
@@ -374,6 +378,274 @@ bool zym_toStringBytes(ZymValue value, const char** out, int* byte_length) {
 double zym_asNumber(ZymValue value) { return AS_DOUBLE(value); }
 bool zym_asBool(ZymValue value) { return AS_BOOL(value); }
 const char* zym_asCString(ZymValue value) { return AS_CSTRING(value); }
+
+// =============================================================================
+// VALUE INSPECTION
+// =============================================================================
+
+const char* zym_typeName(ZymValue value) {
+    if (IS_NULL(value)) return "null";
+    if (IS_BOOL(value)) return "bool";
+    if (IS_DOUBLE(value)) return "number";
+    if (IS_ENUM(value)) return "enum";
+    if (IS_OBJ(value)) {
+        Obj* obj = AS_OBJ(value);
+        switch (obj->type) {
+            case OBJ_STRING: return "string";
+            case OBJ_LIST: return "list";
+            case OBJ_MAP: return "map";
+            case OBJ_FUNCTION: return "function";
+            case OBJ_CLOSURE: return "closure";
+            case OBJ_NATIVE_FUNCTION: return "native_function";
+            case OBJ_NATIVE_CLOSURE: return "native_closure";
+            case OBJ_NATIVE_CONTEXT: return "native_context";
+            case OBJ_NATIVE_REFERENCE: return "native_reference";
+            case OBJ_REFERENCE: return "reference";
+            case OBJ_PROMPT_TAG: return "prompt_tag";
+            case OBJ_CONTINUATION: return "continuation";
+            case OBJ_STRUCT_SCHEMA: return "struct_schema";
+            case OBJ_STRUCT_INSTANCE: return "struct";
+            case OBJ_ENUM_SCHEMA: return "enum_schema";
+            case OBJ_DISPATCHER: return "dispatcher";
+            default: return "unknown";
+        }
+    }
+    return "unknown";
+}
+
+int zym_stringLength(ZymValue value) {
+    if (!IS_STRING(value)) return 0;
+    return AS_STRING(value)->length;
+}
+
+int zym_stringByteLength(ZymValue value) {
+    if (!IS_STRING(value)) return 0;
+    return AS_STRING(value)->byte_length;
+}
+
+// =============================================================================
+// VALUE DISPLAY
+// =============================================================================
+
+// Internal helper: write value to a dynamically growing buffer
+static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_size, size_t* pos, Obj** visited, int depth) {
+    char temp[256];
+
+    if (depth >= 100) {
+        size_t need = 3;
+        while (*pos + need >= *buf_size) { *buf_size *= 2; *buffer = realloc(*buffer, *buf_size); if (!*buffer) return false; }
+        memcpy(*buffer + *pos, "...", 3); *pos += 3;
+        return true;
+    }
+
+#define APPEND(s, n) do { \
+    size_t _n = (n); \
+    while (*pos + _n >= *buf_size) { *buf_size *= 2; *buffer = realloc(*buffer, *buf_size); if (!*buffer) return false; } \
+    memcpy(*buffer + *pos, (s), _n); *pos += _n; \
+} while(0)
+
+    if (IS_NULL(value)) {
+        APPEND("null", 4);
+    } else if (IS_BOOL(value)) {
+        const char* s = AS_BOOL(value) ? "true" : "false";
+        APPEND(s, strlen(s));
+    } else if (IS_ENUM(value)) {
+        int type_id = ENUM_TYPE_ID(value);
+        int variant_idx = ENUM_VARIANT(value);
+        if (vm != NULL) {
+            ObjEnumSchema* schema = NULL;
+            for (int i = 0; i < vm->globals.capacity; i++) {
+                Entry* entry = &vm->globals.entries[i];
+                if (entry->key != NULL && IS_OBJ(entry->value) && IS_ENUM_SCHEMA(entry->value)) {
+                    ObjEnumSchema* candidate = AS_ENUM_SCHEMA(entry->value);
+                    if (candidate->type_id == type_id) { schema = candidate; break; }
+                }
+            }
+            if (schema != NULL && variant_idx >= 0 && variant_idx < schema->variant_count) {
+                ObjString* vname = schema->variant_names[variant_idx];
+                int len = snprintf(temp, sizeof(temp), "%.*s.%.*s",
+                    schema->name->length, schema->name->chars,
+                    vname->length, vname->chars);
+                APPEND(temp, len);
+            } else {
+                int len = snprintf(temp, sizeof(temp), "<enum#%d.%d>", type_id, variant_idx);
+                APPEND(temp, len);
+            }
+        } else {
+            int len = snprintf(temp, sizeof(temp), "<enum#%d.%d>", type_id, variant_idx);
+            APPEND(temp, len);
+        }
+    } else if (IS_DOUBLE(value)) {
+        double num = AS_DOUBLE(value);
+        int len;
+        if (num == (long long)num && num >= -1e15 && num <= 1e15) {
+            len = snprintf(temp, sizeof(temp), "%.0f", num);
+        } else {
+            len = snprintf(temp, sizeof(temp), "%g", num);
+        }
+        APPEND(temp, len);
+    } else if (IS_OBJ(value)) {
+        Obj* obj = AS_OBJ(value);
+
+        for (int i = 0; i < depth; i++) {
+            if (visited[i] == obj) { APPEND("...", 3); return true; }
+        }
+        visited[depth] = obj;
+
+        switch (obj->type) {
+            case OBJ_STRING: {
+                ObjString* str = AS_STRING(value);
+                APPEND(str->chars, str->byte_length);
+                break;
+            }
+            case OBJ_LIST: {
+                ObjList* list = AS_LIST(value);
+                APPEND("[", 1);
+                for (int i = 0; i < list->items.count; i++) {
+                    if (i > 0) APPEND(", ", 2);
+                    if (!valueToStringHelper(vm, list->items.values[i], buffer, buf_size, pos, visited, depth + 1)) return false;
+                }
+                APPEND("]", 1);
+                break;
+            }
+            case OBJ_MAP: {
+                ObjMap* map = AS_MAP(value);
+                APPEND("{", 1);
+                int printed = 0;
+                for (int i = 0; i < map->table->capacity; i++) {
+                    Entry* entry = &map->table->entries[i];
+                    if (entry->key != NULL) {
+                        if (printed > 0) APPEND(", ", 2);
+                        APPEND("\"", 1);
+                        APPEND(entry->key->chars, entry->key->byte_length);
+                        APPEND("\": ", 3);
+                        if (!valueToStringHelper(vm, entry->value, buffer, buf_size, pos, visited, depth + 1)) return false;
+                        printed++;
+                    }
+                }
+                APPEND("}", 1);
+                break;
+            }
+            case OBJ_FUNCTION: {
+                ObjFunction* fn = AS_FUNCTION(value);
+                int len;
+                if (fn->name) len = snprintf(temp, sizeof(temp), "<fn %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
+                else len = snprintf(temp, sizeof(temp), "<fn /%d>", fn->arity);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_CLOSURE: {
+                ObjFunction* fn = AS_CLOSURE(value)->function;
+                int len;
+                if (fn->name) len = snprintf(temp, sizeof(temp), "<closure %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
+                else len = snprintf(temp, sizeof(temp), "<closure /%d>", fn->arity);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_NATIVE_FUNCTION: {
+                ObjNativeFunction* native = AS_NATIVE_FUNCTION(value);
+                int len;
+                if (native->name) len = snprintf(temp, sizeof(temp), "<native fn %.*s/%d>", native->name->length, native->name->chars, native->arity);
+                else len = snprintf(temp, sizeof(temp), "<native fn /%d>", native->arity);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_NATIVE_CONTEXT: {
+                APPEND("<native context>", 16);
+                break;
+            }
+            case OBJ_NATIVE_CLOSURE: {
+                ObjNativeClosure* closure = AS_NATIVE_CLOSURE(value);
+                int len;
+                if (closure->name) len = snprintf(temp, sizeof(temp), "<native closure %.*s/%d>", closure->name->length, closure->name->chars, closure->arity);
+                else len = snprintf(temp, sizeof(temp), "<native closure /%d>", closure->arity);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_REFERENCE:
+            case OBJ_NATIVE_REFERENCE: {
+                Value deref_value;
+                if (dereferenceValue(vm, value, &deref_value)) {
+                    if (!valueToStringHelper(vm, deref_value, buffer, buf_size, pos, visited, depth + 1)) return false;
+                } else {
+                    const char* msg = obj->type == OBJ_REFERENCE ? "<undefined ref>" : "<dead native ref>";
+                    APPEND(msg, strlen(msg));
+                }
+                break;
+            }
+            case OBJ_STRUCT_INSTANCE: {
+                ObjStructInstance* inst = AS_STRUCT_INSTANCE(value);
+                ObjStructSchema* schema = inst->schema;
+                APPEND(schema->name->chars, schema->name->byte_length);
+                APPEND(" { ", 3);
+                for (int i = 0; i < schema->field_count; i++) {
+                    if (i > 0) APPEND(", ", 2);
+                    APPEND(schema->field_names[i]->chars, schema->field_names[i]->byte_length);
+                    APPEND(": ", 2);
+                    if (!valueToStringHelper(vm, inst->fields[i], buffer, buf_size, pos, visited, depth + 1)) return false;
+                }
+                APPEND(" }", 2);
+                break;
+            }
+            case OBJ_PROMPT_TAG: {
+                ObjPromptTag* tag = AS_PROMPT_TAG(value);
+                int len;
+                if (tag->name != NULL) len = snprintf(temp, sizeof(temp), "<prompt_tag: %.*s>", tag->name->length, tag->name->chars);
+                else len = snprintf(temp, sizeof(temp), "<prompt_tag #%u>", tag->id);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_CONTINUATION: {
+                ObjContinuation* cont = AS_CONTINUATION(value);
+                const char* state_str = "valid";
+                if (cont->state == CONT_CONSUMED) state_str = "consumed";
+                else if (cont->state == CONT_INVALID) state_str = "invalid";
+                int len = snprintf(temp, sizeof(temp), "<continuation: %s>", state_str);
+                APPEND(temp, len);
+                break;
+            }
+            case OBJ_DISPATCHER: {
+                APPEND("<dispatcher>", 12);
+                break;
+            }
+            default: {
+                int len = snprintf(temp, sizeof(temp), "<object>");
+                APPEND(temp, len);
+                break;
+            }
+        }
+    } else {
+        APPEND("<unknown>", 9);
+    }
+
+#undef APPEND
+    return true;
+}
+
+ZymValue zym_valueToString(ZymVM* vm, ZymValue value) {
+    if (vm == NULL) return ZYM_ERROR;
+
+    size_t buf_size = 256;
+    char* buffer = malloc(buf_size);
+    if (buffer == NULL) return ZYM_ERROR;
+
+    size_t pos = 0;
+    Obj* visited[100] = {0};
+
+    if (!valueToStringHelper(vm, value, &buffer, &buf_size, &pos, visited, 0)) {
+        free(buffer);
+        return ZYM_ERROR;
+    }
+
+    buffer[pos] = '\0';
+    ZymValue result = zym_newString(vm, buffer);
+    free(buffer);
+    return result;
+}
+
+void zym_printValue(ZymVM* vm, ZymValue value) {
+    printValue(vm, value);
+}
 
 // =============================================================================
 // VALUE CREATION
