@@ -82,6 +82,7 @@ void initVM(VM* vm) {
     vm->preemption_enabled = false;
 
     vm->resume_depth = 0;
+    vm->with_prompt_depth = 0;
 
     vm->gc_enabled = true;
 
@@ -3802,6 +3803,16 @@ static InterpretResult run(VM* vm) {
 
         // Now pop the callee frame
         vm->frame_count--;
+
+        // Check if we're returning from a withPrompt boundary frame
+        // If so, auto-pop the prompt that withPrompt installed
+        if (vm->with_prompt_depth > 0) {
+            WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
+            if (vm->frame_count == wpc->frame_boundary) {
+                popPrompt(vm);
+                vm->with_prompt_depth--;
+            }
+        }
 
         // Check if we're returning from a resumed continuation's boundary frame
         // If so, redirect the return value to where resume() expects it

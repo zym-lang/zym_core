@@ -34,6 +34,7 @@
 #define MAX_PROMPTS 32
 #define DEFAULT_TIMESLICE 10000
 #define MAX_RESUME_DEPTH 16
+#define MAX_WITH_PROMPT_DEPTH 16
 
 typedef struct ObjPromptTag ObjPromptTag;
 
@@ -55,6 +56,10 @@ typedef struct {
     int frame_boundary;
     int result_slot;
 } ResumeContext;
+
+typedef struct {
+    int frame_boundary;
+} WithPromptContext;
 
 typedef struct VM {
     Chunk* chunk;
@@ -103,6 +108,9 @@ typedef struct VM {
 
     ResumeContext resume_stack[MAX_RESUME_DEPTH];
     int resume_depth;
+
+    WithPromptContext with_prompt_stack[MAX_WITH_PROMPT_DEPTH];
+    int with_prompt_depth;
 } VM;
 
 typedef enum {

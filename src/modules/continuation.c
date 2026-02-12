@@ -256,10 +256,107 @@ static ZymValue cont_popPrompt_native(ZymVM* vm, ZymValue context) {
 
 static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymValue fn) {
     (void)zym_getNativeData(context);
-    (void)tag;
-    (void)fn;
-    zym_runtimeError(vm, "Cont.withPrompt not yet implemented - use pushPrompt/popPrompt for manual control.");
-    return ZYM_ERROR;
+
+    if (!IS_PROMPT_TAG(tag)) {
+        zym_runtimeError(vm, "Cont.withPrompt: first argument must be a prompt tag.");
+        return ZYM_ERROR;
+    }
+
+    if (!IS_CLOSURE(fn)) {
+        zym_runtimeError(vm, "Cont.withPrompt: second argument must be a function.");
+        return ZYM_ERROR;
+    }
+
+    ObjPromptTag* promptTag = AS_PROMPT_TAG(tag);
+    ObjClosure* closure = AS_CLOSURE(fn);
+    ObjFunction* function = closure->function;
+
+    if (function->arity != 0) {
+        zym_runtimeError(vm, "Cont.withPrompt: function must take 0 arguments, got %d.", function->arity);
+        return ZYM_ERROR;
+    }
+
+    // Decode the CALL instruction to find the callee_slot (where the result should go)
+    int callee_slot = -1;
+    if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
+        uint32_t prev_instr = *(vm->ip - 1);
+        int opcode = prev_instr & 0xFF;
+
+        if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
+            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            int result_reg = (prev_instr >> 8) & 0xFF;
+            int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
+            callee_slot = frame_base + result_reg;
+        }
+    }
+
+    if (callee_slot < 0) {
+        zym_runtimeError(vm, "Cont.withPrompt: could not determine call context.");
+        return ZYM_ERROR;
+    }
+
+    if (vm->frame_count >= FRAMES_MAX) {
+        zym_runtimeError(vm, "Cont.withPrompt: stack overflow (max call depth reached).");
+        return ZYM_ERROR;
+    }
+
+    if (vm->with_prompt_depth >= MAX_WITH_PROMPT_DEPTH) {
+        zym_runtimeError(vm, "Cont.withPrompt: maximum nesting depth exceeded.");
+        return ZYM_ERROR;
+    }
+
+    // Ensure stack is large enough for fn's registers
+    int needed_top = callee_slot + function->max_regs;
+    if (needed_top > STACK_MAX) {
+        zym_runtimeError(vm, "Cont.withPrompt: stack overflow.");
+        return ZYM_ERROR;
+    }
+    if (needed_top > vm->stack_capacity) {
+        int new_capacity = vm->stack_capacity;
+        while (new_capacity < needed_top) {
+            new_capacity *= 2;
+            if (new_capacity > STACK_MAX) {
+                new_capacity = STACK_MAX;
+                break;
+            }
+        }
+        Value* old_stack = vm->stack;
+        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
+        vm->stack_capacity = new_capacity;
+        if (old_stack != vm->stack) {
+            updateStackReferences(vm, old_stack, vm->stack);
+        }
+    }
+
+    // Place the closure at the callee slot
+    vm->stack[callee_slot] = fn;
+
+    // Push the prompt (records current frame_count and stack_top)
+    if (!pushPrompt(vm, promptTag)) {
+        return ZYM_ERROR;
+    }
+
+    // Record the withPrompt boundary so OP(RET) can auto-pop the prompt
+    vm->with_prompt_stack[vm->with_prompt_depth].frame_boundary = vm->frame_count;
+    vm->with_prompt_depth++;
+
+    // Push a call frame for fn (same as OP(CALL))
+    CallFrame* frame = &vm->frames[vm->frame_count++];
+    frame->closure = closure;
+    frame->ip = vm->ip;
+    frame->stack_base = callee_slot;
+    frame->caller_chunk = vm->chunk;
+
+    // Enter fn
+    vm->chunk = function->chunk;
+    vm->ip = function->chunk->code;
+
+    // Update stack_top to cover fn's registers
+    if (needed_top > vm->stack_top) {
+        vm->stack_top = needed_top;
+    }
+
+    return ZYM_CONTROL_TRANSFER;
 }
 
 static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
@@ -319,6 +416,12 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
     }
 
     popPrompt(vm);
+
+    // Clean up any withPrompt contexts invalidated by the unwind
+    while (vm->with_prompt_depth > 0 &&
+           vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
+        vm->with_prompt_depth--;
+    }
 
     if (vm->resume_depth > 0) {
         ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
@@ -449,6 +552,12 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     }
 
     popPrompt(vm);
+
+    // Clean up any withPrompt contexts invalidated by the unwind
+    while (vm->with_prompt_depth > 0 &&
+           vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
+        vm->with_prompt_depth--;
+    }
 
     if (vm->resume_depth > 0) {
         ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
