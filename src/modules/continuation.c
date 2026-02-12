@@ -591,6 +591,172 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     return ZYM_CONTROL_TRANSFER;
 }
 
+static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymValue handler) {
+    (void)zym_getNativeData(context);
+
+    if (!IS_PROMPT_TAG(tag_val)) {
+        zym_runtimeError(vm, "Cont.shift: first argument must be a prompt tag.");
+        return ZYM_ERROR;
+    }
+
+    if (!IS_CLOSURE(handler)) {
+        zym_runtimeError(vm, "Cont.shift: second argument must be a function.");
+        return ZYM_ERROR;
+    }
+
+    ObjClosure* handler_closure = AS_CLOSURE(handler);
+    ObjFunction* handler_fn = handler_closure->function;
+
+    if (handler_fn->arity != 1) {
+        zym_runtimeError(vm, "Cont.shift: handler must take 1 argument (the continuation), got %d.", handler_fn->arity);
+        return ZYM_ERROR;
+    }
+
+    ObjPromptTag* tag = AS_PROMPT_TAG(tag_val);
+
+    PromptEntry* prompt = findPrompt(vm, tag);
+    if (prompt == NULL) {
+        zym_runtimeError(vm, "Cont.shift: prompt tag not found.");
+        return ZYM_ERROR;
+    }
+
+    // Decode the return slot for the continuation (same as capture)
+    int return_slot = 0;
+    if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
+        uint32_t prev_instr = *(vm->ip - 1);
+        int opcode = prev_instr & 0xFF;
+
+        if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
+            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            int result_reg = (prev_instr >> 8) & 0xFF;
+            int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
+            int absolute_slot = frame_base + result_reg;
+
+            return_slot = absolute_slot - prompt->stack_base;
+        }
+    }
+
+    // Capture the continuation (same mechanics as cont_capture)
+    ObjContinuation* cont = captureContinuation(vm, tag, return_slot);
+    if (cont == NULL) {
+        return ZYM_ERROR;
+    }
+
+    // Protect cont and handler from GC during stack manipulation
+    pushTempRoot(vm, (Obj*)cont);
+    pushTempRoot(vm, (Obj*)handler_closure);
+
+    // Unwind to the prompt boundary
+    vm->frame_count = prompt->frame_index;
+    vm->stack_top = prompt->stack_base;
+
+    // Restore ip/chunk from the first unwound frame
+    if (cont->frame_count > 0) {
+        CallFrame* captured_frame = &cont->frames[0];
+        vm->ip = captured_frame->ip;
+        vm->chunk = captured_frame->caller_chunk;
+
+        if (vm->chunk == NULL && vm->frame_count > 0) {
+            vm->chunk = vm->frames[vm->frame_count - 1].closure->function->chunk;
+        }
+    } else if (vm->frame_count > 0) {
+        CallFrame* frame = &vm->frames[vm->frame_count - 1];
+        vm->ip = frame->ip;
+        vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
+    }
+
+    // Pop the prompt
+    popPrompt(vm);
+
+    // Clean up any withPrompt contexts invalidated by the unwind
+    while (vm->with_prompt_depth > 0 &&
+           vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
+        vm->with_prompt_depth--;
+    }
+
+    // NOTE: We intentionally do NOT handle resume_depth here.
+    // The handler runs as a normal function call. When it returns via OP(RET),
+    // the resume boundary check in OP(RET) will fire naturally and redirect
+    // the handler's return value to the correct resume result slot.
+
+    // Decode callee_slot at the prompt boundary (where handler's result should go)
+    int callee_slot = -1;
+    if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
+        uint32_t prev_instr = *(vm->ip - 1);
+        int opcode = prev_instr & 0xFF;
+
+        if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
+            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            int result_reg = (prev_instr >> 8) & 0xFF;
+            int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
+            callee_slot = frame_base + result_reg;
+        }
+    }
+
+    if (callee_slot < 0) {
+        popTempRoot(vm);  // handler_closure
+        popTempRoot(vm);  // cont
+        zym_runtimeError(vm, "Cont.shift: could not determine call context at prompt boundary.");
+        return ZYM_ERROR;
+    }
+
+    if (vm->frame_count >= FRAMES_MAX) {
+        popTempRoot(vm);  // handler_closure
+        popTempRoot(vm);  // cont
+        zym_runtimeError(vm, "Cont.shift: stack overflow (max call depth reached).");
+        return ZYM_ERROR;
+    }
+
+    // Ensure stack is large enough for handler's registers
+    int needed_top = callee_slot + handler_fn->max_regs;
+    if (needed_top > STACK_MAX) {
+        popTempRoot(vm);  // handler_closure
+        popTempRoot(vm);  // cont
+        zym_runtimeError(vm, "Cont.shift: stack overflow.");
+        return ZYM_ERROR;
+    }
+    if (needed_top > vm->stack_capacity) {
+        int new_capacity = vm->stack_capacity;
+        while (new_capacity < needed_top) {
+            new_capacity *= 2;
+            if (new_capacity > STACK_MAX) {
+                new_capacity = STACK_MAX;
+                break;
+            }
+        }
+        Value* old_stack = vm->stack;
+        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
+        vm->stack_capacity = new_capacity;
+        if (old_stack != vm->stack) {
+            updateStackReferences(vm, old_stack, vm->stack);
+        }
+    }
+
+    // Place handler closure and continuation argument
+    vm->stack[callee_slot] = handler;
+    vm->stack[callee_slot + 1] = OBJ_VAL(cont);
+
+    popTempRoot(vm);  // handler_closure
+    popTempRoot(vm);  // cont
+
+    // Push call frame for handler (same pattern as OP(CALL))
+    CallFrame* frame = &vm->frames[vm->frame_count++];
+    frame->closure = handler_closure;
+    frame->ip = vm->ip;
+    frame->stack_base = callee_slot;
+    frame->caller_chunk = vm->chunk;
+
+    // Enter handler
+    vm->chunk = handler_fn->chunk;
+    vm->ip = handler_fn->chunk->code;
+
+    if (needed_top > vm->stack_top) {
+        vm->stack_top = needed_top;
+    }
+
+    return ZYM_CONTROL_TRANSFER;
+}
+
 // ============================================================================
 // Module Factory
 // ============================================================================
@@ -638,6 +804,9 @@ ZymValue nativeCont_create(ZymVM* vm) {
     ZymValue abort_closure = zym_createNativeClosure(vm, "abort(tag, value)", (void*)cont_abort, context);
     zym_pushRoot(vm, abort_closure);
 
+    ZymValue shift_closure = zym_createNativeClosure(vm, "shift(tag, handler)", (void*)cont_shift, context);
+    zym_pushRoot(vm, shift_closure);
+
     ZymValue newPrompt_dispatcher = zym_createDispatcher(vm);
     zym_pushRoot(vm, newPrompt_dispatcher);
     zym_addOverload(vm, newPrompt_dispatcher, newPrompt_0);
@@ -656,8 +825,9 @@ ZymValue nativeCont_create(ZymVM* vm) {
     zym_mapSet(vm, obj, "capture", capture);
     zym_mapSet(vm, obj, "resume", resume);
     zym_mapSet(vm, obj, "abort", abort_closure);
+    zym_mapSet(vm, obj, "shift", shift_closure);
 
-    for (int i = 0; i < 14; i++) {
+    for (int i = 0; i < 15; i++) {
         zym_popRoot(vm);
     }
 
