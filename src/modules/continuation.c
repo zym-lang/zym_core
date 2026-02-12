@@ -112,8 +112,6 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         return false;
     }
 
-    cont->state = CONT_CONSUMED;
-
     if (vm->frame_count + cont->frame_count > FRAMES_MAX) {
         runtimeError(vm, "Stack overflow: resuming continuation would exceed frame limit.");
         return false;
@@ -144,6 +142,9 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
             updateStackReferences(vm, old_stack, vm->stack);
         }
     }
+
+    // Mark consumed only after all precondition checks have passed.
+    cont->state = CONT_CONSUMED;
 
     int restore_base = vm->stack_top;
 
@@ -366,7 +367,7 @@ static ZymValue cont_resume(ZymVM* vm, ZymValue context, ZymValue continuation, 
         return ZYM_ERROR;
     }
 
-    int resume_result_slot = 0;
+    int resume_result_slot = -1;
     if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
         uint32_t prev_instr = *(vm->ip - 1);
         int opcode = prev_instr & 0xFF;
@@ -377,6 +378,11 @@ static ZymValue cont_resume(ZymVM* vm, ZymValue context, ZymValue continuation, 
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             resume_result_slot = frame_base + result_reg;
         }
+    }
+
+    if (resume_result_slot < 0) {
+        zym_runtimeError(vm, "Cont.resume must be called in a value position (as part of a call expression).");
+        return ZYM_ERROR;
     }
 
     uint32_t* resume_return_ip = vm->ip;
