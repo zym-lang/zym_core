@@ -3,13 +3,13 @@
   <p align="center"><strong>Control without the ceremony.</strong></p>
   <p align="center"><em>Fast. Simple. Powerful.</em></p>
   <p align="center">
-    A control-oriented embeddable scripting language with explicit memory semantics,<br>
-    first-class continuations, and script-directed tail-call optimization —<br>
-    built as a compact C runtime for performance-sensitive and embedded environments.
+    A compact embeddable scripting core for systems that need control where it matters.
   </p>
 </p>
 
 ---
+
+If you've written JavaScript, Python, or Lua, Zym reads like you'd expect.
 
 ```javascript
 func fibonacci(n) {
@@ -21,7 +21,7 @@ print(fibonacci(30));
 ```
 
 ```javascript
-// First-class functions and closures
+// closures, naturally
 func makeGreeter(greeting) {
     return func(name) {
         print(greeting + ", " + name + "!");
@@ -33,7 +33,7 @@ hello("world");  // Hello, world!
 ```
 
 ```javascript
-// Structs, enums, and pattern-like control flow
+// structs, enums, first-class
 struct Point { x, y }
 
 var p = Point(3, 4);
@@ -45,7 +45,7 @@ var c = Color.Red;
 ```
 
 ```javascript
-// Real memory semantics — ref, slot, and val parameter modifiers
+// memory semantics, the distinction is observable
 func makeMachine() {
     var total = 0
     var totalRef = ref total
@@ -76,7 +76,7 @@ assert(m.total() == 12,    "ref chain updated total")
 ```
 
 ```javascript
-// Cooperative fibers via delimited continuations
+// cooperative fibers, all from continuations
 var tag = Cont.newPrompt("fiber");
 
 func yield() {
@@ -93,7 +93,7 @@ func worker(name) {
 ```
 
 ```javascript
-// Continuations + forced TCO + ref — working together
+// continuations, TCO, and ref, working together
 var TAG = Cont.newPrompt("cap-val-nested");
 
 @tco aggressive
@@ -122,18 +122,17 @@ assert(base == 15, "nested capture value delivered");
 
 ## Why Zym?
 
-- **Embeddable** — Drop a single static library into any C or C++ project. Clean API, no global state, no dependencies beyond the C standard library.
-- **Small** — The entire language fits in a compact codebase. Minimal footprint for embedded and resource-constrained environments.
-- **Familiar syntax** — If you know JavaScript, Python, or Lua, you already know most of Zym.
-- **Rich built-in types** — Strings (UTF-8), lists, maps, structs, and enums are all first-class.
-- **First-class functions** — Closures, higher-order functions, and anonymous functions are natural and lightweight.
-- **Real memory semantics** — `ref`, `slot`, and `val` parameter modifiers give precise control over how values flow between caller and callee. References are first-class and composable.
-- **Delimited continuations** — Build fibers, coroutines, generators, async/await, and algebraic effects from a small set of primitives. No special syntax needed — it's all library code.
-- **Script-directed tail-call optimization** — `@tco` allows explicit control over tail-call behavior (`aggressive`, `safe`, `smart`, `off`), enabling predictable stack usage.
-- **Preemptive scheduling** — VM-level preemption — Instruction-count-based time slicing for building fair schedulers without cooperative yields.
-- **Thread-safe VM** — Each VM instance is independent and can run on its own thread.
-- **Bytecode serialization** — Compile once, distribute bytecode, run anywhere.
-- **Native C API** — Register C functions, create closures bound to C data, expose references with get/set hooks — all through a clean `zym_*` prefixed API.
+- **Embeddable** — one static library, dropped into any C or C++ project, no global state, no dependencies beyond the C standard library, by design.
+- **Small** — the entire language fits in a compact codebase, minimal footprint for embedded and resource-constrained environments.
+- **Rich built-in types** — strings, lists, maps, structs, enums, all first-class, all doing what you'd expect.
+- **First-class functions** — closures, higher-order functions, anonymous functions, natural and lightweight.
+- **Real memory semantics** — `ref`, `slot`, and `val` modifiers control how values move between caller and callee, the distinction is observable.
+- **Delimited continuations** — fibers, coroutines, generators, async/await, algebraic effects, all from a small set of primitives.
+- **Script-directed tail-call optimization** — `@tco` with `aggressive`, `safe`, `smart`, and `off` modes, stack behavior is predictable.
+- **Preemptive scheduling** — instruction-count-based time slicing at the VM level, build fair schedulers without cooperative yields, correctness is yours.
+- **Thread-safe VM** — each instance owns its heap, globals, and execution state, nothing shared.
+- **Bytecode serialization** — compile once, distribute bytecode, run anywhere, this is efficient.
+- **Native C API** — register functions, bind closures to C data, expose references with get/set hooks, consistently named `zym_*` prefixed API.
 
 ## Building
 
@@ -144,7 +143,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Produces `libzym_core.a` (Unix) or `zym_core.lib` (Windows).
+Produces `libzym_core.a` or `zym_core.lib`, one artifact, link it.
 
 ### As a Git submodule
 
@@ -159,7 +158,7 @@ add_executable(my_app main.c)
 target_link_libraries(my_app PRIVATE zym_core)
 ```
 
-Include headers with `#include "zym/zym.h"` — paths are set up automatically.
+Include with `#include "zym/zym.h"`, configuration is minimal.
 
 ### Build options
 
@@ -199,7 +198,7 @@ ZymValue myAdd(ZymVM* vm, ZymValue a, ZymValue b) {
 zym_defineNative(vm, "add(a, b)", myAdd);
 ```
 
-Now Zym scripts can call `add(10, 20)` and get `30`.
+Scripts call `add(10, 20)` and get `30`.
 
 ## Project structure
 
@@ -215,4 +214,4 @@ zym_core/
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE). All remaining behavior shall conform thereto.
