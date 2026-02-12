@@ -96,17 +96,12 @@ func worker(name) {
 // Continuations + forced TCO + ref — working together
 var TAG = Cont.newPrompt("cap-val-nested");
 
-func cap_helper() {
-    var x = Cont.capture(TAG);
-    return x;
-}
-
 @tco aggressive
 func test_nested(ref counter, stepsLeft) {
     if (stepsLeft == 0) return counter;
 
     if (counter == 3) {
-        var x = cap_helper();
+        var x = Cont.capture(TAG);
         if (x != null) counter = counter + x;
     }
 
