@@ -26,6 +26,10 @@ set(ZYM_CORE_SOURCES
     src/natives/gc_native.c
     src/natives/conversions.c
     src/natives/error.c
+    src/natives/list.c
+    src/natives/map.c
+    src/natives/shared.c
+    src/natives/string_natives.c
 )
 
 # --- Compiler sources (only for full build) ---
