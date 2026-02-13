@@ -6,6 +6,7 @@
 #include "map.h"
 #include "shared.h"
 #include "string_natives.h"
+#include "math.h"
 
 // ============================================================================
 // Core Natives Registration
@@ -19,4 +20,5 @@ void setupCoreNatives(VM* vm) {
     registerListNatives(vm);
     registerMapNatives(vm);
     registerStringNatives(vm);
+    registerMathNatives(vm);
 }
