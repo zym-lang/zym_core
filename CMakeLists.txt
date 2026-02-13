@@ -24,6 +24,8 @@ set(ZYM_CORE_SOURCES
     src/modules/preemption.c
     src/natives/core_natives.c
     src/natives/gc_native.c
+    src/natives/conversions.c
+    src/natives/error.c
 )
 
 # --- Compiler sources (only for full build) ---

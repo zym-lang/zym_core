@@ -145,6 +145,21 @@ bool zym_toStringBytes(ZymValue value, const char** out, int* byte_length); // R
 // VALUE EXTRACTION (UNSAFE - ASSUMES CORRECT TYPE)
 // =============================================================================
 
+// Type name (returns static string like "number", "string", etc.)
+const char* zym_typeName(ZymValue value);
+
+// String length (in characters, not bytes)
+int zym_stringLength(ZymValue value);
+
+// String byte length
+int zym_stringByteLength(ZymValue value);
+
+// Convert any value to its string representation
+ZymValue zym_valueToString(ZymVM* vm, ZymValue value);
+
+// Print a value to stdout
+void zym_printValue(ZymVM* vm, ZymValue value);
+
 // Direct extraction - undefined behavior if type is wrong
 // Use only after type checking with zym_isX()
 double zym_asNumber(ZymValue value);
