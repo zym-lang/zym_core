@@ -1157,7 +1157,25 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
     } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
         emit_get_upvalue(compiler, call_base, reg, line);
     } else {
+        bool should_mangle = false;
+
         if (is_hoisted_global(compiler, name, arg_count)) {
+            should_mangle = true;
+        } else {
+            // Check if it's a registered native function
+            // Native functions are registered with mangled names (e.g., "print@1")
+            ScopedString mangled = scoped_mangle(compiler, name, arg_count);
+            ObjString* mangled_str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
+            pushTempRoot(compiler->vm, (Obj*)mangled_str);
+            Value func_val;
+            if (tableGet(&compiler->vm->globals, mangled_str, &func_val) && IS_NATIVE_FUNCTION(func_val)) {
+                should_mangle = true;
+            }
+            popTempRoot(compiler->vm);
+            scoped_string_free(&mangled);
+        }
+
+        if (should_mangle) {
             ScopedString mangled = scoped_mangle(compiler, name, arg_count);
             ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
             pushTempRoot(compiler->vm, (Obj*)str);

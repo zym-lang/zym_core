@@ -3475,6 +3475,119 @@ static InterpretResult run(VM* vm) {
             vm->stack[callee_slot] = callee;
         }
 
+        // Handle native functions in tail position: call directly and return result
+        if (IS_NATIVE_FUNCTION(callee)) {
+            ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
+
+            if (arg_count != native->arity) {
+                runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // Process parameter qualifiers for native (same as CALL)
+            if (native->param_qualifiers == NULL) {
+                for (int i = 0; i < arg_count; i++) {
+                    int arg_slot = callee_slot + 1 + i;
+                    Value arg_value = vm->stack[arg_slot];
+                    if (IS_REFERENCE(arg_value)) {
+                        Value deref_value;
+                        if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                            deref_value = NULL_VAL;
+                        }
+                        vm->stack[arg_slot] = deref_value;
+                    }
+                }
+            } else {
+                for (int i = 0; i < arg_count; i++) {
+                    int arg_slot = callee_slot + 1 + i;
+                    ParamQualifier qualifier = (ParamQualifier)native->param_qualifiers[i];
+                    Value arg_value = vm->stack[arg_slot];
+
+                    if (IS_REFERENCE(arg_value) || (IS_OBJ(arg_value) && IS_NATIVE_REFERENCE(arg_value))) {
+                        if (qualifier == PARAM_REF || qualifier == PARAM_SLOT) {
+                            continue;
+                        } else if (qualifier == PARAM_VAL) {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = cloneValue(vm, deref_value);
+                        } else if (qualifier == PARAM_CLONE) {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = deepCloneValue(vm, deref_value);
+                        } else {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = deref_value;
+                        }
+                    } else {
+                        if (qualifier == PARAM_VAL) {
+                            vm->stack[arg_slot] = cloneValue(vm, arg_value);
+                        } else if (qualifier == PARAM_CLONE) {
+                            vm->stack[arg_slot] = deepCloneValue(vm, arg_value);
+                        }
+                    }
+                }
+            }
+
+            Value* args = &vm->stack[callee_slot + 1];
+
+            int saved_temp_root_count = vm->temp_root_count;
+            for (int i = 0; i < arg_count; i++) {
+                if (IS_OBJ(args[i])) {
+                    pushTempRoot(vm, AS_OBJ(args[i]));
+                }
+            }
+
+            Value result = native->dispatcher(vm, args, native->func_ptr);
+
+            vm->temp_root_count = saved_temp_root_count;
+
+            if (result == ZYM_ERROR) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            if (result == ZYM_CONTROL_TRANSFER) {
+                DISPATCH();
+            }
+
+            // Tail position: return the native's result from the current frame
+            CallFrame* frame = &vm->frames[vm->frame_count - 1];
+            protectLocalRefsInValue(vm, result, &vm->stack[frame->stack_base]);
+            closeUpvalues(vm, &vm->stack[frame->stack_base]);
+            vm->frame_count--;
+
+            if (vm->with_prompt_depth > 0) {
+                WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
+                if (vm->frame_count == wpc->frame_boundary) {
+                    popPrompt(vm);
+                    vm->with_prompt_depth--;
+                }
+            }
+
+            if (vm->resume_depth > 0) {
+                ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
+                if (vm->frame_count == ctx->frame_boundary) {
+                    vm->stack[ctx->result_slot] = result;
+                    vm->resume_depth--;
+                    vm->ip    = frame->ip;
+                    vm->chunk = frame->caller_chunk;
+                    DISPATCH();
+                }
+            }
+
+            vm->ip    = frame->ip;
+            vm->chunk = frame->caller_chunk;
+            vm->stack[frame->stack_base] = result;
+
+            DISPATCH();
+        }
+
         if (!IS_CLOSURE(callee)) {
             runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
             return INTERPRET_RUNTIME_ERROR;
@@ -3605,6 +3718,119 @@ static InterpretResult run(VM* vm) {
             }
             callee = matched_closure;
             vm->stack[callee_slot] = callee;
+        }
+
+        // Handle native functions in tail position: call directly and return result
+        if (IS_NATIVE_FUNCTION(callee)) {
+            ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
+
+            if (arg_count != native->arity) {
+                runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // Process parameter qualifiers for native (same as CALL)
+            if (native->param_qualifiers == NULL) {
+                for (int i = 0; i < arg_count; i++) {
+                    int arg_slot = callee_slot + 1 + i;
+                    Value arg_value = vm->stack[arg_slot];
+                    if (IS_REFERENCE(arg_value)) {
+                        Value deref_value;
+                        if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                            deref_value = NULL_VAL;
+                        }
+                        vm->stack[arg_slot] = deref_value;
+                    }
+                }
+            } else {
+                for (int i = 0; i < arg_count; i++) {
+                    int arg_slot = callee_slot + 1 + i;
+                    ParamQualifier qualifier = (ParamQualifier)native->param_qualifiers[i];
+                    Value arg_value = vm->stack[arg_slot];
+
+                    if (IS_REFERENCE(arg_value) || (IS_OBJ(arg_value) && IS_NATIVE_REFERENCE(arg_value))) {
+                        if (qualifier == PARAM_REF || qualifier == PARAM_SLOT) {
+                            continue;
+                        } else if (qualifier == PARAM_VAL) {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = cloneValue(vm, deref_value);
+                        } else if (qualifier == PARAM_CLONE) {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = deepCloneValue(vm, deref_value);
+                        } else {
+                            Value deref_value;
+                            if (!dereferenceValue(vm, arg_value, &deref_value)) {
+                                deref_value = NULL_VAL;
+                            }
+                            vm->stack[arg_slot] = deref_value;
+                        }
+                    } else {
+                        if (qualifier == PARAM_VAL) {
+                            vm->stack[arg_slot] = cloneValue(vm, arg_value);
+                        } else if (qualifier == PARAM_CLONE) {
+                            vm->stack[arg_slot] = deepCloneValue(vm, arg_value);
+                        }
+                    }
+                }
+            }
+
+            Value* args = &vm->stack[callee_slot + 1];
+
+            int saved_temp_root_count = vm->temp_root_count;
+            for (int i = 0; i < arg_count; i++) {
+                if (IS_OBJ(args[i])) {
+                    pushTempRoot(vm, AS_OBJ(args[i]));
+                }
+            }
+
+            Value result = native->dispatcher(vm, args, native->func_ptr);
+
+            vm->temp_root_count = saved_temp_root_count;
+
+            if (result == ZYM_ERROR) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            if (result == ZYM_CONTROL_TRANSFER) {
+                DISPATCH();
+            }
+
+            // Tail position: return the native's result from the current frame
+            CallFrame* frame = &vm->frames[vm->frame_count - 1];
+            protectLocalRefsInValue(vm, result, &vm->stack[frame->stack_base]);
+            closeUpvalues(vm, &vm->stack[frame->stack_base]);
+            vm->frame_count--;
+
+            if (vm->with_prompt_depth > 0) {
+                WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
+                if (vm->frame_count == wpc->frame_boundary) {
+                    popPrompt(vm);
+                    vm->with_prompt_depth--;
+                }
+            }
+
+            if (vm->resume_depth > 0) {
+                ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
+                if (vm->frame_count == ctx->frame_boundary) {
+                    vm->stack[ctx->result_slot] = result;
+                    vm->resume_depth--;
+                    vm->ip    = frame->ip;
+                    vm->chunk = frame->caller_chunk;
+                    DISPATCH();
+                }
+            }
+
+            vm->ip    = frame->ip;
+            vm->chunk = frame->caller_chunk;
+            vm->stack[frame->stack_base] = result;
+
+            DISPATCH();
         }
 
         if (!IS_CLOSURE(callee)) {
