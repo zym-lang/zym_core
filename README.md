@@ -204,6 +204,8 @@ Scripts call `add(10, 20)` and get `30`.
 
 Full language guide, API references, and embedding tutorials are available at **[zym-lang.org](https://zym-lang.org)**.
 
+Try Zym instantly in the browser: **[Playground](https://zym-lang.org/playground.html)**
+
 The docs cover:
 
 - **[Language Guide](https://zym-lang.org/docs-language.html)** — variables, types, operators, control flow, functions, and a tour of all language features

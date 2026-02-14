@@ -65,7 +65,9 @@ if(ZYM_RUNTIME_ONLY)
 endif()
 
 # Platform libraries
-if(WIN32)
+if(EMSCRIPTEN)
+    # Emscripten provides libm built-in; no platform libs needed
+elseif(WIN32)
     target_link_libraries(zym_core PUBLIC m ws2_32 userenv iphlpapi)
 else()
     target_link_libraries(zym_core PUBLIC m)
