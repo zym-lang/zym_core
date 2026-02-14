@@ -108,12 +108,6 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
             }
 
         case 'v': // Any value
-        case 'l': // List
-        case 'm': // Map
-        case 't': // Struct
-        case 'e': // Enum
-        case 'f': // Function
-        case 'r': // Reference
             {
                 ZymValue str_val = zym_valueToString(vm, val);
                 if (str_val == ZYM_ERROR) return false;
