@@ -200,6 +200,19 @@ zym_defineNative(vm, "add(a, b)", myAdd);
 
 Scripts call `add(10, 20)` and get `30`.
 
+## Documentation
+
+Full language guide, API references, and embedding tutorials are available at **[zym-lang.org](https://zym-lang.org)**.
+
+The docs cover:
+
+- **[Language Guide](https://zym-lang.org/docs-language.html)** — variables, types, operators, control flow, functions, and a tour of all language features
+- **[Language Semantics](https://zym-lang.org/docs-control-flow.html)** — deep-dive pages for control flow, functions, memory semantics, structs & enums, TCO, and spread
+- **[Core Modules](https://zym-lang.org/docs-strings.html)** — built-in APIs for strings, math, lists, maps, conversions, error handling, and GC
+- **[Continuations & Preemption](https://zym-lang.org/docs-continuations.html)** — delimited continuations, fibers, generators, and preemptive scheduling
+- **[Macros & Preprocessor](https://zym-lang.org/docs-macros.html)** — compile-time macros, conditional compilation, and block macros
+- **[Embedding Guide](https://zym-lang.org/docs-embedding.html)** — VM lifecycle, native functions, two-way FFI, and the `zym_*` C API
+
 ## Project structure
 
 ```
