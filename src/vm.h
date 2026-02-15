@@ -61,6 +61,11 @@ typedef struct {
     int frame_boundary;
 } WithPromptContext;
 
+// Error callback: if set, error messages are routed here instead of stderr.
+// type: 1 = compile error, 2 = runtime error (matches ZymStatus values)
+typedef void (*ErrorCallback)(struct VM* vm, int type, const char* file,
+                              int line, const char* message, void* user_data);
+
 typedef struct VM {
     Chunk* chunk;
     uint32_t* ip;
@@ -111,6 +116,10 @@ typedef struct VM {
 
     WithPromptContext with_prompt_stack[MAX_WITH_PROMPT_DEPTH];
     int with_prompt_depth;
+
+    // Error callback (NULL = default fprintf to stderr)
+    ErrorCallback error_callback;
+    void* error_user_data;
 } VM;
 
 typedef enum {

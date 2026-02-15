@@ -146,30 +146,69 @@ static void advance(Parser* parser) {
 static void error_at_current(Parser* parser, const char* message) {
     if (parser->panic_mode) return;
     parser->panic_mode = true;
+    parser->had_error = true;
 
-    if (parser->current_module_name) {
-        char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
-        fprintf(stderr, "[%s] line %d", decoded, parser->current.line);
-        free(decoded);
-    } else {
-        fprintf(stderr, "[line %d]", parser->current.line);
-    }
+    int line = parser->current.line;
 
-    if (parser->current.type == TOKEN_EOF) {
-        fprintf(stderr, " at end");
-    } else if (parser->current.type != TOKEN_ERROR) {
-        if (parser->current.start != NULL && parser->current.length > 0) {
-            const int MAX_TOKEN_DISPLAY = 40;
-            if (parser->current.length <= MAX_TOKEN_DISPLAY) {
-                fprintf(stderr, " at '%.*s'", parser->current.length, parser->current.start);
-            } else {
-                fprintf(stderr, " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
+    if (parser->vm->error_callback) {
+        char buf[1280];
+        int pos = 0;
+
+        // Location prefix
+        if (parser->current_module_name) {
+            char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
+            free(decoded);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
+        }
+
+        // Token context
+        if (parser->current.type == TOKEN_EOF) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " at end");
+        } else if (parser->current.type != TOKEN_ERROR) {
+            if (parser->current.start != NULL && parser->current.length > 0) {
+                const int MAX_TOKEN_DISPLAY = 40;
+                if (parser->current.length <= MAX_TOKEN_DISPLAY) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, " at '%.*s'", parser->current.length, parser->current.start);
+                } else {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
+                }
             }
         }
-    }
 
-    fprintf(stderr, ": %s\n", message);
-    parser->had_error = true;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, ": %s", message);
+
+        const char* file = NULL;
+        if (parser->current_module_name) {
+            file = parser->current_module_name;
+        }
+        parser->vm->error_callback(parser->vm, 1, file, line, buf, parser->vm->error_user_data);
+    } else {
+        // Default: write to stderr (original behavior)
+        if (parser->current_module_name) {
+            char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
+            fprintf(stderr, "[%s] line %d", decoded, line);
+            free(decoded);
+        } else {
+            fprintf(stderr, "[line %d]", line);
+        }
+
+        if (parser->current.type == TOKEN_EOF) {
+            fprintf(stderr, " at end");
+        } else if (parser->current.type != TOKEN_ERROR) {
+            if (parser->current.start != NULL && parser->current.length > 0) {
+                const int MAX_TOKEN_DISPLAY = 40;
+                if (parser->current.length <= MAX_TOKEN_DISPLAY) {
+                    fprintf(stderr, " at '%.*s'", parser->current.length, parser->current.start);
+                } else {
+                    fprintf(stderr, " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
+                }
+            }
+        }
+
+        fprintf(stderr, ": %s\n", message);
+    }
 }
 
 static void consume(Parser* parser, TokenType type, const char* message) {
@@ -993,7 +1032,7 @@ static Stmt* parse_compiler_directive(Parser* parser) {
     Token at_token = parser->previous;
 
     if (parser->current.type != TOKEN_IDENTIFIER) {
-        printf("[Line %d] Error: Expected directive name after '@'.\n", at_token.line);
+        error_at_current(parser, "Expected directive name after '@'.");
         return NULL;
     }
 
@@ -1002,7 +1041,7 @@ static Stmt* parse_compiler_directive(Parser* parser) {
 
     if (directive_name.length == 3 && memcmp(directive_name.start, "tco", 3) == 0) {
         if (parser->current.type != TOKEN_IDENTIFIER) {
-            printf("[Line %d] Error: Expected TCO mode (aggressive/safe/off) after '@tco'.\n", directive_name.line);
+            error_at_current(parser, "Expected TCO mode (aggressive/safe/off) after '@tco'.");
             return NULL;
         }
 
@@ -1016,7 +1055,7 @@ static Stmt* parse_compiler_directive(Parser* parser) {
         else if (mode_token.length == 3 && memcmp(mode_token.start, "off", 3) == 0) valid = true;
 
         if (!valid) {
-            printf("[Line %d] Error: Invalid TCO mode. Expected 'aggressive', 'smart', 'safe', or 'off'.\n", mode_token.line);
+            error_at_current(parser, "Invalid TCO mode. Expected 'aggressive', 'smart', 'safe', or 'off'.");
             return NULL;
         }
 
@@ -1031,7 +1070,11 @@ static Stmt* parse_compiler_directive(Parser* parser) {
     }
 
 
-    printf("[Line %d] Error: Unknown compiler directive '@%.*s'.\n", directive_name.line, directive_name.length, directive_name.start);
+    {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "Unknown compiler directive '@%.*s'.", directive_name.length, directive_name.start);
+        error_at_current(parser, err_buf);
+    }
     return NULL;
 }
 
@@ -1408,7 +1451,11 @@ AstResult parse(VM* vm, const char* source, const LineMap* line_map, const char*
     }
 
     if (parser.had_error) {
-        fprintf(stderr, "\nCompilation aborted due to parse errors.\n");
+        if (vm->error_callback) {
+            vm->error_callback(vm, 1, NULL, -1, "Compilation aborted due to parse errors.", vm->error_user_data);
+        } else {
+            fprintf(stderr, "\nCompilation aborted due to parse errors.\n");
+        }
         for (int i = 0; i < count; i++) free_stmt(vm, statements[i]);
         FREE_ARRAY(vm, Stmt*, statements, capacity);
         return (AstResult){ .statements = NULL, .capacity = 0 };

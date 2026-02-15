@@ -84,6 +84,9 @@ void initVM(VM* vm) {
     vm->resume_depth = 0;
     vm->with_prompt_depth = 0;
 
+    vm->error_callback = NULL;
+    vm->error_user_data = NULL;
+
     vm->gc_enabled = true;
 
     // Register core modules (Cont, Preemption, GC) as part of VM init
@@ -159,65 +162,130 @@ static int line_at_ip(Chunk* chunk, uint32_t* ip) {
 }
 
 void runtimeError(VM* vm, const char* format, ...) {
+    // Format the error message
+    char msg_buf[1024];
     va_list args;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    int msg_len = vsnprintf(msg_buf, sizeof(msg_buf), format, args);
     va_end(args);
-    fputc('\n', stderr);
+    if (msg_len < 0) msg_len = 0;
+
+    // Determine file and line for the error location
+    const char* err_file = NULL;
+    int err_line = -1;
+
     if (vm->frame_count > 0) {
         CallFrame* cur = &vm->frames[vm->frame_count - 1];
         Chunk* cur_chunk = cur->closure->function ? cur->closure->function->chunk : vm->chunk;
-        int cur_line = line_at_ip(cur_chunk, vm->ip);
-
+        err_line = line_at_ip(cur_chunk, vm->ip);
         if (cur->closure->function && cur->closure->function->module_name) {
-            fprintf(stderr, "[%s] line %d\n", cur->closure->function->module_name->chars, cur_line);
+            err_file = cur->closure->function->module_name->chars;
         } else if (vm->entry_file) {
-            fprintf(stderr, "[%s] line %d\n", vm->entry_file->chars, cur_line);
-        } else {
-            fprintf(stderr, "[line %d]\n", cur_line);
+            err_file = vm->entry_file->chars;
         }
     } else {
-        int line = line_at_ip(vm->chunk, vm->ip);
+        err_line = line_at_ip(vm->chunk, vm->ip);
         if (vm->entry_file) {
-            fprintf(stderr, "[%s] line %d\n", vm->entry_file->chars, line);
-        } else {
-            fprintf(stderr, "[line %d]\n", line);
+            err_file = vm->entry_file->chars;
         }
     }
-    for (int i = (int)vm->frame_count - 1; i >= 0; --i) {
-        CallFrame* f = &vm->frames[i];
-        Chunk* caller_chunk = f->caller_chunk ? f->caller_chunk : vm->chunk;
-        int call_line = line_at_ip(caller_chunk, f->ip);
 
-        const char* call_file = NULL;
-        const char* caller_name = "<script>";
-        int caller_len = 8;
+    if (vm->error_callback) {
+        // Build the full message with location and stack trace into a buffer
+        char full_buf[4096];
+        int pos = 0;
 
-        if (i > 0) {
-            ObjFunction* caller_fn = vm->frames[i - 1].closure->function;
-            if (caller_fn && caller_fn->name) {
-                caller_name = caller_fn->name->chars;
-                caller_len  = caller_fn->name->length;
+        // Error message
+        pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "%s\n", msg_buf);
 
-                if (caller_len > 9 && memcmp(caller_name, "__module_", 9) == 0) {
-                    caller_name = "<script>";
-                    caller_len = 8;
+        // Location
+        if (err_file) {
+            pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "[%s] line %d\n", err_file, err_line);
+        } else {
+            pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "[line %d]\n", err_line);
+        }
+
+        // Stack trace
+        for (int i = (int)vm->frame_count - 1; i >= 0 && pos < (int)sizeof(full_buf) - 1; --i) {
+            CallFrame* f = &vm->frames[i];
+            Chunk* caller_chunk = f->caller_chunk ? f->caller_chunk : vm->chunk;
+            int call_line = line_at_ip(caller_chunk, f->ip);
+
+            const char* call_file = NULL;
+            const char* caller_name = "<script>";
+            int caller_len = 8;
+
+            if (i > 0) {
+                ObjFunction* caller_fn = vm->frames[i - 1].closure->function;
+                if (caller_fn && caller_fn->name) {
+                    caller_name = caller_fn->name->chars;
+                    caller_len  = caller_fn->name->length;
+                    if (caller_len > 9 && memcmp(caller_name, "__module_", 9) == 0) {
+                        caller_name = "<script>";
+                        caller_len = 8;
+                    }
+                }
+                if (caller_fn && caller_fn->module_name) {
+                    call_file = caller_fn->module_name->chars;
                 }
             }
-            if (caller_fn && caller_fn->module_name) {
-                call_file = caller_fn->module_name->chars;
+
+            pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "    at ");
+            if (call_file) {
+                pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "[%s] line %d", call_file, call_line);
+            } else if (vm->entry_file) {
+                pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "[%s] line %d", vm->entry_file->chars, call_line);
+            } else {
+                pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, "[line %d]", call_line);
             }
+            pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, " (called from %.*s)\n", caller_len, caller_name);
         }
 
-        fprintf(stderr, "    at ");
-        if (call_file) {
-            fprintf(stderr, "[%s] line %d", call_file, call_line);
-        } else if (vm->entry_file) {
-            fprintf(stderr, "[%s] line %d", vm->entry_file->chars, call_line);
+        vm->error_callback(vm, 2, err_file, err_line, full_buf, vm->error_user_data);
+    } else {
+        // Default: write to stderr (original behavior)
+        fprintf(stderr, "%s\n", msg_buf);
+
+        if (err_file) {
+            fprintf(stderr, "[%s] line %d\n", err_file, err_line);
         } else {
-            fprintf(stderr, "[line %d]", call_line);
+            fprintf(stderr, "[line %d]\n", err_line);
         }
-        fprintf(stderr, " (called from %.*s)\n", caller_len, caller_name);
+
+        for (int i = (int)vm->frame_count - 1; i >= 0; --i) {
+            CallFrame* f = &vm->frames[i];
+            Chunk* caller_chunk = f->caller_chunk ? f->caller_chunk : vm->chunk;
+            int call_line = line_at_ip(caller_chunk, f->ip);
+
+            const char* call_file = NULL;
+            const char* caller_name = "<script>";
+            int caller_len = 8;
+
+            if (i > 0) {
+                ObjFunction* caller_fn = vm->frames[i - 1].closure->function;
+                if (caller_fn && caller_fn->name) {
+                    caller_name = caller_fn->name->chars;
+                    caller_len  = caller_fn->name->length;
+                    if (caller_len > 9 && memcmp(caller_name, "__module_", 9) == 0) {
+                        caller_name = "<script>";
+                        caller_len = 8;
+                    }
+                }
+                if (caller_fn && caller_fn->module_name) {
+                    call_file = caller_fn->module_name->chars;
+                }
+            }
+
+            fprintf(stderr, "    at ");
+            if (call_file) {
+                fprintf(stderr, "[%s] line %d", call_file, call_line);
+            } else if (vm->entry_file) {
+                fprintf(stderr, "[%s] line %d", vm->entry_file->chars, call_line);
+            } else {
+                fprintf(stderr, "[line %d]", call_line);
+            }
+            fprintf(stderr, " (called from %.*s)\n", caller_len, caller_name);
+        }
     }
 }
 

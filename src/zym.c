@@ -40,6 +40,17 @@ void zym_freeVM(ZymVM* vm)
 }
 
 // =============================================================================
+// ERROR CALLBACK
+// =============================================================================
+
+void zym_setErrorCallback(ZymVM* vm, ErrorCallback callback, void* user_data)
+{
+    if (vm == NULL) return;
+    vm->error_callback = callback;
+    vm->error_user_data = user_data;
+}
+
+// =============================================================================
 // COMPILATION AND EXECUTION
 // =============================================================================
 

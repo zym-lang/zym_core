@@ -39,6 +39,15 @@ ZymVM* zym_newVM();
 void zym_freeVM(ZymVM* vm);
 
 // =============================================================================
+// ERROR CALLBACK
+// =============================================================================
+
+// Set an error callback on the VM. When set, all error messages are routed
+// to the callback instead of stderr. Pass NULL to restore default behavior.
+// ErrorCallback is defined in vm.h.
+void zym_setErrorCallback(ZymVM* vm, ErrorCallback callback, void* user_data);
+
+// =============================================================================
 // COMPILATION AND EXECUTION
 // =============================================================================
 

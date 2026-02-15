@@ -40,6 +40,26 @@ ZymVM* zym_newVM();
 void zym_freeVM(ZymVM* vm);
 
 // =============================================================================
+// ERROR CALLBACK
+// =============================================================================
+
+// Error callback signature.
+// Parameters:
+//   vm:        The VM that produced the error
+//   type:      ZYM_STATUS_COMPILE_ERROR or ZYM_STATUS_RUNTIME_ERROR
+//   file:      Source file name (may be NULL)
+//   line:      Line number (-1 if unknown)
+//   message:   The fully formatted error message (includes stack trace for runtime errors)
+//   user_data: Opaque pointer passed through from zym_setErrorCallback
+typedef void (*ZymErrorCallback)(ZymVM* vm, ZymStatus type, const char* file,
+                                 int line, const char* message, void* user_data);
+
+// Set an error callback on the VM. When set, all error messages (compile errors,
+// parse errors, runtime errors) are routed to the callback instead of stderr.
+// Pass NULL to restore default behavior (fprintf to stderr).
+void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data);
+
+// =============================================================================
 // COMPILATION AND EXECUTION
 // =============================================================================
 

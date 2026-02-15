@@ -116,20 +116,41 @@ static void emit_closure(Compiler* c, int reg, int const_idx, int line) {
 
 static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
     compiler->has_error = true;
-    if (compiler->current_module_name) {
-        fprintf(stderr, "[%.*s] line %d: ",
-                compiler->current_module_name->length,
-                compiler->current_module_name->chars,
-                line);
-    } else {
-        fprintf(stderr, "[line %d]: ", line);
-    }
 
     va_list args;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+
+    if (compiler->vm->error_callback) {
+        char msg_buf[1024];
+        vsnprintf(msg_buf, sizeof(msg_buf), format, args);
+
+        const char* file = NULL;
+        if (compiler->current_module_name) {
+            file = compiler->current_module_name->chars;
+        }
+
+        char full_buf[1280];
+        if (file) {
+            snprintf(full_buf, sizeof(full_buf), "[%s] line %d: %s", file, line, msg_buf);
+        } else {
+            snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
+        }
+
+        compiler->vm->error_callback(compiler->vm, 1, file, line, full_buf, compiler->vm->error_user_data);
+    } else {
+        if (compiler->current_module_name) {
+            fprintf(stderr, "[%.*s] line %d: ",
+                    compiler->current_module_name->length,
+                    compiler->current_module_name->chars,
+                    line);
+        } else {
+            fprintf(stderr, "[line %d]: ", line);
+        }
+        vfprintf(stderr, format, args);
+        fprintf(stderr, "\n");
+    }
+
     va_end(args);
-    fprintf(stderr, "\n");
 }
 
 static void compiler_error_and_exit(int line, const char* format, ...) {
@@ -196,7 +217,7 @@ static double parse_number_literal(const char* start, int length) {
 static int make_constant(Compiler* compiler, Value value) {
     int constant = addConstant(compiler->vm, compiler->compiling_chunk, value);
     if (constant > 0xFFFF) {
-        printf("Too many constants in one chunk.\n");
+        compiler_error(compiler, -1, "Too many constants in one chunk.");
         return 0;
     }
     return constant;
@@ -321,8 +342,7 @@ static int emit_jump_instruction(Compiler* compiler, OpCode opcode, int reg, int
 static void patch_jump(Compiler* compiler, int jump_address) {
     int offset = compiler->compiling_chunk->count - jump_address - 1;
     if (offset < MAX_JUMP_OFFSET_NEG || offset > MAX_JUMP_OFFSET_POS) {
-        printf("Error: Jump offset out of 16-bit signed range.\n");
-        compiler->has_error = true;
+        compiler_error(compiler, -1, "Jump offset out of 16-bit signed range.");
     }
     uint32_t old = compiler->compiling_chunk->code[jump_address];
 
@@ -421,7 +441,7 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
 static void emit_loop(Compiler* compiler, int loop_start, int line) {
     int offset = loop_start - (compiler->compiling_chunk->count + 1);
     if (offset < MAX_JUMP_OFFSET_NEG) {
-        printf("Error: Loop body too large.\n");
+        compiler_error(compiler, line, "Loop body too large.");
     }
     emit_instruction(compiler, PACK_ABx(JUMP, 0, (uint32_t)offset), line);
 }
@@ -493,7 +513,7 @@ static int add_upvalue(Compiler* compiler, uint8_t index, bool is_local, ObjStru
     }
 
     if (compiler->upvalue_count == MAX_LOCALS) {
-        printf("Too many upvalues in function.\n");
+        compiler_error(compiler, -1, "Too many upvalues in function.");
         return -1;
     }
 
@@ -605,7 +625,7 @@ static void declare_variable(Compiler* compiler, Token* name) {
         Local* local = &compiler->locals[i];
         if (local->depth != -1 && local->depth < compiler->scope_depth) break;
         if (tokens_equal(name, &local->name)) {
-            printf("Error: Already a variable with this name in this scope.\n");
+            compiler_error(compiler, -1, "Already a variable with this name in this scope.");
         }
     }
 }
@@ -3162,7 +3182,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     if (var->qualifier == VAR_REF) {
                         // Reference: create a reference object that points to another variable or collection element
                         if (!var->initializer) {
-                            printf("Error: ref variable must have an initializer.\n");
+                            compiler_error(compiler, stmt->line, "ref variable must have an initializer.");
                             break;
                         }
 
@@ -3250,7 +3270,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     if (var->qualifier == VAR_REF) {
                         // Global references: create reference object
                         if (!var->initializer) {
-                            printf("Error: ref variable must have an initializer.\n");
+                            compiler_error(compiler, stmt->line, "ref variable must have an initializer.");
                             break;
                         }
 
@@ -3900,7 +3920,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         }
         case STMT_BREAK: {
             if (compiler->loop_depth == 0) {
-                printf("[Line %d] Error: 'break' statement outside of a loop.\n", stmt->line);
+                compiler_error(compiler, stmt->line, "'break' statement outside of a loop.");
                 return false;
             }
             // Emit a placeholder jump and add it to the patch list for the current loop.
@@ -3910,7 +3930,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         }
         case STMT_CONTINUE: {
             if (compiler->loop_depth == 0) {
-                printf("[Line %d] Error: 'continue' statement outside of a loop.\n", stmt->line);
+                compiler_error(compiler, stmt->line, "'continue' statement outside of a loop.");
                 return false;
             }
             // Emit a jump back to the start of the current loop's next iteration.
@@ -4581,7 +4601,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                 // For ref variables, we need special handling
                 if (var->qualifier == VAR_REF) {
                     if (!var->initializer) {
-                        printf("Error: ref variable must have an initializer.\n");
+                        compiler_error(&fn_compiler, s->line, "ref variable must have an initializer.");
                         continue;
                     }
 
@@ -4701,7 +4721,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                             }
                         }
                     } else {
-                        printf("Error: ref variable initializer must be a variable, subscript, or property.\n");
+                        compiler_error(&fn_compiler, s->line, "ref variable initializer must be a variable, subscript, or property.");
                         continue;
                     }
                 } else if (var->qualifier == VAR_VAL) {
@@ -4937,7 +4957,11 @@ cleanup_on_error:
 
     // Report compilation status
     if (!success) {
-        fprintf(stderr, "\nCompilation failed with errors.\n");
+        if (vm->error_callback) {
+            vm->error_callback(vm, 1, NULL, -1, "Compilation failed with errors.", vm->error_user_data);
+        } else {
+            fprintf(stderr, "\nCompilation failed with errors.\n");
+        }
     }
 
     // NOTE: compiler.function is managed by the GC (it's in vm->objects list)
