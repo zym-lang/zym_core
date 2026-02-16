@@ -1975,13 +1975,12 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(op_lit, target_reg, src_reg, 0), expr->line);
                 write64BitLiteral(compiler->vm, compiler->compiling_chunk, const_value, expr->line);
             } else {
-                // Standard 3-register operation
-                // 1. Compile the left operand DIRECTLY into the target register.
-                COMPILE_REQUIRED(compiler, expr->as.binary.left, target_reg);
-                // 2. Compile right operand into a new temporary register as usual.
+                // Standard 3-register operation: target = left OP right
+                // Use compile_sub_expression_to to avoid unnecessary MOVEs when
+                // the left operand is already in a register (e.g., a local variable).
+                int left_reg = compile_sub_expression_to(compiler, expr->as.binary.left, target_reg);
                 int right_reg = compile_sub_expression(compiler, expr->as.binary.right);
-                // 3. Emit instruction: target = target OP right
-                emit_instruction(compiler, PACK_ABC(op_base, target_reg, target_reg, right_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(op_base, target_reg, left_reg, right_reg), expr->line);
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2016,16 +2015,16 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 break;
             } else if (expr->as.unary.operator.type == TOKEN_VAL) {
                 // Handle val as unary expression - deep clone
-                int right_reg = alloc_temp(compiler);
-                compile_expression(compiler, expr->as.unary.right, right_reg);
+                // Use compile_sub_expression to avoid MOVE when operand is a local variable.
+                int right_reg = compile_sub_expression(compiler, expr->as.unary.right);
                 emit_instruction(compiler, PACK_ABC(CLONE_VALUE, target_reg, right_reg, 0), expr->line);
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
                 break;
             }
 
             // Regular unary operators (-, !, ~)
-            int right_reg = alloc_temp(compiler);
-            compile_expression(compiler, expr->as.unary.right, right_reg);
+            // Use compile_sub_expression to avoid MOVE when operand is a local variable.
+            int right_reg = compile_sub_expression(compiler, expr->as.unary.right);
             OpCode op;
             switch (expr->as.unary.operator.type) {
                 case TOKEN_MINUS:
@@ -2356,10 +2355,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             int saved_top = save_temp_top(compiler);
 
             SubscriptExpr* sub_expr = &expr->as.subscript;
-            int list_reg = alloc_temp(compiler);
-            COMPILE_REQUIRED(compiler, sub_expr->object, list_reg);
-            int index_reg = alloc_temp(compiler);
-            COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
+            // Use compile_sub_expression to avoid MOVEs when object/index are local variables.
+            int list_reg = compile_sub_expression(compiler, sub_expr->object);
+            int index_reg = compile_sub_expression(compiler, sub_expr->index);
             emit_instruction(compiler, PACK_ABC(GET_SUBSCRIPT, target_reg, list_reg, index_reg), expr->line);
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -3198,8 +3196,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                         // Value: deep clone the initializer
                         int value_reg = reserve_register(compiler);
                         if (var->initializer) {
-                            int temp_reg = alloc_temp(compiler);
-                            compile_expression(compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(compiler, var->initializer);
                             // Emit CLONE_VALUE instruction
                             emit_instruction(compiler, PACK_ABC(CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
                         } else {
@@ -3212,8 +3209,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                         // Clone: deep clone with reference rewriting
                         int value_reg = reserve_register(compiler);
                         if (var->initializer) {
-                            int temp_reg = alloc_temp(compiler);
-                            compile_expression(compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(compiler, var->initializer);
                             // Emit DEEP_CLONE_VALUE instruction
                             emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
                         } else {
@@ -3289,21 +3285,19 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
                         if (var->qualifier == VAR_VAL && var->initializer) {
                             // Clone for global val
-                            int temp_reg = alloc_temp(compiler);
                             // Check if initializer is a struct instantiation
                             if (var->initializer->type == EXPR_STRUCT_INST) {
                                 struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                             }
-                            compile_expression(compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(compiler, var->initializer);
                             emit_instruction(compiler, PACK_ABC(CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
                         } else if (var->qualifier == VAR_CLONE && var->initializer) {
                             // Deep clone for global clone
-                            int temp_reg = alloc_temp(compiler);
                             // Check if initializer is a struct instantiation
                             if (var->initializer->type == EXPR_STRUCT_INST) {
                                 struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                             }
-                            compile_expression(compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(compiler, var->initializer);
                             emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
                         } else if (var->initializer) {
                             // Check if initializer is a struct instantiation
@@ -3618,15 +3612,13 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                             } else if (var->qualifier == VAR_VAL) {
                                 // Val variable - deep clone
                                 if (var->initializer) {
-                                    int temp_reg = alloc_temp(compiler);
-                                    compile_expression(compiler, var->initializer, temp_reg);
+                                    int temp_reg = compile_sub_expression(compiler, var->initializer);
                                     emit_instruction(compiler, PACK_ABC(CLONE_VALUE, var_reg, temp_reg, 0), s->line);
                                 }
                             } else if (var->qualifier == VAR_CLONE) {
                                 // Clone variable - deep clone with ref rewriting
                                 if (var->initializer) {
-                                    int temp_reg = alloc_temp(compiler);
-                                    compile_expression(compiler, var->initializer, temp_reg);
+                                    int temp_reg = compile_sub_expression(compiler, var->initializer);
                                     emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, var_reg, temp_reg, 0), s->line);
                                 }
                             } else {
@@ -4729,8 +4721,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                     if (var->initializer) {
                         int var_reg = resolve_local(&fn_compiler, &var->name);
                         if (var_reg != -1) {
-                            int temp_reg = alloc_temp(&fn_compiler);
-                            compile_expression(&fn_compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(&fn_compiler, var->initializer);
                             emit_instruction(&fn_compiler, PACK_ABC(CLONE_VALUE, var_reg, temp_reg, 0), s->line);
 
                             // Mark the variable as initialized
@@ -4747,8 +4738,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                     if (var->initializer) {
                         int var_reg = resolve_local(&fn_compiler, &var->name);
                         if (var_reg != -1) {
-                            int temp_reg = alloc_temp(&fn_compiler);
-                            compile_expression(&fn_compiler, var->initializer, temp_reg);
+                            int temp_reg = compile_sub_expression(&fn_compiler, var->initializer);
                             emit_instruction(&fn_compiler, PACK_ABC(DEEP_CLONE_VALUE, var_reg, temp_reg, 0), s->line);
 
                             // Mark the variable as initialized
