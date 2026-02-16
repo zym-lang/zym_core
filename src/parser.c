@@ -809,6 +809,16 @@ static Expr* map_literal(Parser* parser, bool can_assign) {
                 } else if (parser->current.type == TOKEN_IDENTIFIER) {
                     advance(parser);
                     key = new_literal_expr(parser->vm, parser->previous);
+
+                    if (parser->current.type != TOKEN_COLON) {
+                        Token ident = parser->previous;
+                        keys[count] = key;
+                        values[count] = new_variable_expr(parser->vm, ident);
+                        count++;
+                        if (!match(parser, TOKEN_COMMA)) break;
+                        if (parser->current.type == TOKEN_RIGHT_BRACE) break;
+                        continue;
+                    }
                 } else {
                     error_at_current(parser, "Expect key (string, number, or expression in parentheses).");
                     return NULL;
