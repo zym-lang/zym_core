@@ -89,6 +89,7 @@ static char* encode_path_to_identifier(const char* path) {
         else if (c == '.') result_len += 5;
         else if (c == '-') result_len += 6;
         else if (c == ' ') result_len += 7;
+        else if (c == ':') result_len += 7;
         else result_len += 1;
     }
 
@@ -107,6 +108,9 @@ static char* encode_path_to_identifier(const char* path) {
             j += 6;
         } else if (c == ' ') {
             memcpy(result + j, "_space_", 7);
+            j += 7;
+        } else if (c == ':') {
+            memcpy(result + j, "_colon_", 7);
             j += 7;
         } else {
             result[j++] = c;
@@ -134,6 +138,9 @@ static char* decode_identifier_to_path(const char* encoded, int length) {
             i += 6;
         } else if (i + 7 <= length && memcmp(encoded + i, "_space_", 7) == 0) {
             result[j++] = ' ';
+            i += 7;
+        } else if (i + 7 <= length && memcmp(encoded + i, "_colon_", 7) == 0) {
+            result[j++] = ':';
             i += 7;
         } else {
             result[j++] = encoded[i++];
@@ -769,8 +776,14 @@ static void add_mapped_lines(VM* vm, const char* text, LineMap* source_linemap, 
     }
 }
 
+static bool is_fresh_module(const char* source) {
+    const char* p = source;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return strncmp(p, "\"use fresh\"", 11) == 0;
+}
+
 static char* transform_imports(const char* source, const char* base_path, StringSet* loaded_modules,
-                               SymbolMap* symbol_map, bool debug_names) {
+                               SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules) {
     StringBuilder sb;
     sb_init(&sb);
 
@@ -866,7 +879,9 @@ static char* transform_imports(const char* source, const char* base_path, String
                                 snprintf(hash_str, sizeof(hash_str), "_%x", hash_path(resolved));
                                 sb_append(&sb, hash_str);
                             }
-                            sb_append(&sb, "()");
+                            if (!fresh_modules || set_contains(fresh_modules, resolved)) {
+                                sb_append(&sb, "()");
+                            }
 
                             free(resolved);
                             last = p;
@@ -907,7 +922,9 @@ static char* transform_imports(const char* source, const char* base_path, String
                         snprintf(hash_str, sizeof(hash_str), "_%x", hash_path(module_path));
                         sb_append(&sb, hash_str);
                     }
-                    sb_append(&sb, "()");
+                    if (!fresh_modules || set_contains(fresh_modules, module_path)) {
+                        sb_append(&sb, "()");
+                    }
 
                     p += 2;
                     last = p;
@@ -967,6 +984,9 @@ ModuleLoadResult* loadModules(
     SymbolMap symbol_map;
     symbolmap_init(&symbol_map);
 
+    StringSet fresh_modules;
+    set_init(&fresh_modules);
+
     set_add(&loaded_modules, entry_path);
     map_set(&module_sources, entry_path, entry_source);
 
@@ -1017,21 +1037,36 @@ ModuleLoadResult* loadModules(
         LineMap* source_linemap = linemap_map_get(&module_linemaps, module_path);
         if (!source) continue;
 
+        bool is_fresh = is_fresh_module(source);
+        if (is_fresh) {
+            set_add(&fresh_modules, module_path);
+        }
+
         if (debug_names) {
-            sb_append(&combined, "func __module_");
             char* encoded = encode_path_to_identifier(module_path);
-            sb_append(&combined, encoded);
+            if (is_fresh) {
+                sb_append(&combined, "func __module_");
+                sb_append(&combined, encoded);
+            } else {
+                sb_append(&combined, "func __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, "_init");
+            }
             free(encoded);
         } else {
-            char hash_str[16];
-            snprintf(hash_str, sizeof(hash_str), "func _%x", hash_path(module_path));
+            char hash_str[32];
+            if (is_fresh) {
+                snprintf(hash_str, sizeof(hash_str), "func _%x", hash_path(module_path));
+            } else {
+                snprintf(hash_str, sizeof(hash_str), "func _%x_init", hash_path(module_path));
+            }
             sb_append(&combined, hash_str);
         }
 
         sb_append(&combined, "() {\n");
         addLineMapping(vm, combined_linemap, 0);
 
-        char* transformed = transform_imports(source, module_path, &loaded_modules, &symbol_map, debug_names);
+        char* transformed = transform_imports(source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
         int source_line_idx = 0;
         add_mapped_lines(vm, transformed, source_linemap, combined_linemap, &source_line_idx);
@@ -1039,13 +1074,33 @@ ModuleLoadResult* loadModules(
         sb_append(&combined, transformed);
         free(transformed);
 
-        sb_append(&combined, "\n}\n\n");
+        sb_append(&combined, "\n}\n");
         addLineMapping(vm, combined_linemap, 0);
         addLineMapping(vm, combined_linemap, 0);
+
+        if (!is_fresh) {
+            if (debug_names) {
+                char* encoded = encode_path_to_identifier(module_path);
+                sb_append(&combined, "var __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, " = __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, "_init()\n");
+                free(encoded);
+            } else {
+                char hash_str[64];
+                snprintf(hash_str, sizeof(hash_str), "var _%x = _%x_init()\n",
+                         hash_path(module_path), hash_path(module_path));
+                sb_append(&combined, hash_str);
+            }
+            addLineMapping(vm, combined_linemap, 0);
+        }
+
+        sb_append(&combined, "\n");
         addLineMapping(vm, combined_linemap, 0);
     }
 
-    char* transformed_entry = transform_imports(entry_source, entry_path, &loaded_modules, &symbol_map, debug_names);
+    char* transformed_entry = transform_imports(entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
     int entry_line_idx = 0;
     add_mapped_lines(vm, transformed_entry, entry_line_map, combined_linemap, &entry_line_idx);
@@ -1085,6 +1140,7 @@ cleanup:
     linemap_map_free(vm, &module_linemaps);
     stack_free(&import_stack);
     symbolmap_free(&symbol_map);
+    set_free(&fresh_modules);
 
     return result;
 }
