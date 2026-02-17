@@ -3955,9 +3955,15 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             int exit_jump = -1;
             if (stmt->as.for_stmt.condition) {
-                int cond_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, stmt->as.for_stmt.condition, cond_reg);
-                exit_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, stmt->line);
+                // Try to optimize with branch-compare instruction
+                exit_jump = try_emit_branch_compare(compiler, stmt->as.for_stmt.condition, false, stmt->line);
+
+                if (exit_jump == -1) {
+                    // Fallback: use regular comparison + JUMP_IF_FALSE
+                    int cond_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, stmt->as.for_stmt.condition, cond_reg);
+                    exit_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, stmt->line);
+                }
             }
 
             // 5) loop bookkeeping
