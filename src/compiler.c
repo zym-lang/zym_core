@@ -418,6 +418,53 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
         default: return -1;
     }
 
+    // Early return if we can't use immediate or literal and it's not a simple reg-reg case
+    if (!use_immediate && !use_literal) {
+        // Try register-register branch: compile both sides, use BRANCH_XX + JUMP
+        // We use the ORIGINAL condition (op, not effective_op) with offset +1:
+        //   BRANCH_<original_op> left, right, +1   -- if original cond true, skip JUMP
+        //   JUMP <patched to skip body>             -- reached when original cond false
+        int saved_top = save_temp_top(compiler);
+        int left_reg = compile_sub_expression(compiler, bin->left);
+        int right_reg = compile_sub_expression(compiler, bin->right);
+
+        // Use the ORIGINAL condition so +1 skip works correctly
+        OpCode rr_op;
+        switch (op) {
+            case TOKEN_LESS:          rr_op = BRANCH_LT; break;
+            case TOKEN_LESS_EQUAL:    rr_op = BRANCH_LE; break;
+            case TOKEN_GREATER:       rr_op = BRANCH_GT; break;
+            case TOKEN_GREATER_EQUAL: rr_op = BRANCH_GE; break;
+            case TOKEN_EQUAL_EQUAL:   rr_op = BRANCH_EQ; break;
+            case TOKEN_BANG_EQUAL:    rr_op = BRANCH_NE; break;
+            default: restore_temp_top(compiler, saved_top); return -1;
+        }
+
+        if (jump_if_true) {
+            // jump_if_true: jump when original condition IS true
+            // Use negated condition with +1: if negated is true, skip JUMP; else take JUMP
+            OpCode neg_op;
+            switch (op) {
+                case TOKEN_LESS:          neg_op = BRANCH_GE; break;
+                case TOKEN_LESS_EQUAL:    neg_op = BRANCH_GT; break;
+                case TOKEN_GREATER:       neg_op = BRANCH_LE; break;
+                case TOKEN_GREATER_EQUAL: neg_op = BRANCH_LT; break;
+                case TOKEN_EQUAL_EQUAL:   neg_op = BRANCH_NE; break;
+                case TOKEN_BANG_EQUAL:    neg_op = BRANCH_EQ; break;
+                default: restore_temp_top(compiler, saved_top); return -1;
+            }
+            emit_instruction(compiler, PACK_ABC(neg_op, left_reg, right_reg, 1), line);
+        } else {
+            // jump_if_false (normal case): jump when original condition is FALSE
+            // BRANCH_<original> +1: if true, skip the JUMP (fall into body); if false, take JUMP
+            emit_instruction(compiler, PACK_ABC(rr_op, left_reg, right_reg, 1), line);
+        }
+        // Emit a proper JUMP instruction so patch_jump can patch it
+        int jump_addr = emit_jump_instruction(compiler, JUMP, 0, line);
+        restore_temp_top(compiler, saved_top);
+        return jump_addr;
+    }
+
     int left_reg = compile_sub_expression(compiler, bin->left);
 
     if (use_immediate) {
@@ -427,14 +474,12 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
         int jump_addr = compiler->compiling_chunk->count;
         emit_instruction(compiler, JUMP_PLACEHOLDER, line);
         return jump_addr;
-    } else if (use_literal) {
+    } else {
         emit_instruction(compiler, PACK_ABx(branch_op, left_reg, 0), line);
         write64BitLiteral(compiler->vm, compiler->compiling_chunk, const_value, line);
         int jump_addr = compiler->compiling_chunk->count;
         emit_instruction(compiler, JUMP_PLACEHOLDER, line);
         return jump_addr;
-    } else {
-        return -1;
     }
 }
 
