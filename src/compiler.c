@@ -458,7 +458,9 @@ static void add_break_jump(Compiler* compiler, int jump_address) {
 static void end_scope(Compiler* c) {
     c->scope_depth--;
     while (c->local_count > 0 && c->locals[c->local_count - 1].depth > c->scope_depth) {
-        emit_instruction(c, PACK_ABx(CLOSE_UPVALUE, c->locals[c->local_count - 1].reg, 0), 0);
+        if (c->locals[c->local_count - 1].is_captured) {
+            emit_instruction(c, PACK_ABx(CLOSE_UPVALUE, c->locals[c->local_count - 1].reg, 0), 0);
+        }
         int r = c->locals[--c->local_count].reg;
     }
 }
@@ -564,6 +566,7 @@ static int resolve_upvalue(Compiler* compiler, Token* name) {
     int local = resolve_local(compiler->enclosing, name);
     if (local != -1) {
         Local* parent_local = get_local_by_reg(compiler->enclosing, local);
+        if (parent_local) parent_local->is_captured = true;
         ObjStructSchema* struct_type = parent_local ? parent_local->struct_type : NULL;
         return add_upvalue(compiler, (uint8_t)local, true, struct_type);
     }
@@ -571,6 +574,7 @@ static int resolve_upvalue(Compiler* compiler, Token* name) {
     int mlocal = resolve_mangled_local_by_base(compiler->enclosing, name);
     if (mlocal != -1) {
         Local* parent_local = get_local_by_reg(compiler->enclosing, mlocal);
+        if (parent_local) parent_local->is_captured = true;
         ObjStructSchema* struct_type = parent_local ? parent_local->struct_type : NULL;
         return add_upvalue(compiler, (uint8_t)mlocal, true, struct_type);
     }
@@ -597,6 +601,8 @@ static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
     local->is_reference = false;
     local->is_ref_param = false;
     local->is_slot_param = false;
+    local->is_captured = false;
+    local->deref_cache_reg = -1;
     local->ref_target_reg = -1;
     local->struct_type = NULL;
 }
@@ -614,6 +620,8 @@ static int add_local(Compiler* compiler, Token name) {
     local->is_reference = false;
     local->is_ref_param = false;
     local->is_slot_param = false;
+    local->is_captured = false;
+    local->deref_cache_reg = -1;
     local->ref_target_reg = -1;
     local->struct_type = NULL;
     return reserve_register(compiler);
@@ -1501,8 +1509,21 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 }
 
                 if (should_deref) {
-                    // Ref or slot parameter: dereference ONE level to get the aliased value
-                    emit_instruction(compiler, PACK_ABC(DEREF_GET, target_reg, reg, 0), expr->line);
+                    // Check if this ref param has a cached deref register
+                    int cache_reg = -1;
+                    for (int i = 0; i < compiler->local_count; i++) {
+                        if (compiler->locals[i].reg == reg && compiler->locals[i].deref_cache_reg >= 0) {
+                            cache_reg = compiler->locals[i].deref_cache_reg;
+                            break;
+                        }
+                    }
+                    if (cache_reg >= 0) {
+                        // Use cached dereferenced value instead of emitting DEREF_GET
+                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, cache_reg, expr->line);
+                    } else {
+                        // Ref or slot parameter: dereference ONE level to get the aliased value
+                        emit_instruction(compiler, PACK_ABC(DEREF_GET, target_reg, reg, 0), expr->line);
+                    }
                 } else if (reg == target_reg) {
                     // Already in target register - no move needed!
                     // This is a common case and eliminates unnecessary MOVE dispatches
@@ -2113,10 +2134,16 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             bool can_optimize = true;
 
+            // Special case: for zero-argument calls (call_slots_needed == 1), the only slot
+            // used is target_reg itself. If target_reg is a local, we're assigning to it anyway,
+            // so overwriting it with the callee and then the result is safe.
+            bool is_zero_arg_local_target = (arg_count == 0 && is_local_reg(compiler, target_reg));
+
             // Check 1: target_reg must be >= next_register_before_args (outside the local region)
             // We allow target_reg == next_register_before_args because it's at the boundary
             // We also allow target_reg == next_register_before_args - 1 if it's a temporary (not a local)
-            if (target_reg < next_register_before_args) {
+            // Exception: zero-arg calls to a local target are always safe (only 1 slot used)
+            if (!is_zero_arg_local_target && target_reg < next_register_before_args) {
                 if (target_reg != next_register_before_args - 1 || is_local_reg(compiler, target_reg)) {
                     can_optimize = false;
                     #ifdef DEBUG_CALL_OPT
@@ -2127,7 +2154,8 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             }
 
             // Check 2: Verify no local variable uses any register in [target_reg, target_reg + call_slots_needed)
-            if (can_optimize) {
+            // For zero-arg calls targeting a local, skip this check (only the target slot is used)
+            if (can_optimize && !is_zero_arg_local_target) {
                 for (int i = 0; i < compiler->local_count; i++) {
                     int local_reg = compiler->locals[i].reg;
                     if (local_reg >= target_reg && local_reg < target_reg + call_slots_needed) {
@@ -3738,9 +3766,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             bool then_terminates = compile_statement(compiler, stmt->as.if_stmt.then_branch);
             compiler->in_tail_position = false;
 
-            // Only emit else-jump if then-branch doesn't terminate
+            // Only emit else-jump if then-branch doesn't terminate AND there's an else branch to skip
             int else_jump = -1;
-            if (!then_terminates) {
+            if (!then_terminates && stmt->as.if_stmt.else_branch != NULL) {
                 else_jump = emit_jump_instruction(compiler, JUMP, 0, stmt->line);
             }
 
@@ -4401,6 +4429,141 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
     }
 }
 
+// --- DEREF_GET caching: AST scanner to check if a variable name is directly assigned to ---
+
+static bool is_name_assigned_in_expr(const Token* name, Expr* expr);
+static bool is_name_assigned_in_stmt(const Token* name, Stmt* stmt);
+
+static bool is_name_assigned_in_expr(const Token* name, Expr* expr) {
+    if (!expr) return false;
+    switch (expr->type) {
+        case EXPR_ASSIGN: {
+            // Check if the assignment target is our variable
+            if (expr->as.assign.target->type == EXPR_VARIABLE &&
+                tokens_equal(name, &expr->as.assign.target->as.variable.name)) {
+                return true;
+            }
+            return is_name_assigned_in_expr(name, expr->as.assign.target) ||
+                   is_name_assigned_in_expr(name, expr->as.assign.value);
+        }
+        case EXPR_BINARY:
+            return is_name_assigned_in_expr(name, expr->as.binary.left) ||
+                   is_name_assigned_in_expr(name, expr->as.binary.right);
+        case EXPR_CALL: {
+            if (is_name_assigned_in_expr(name, expr->as.call.callee)) return true;
+            for (int i = 0; i < expr->as.call.arg_count; i++) {
+                if (is_name_assigned_in_expr(name, expr->as.call.args[i])) return true;
+            }
+            return false;
+        }
+        case EXPR_GET:
+            return is_name_assigned_in_expr(name, expr->as.get.object);
+        case EXPR_SET:
+            return is_name_assigned_in_expr(name, expr->as.set.object) ||
+                   is_name_assigned_in_expr(name, expr->as.set.value);
+        case EXPR_UNARY:
+            return is_name_assigned_in_expr(name, expr->as.unary.right);
+        case EXPR_GROUPING:
+            return is_name_assigned_in_expr(name, expr->as.grouping.expression);
+        case EXPR_SUBSCRIPT:
+            return is_name_assigned_in_expr(name, expr->as.subscript.object) ||
+                   is_name_assigned_in_expr(name, expr->as.subscript.index);
+        case EXPR_TERNARY:
+            return is_name_assigned_in_expr(name, expr->as.ternary.condition) ||
+                   is_name_assigned_in_expr(name, expr->as.ternary.then_expr) ||
+                   is_name_assigned_in_expr(name, expr->as.ternary.else_expr);
+        case EXPR_PRE_INC:
+            if (expr->as.pre_inc.target->type == EXPR_VARIABLE &&
+                tokens_equal(name, &expr->as.pre_inc.target->as.variable.name)) return true;
+            return is_name_assigned_in_expr(name, expr->as.pre_inc.target);
+        case EXPR_POST_INC:
+            if (expr->as.post_inc.target->type == EXPR_VARIABLE &&
+                tokens_equal(name, &expr->as.post_inc.target->as.variable.name)) return true;
+            return is_name_assigned_in_expr(name, expr->as.post_inc.target);
+        case EXPR_PRE_DEC:
+            if (expr->as.pre_dec.target->type == EXPR_VARIABLE &&
+                tokens_equal(name, &expr->as.pre_dec.target->as.variable.name)) return true;
+            return is_name_assigned_in_expr(name, expr->as.pre_dec.target);
+        case EXPR_POST_DEC:
+            if (expr->as.post_dec.target->type == EXPR_VARIABLE &&
+                tokens_equal(name, &expr->as.post_dec.target->as.variable.name)) return true;
+            return is_name_assigned_in_expr(name, expr->as.post_dec.target);
+        case EXPR_LIST: {
+            for (int i = 0; i < expr->as.list.count; i++) {
+                if (is_name_assigned_in_expr(name, expr->as.list.elements[i])) return true;
+            }
+            return false;
+        }
+        case EXPR_MAP: {
+            for (int i = 0; i < expr->as.map.count; i++) {
+                if (is_name_assigned_in_expr(name, expr->as.map.keys[i])) return true;
+                if (is_name_assigned_in_expr(name, expr->as.map.values[i])) return true;
+            }
+            return false;
+        }
+        case EXPR_TYPEOF:
+            return is_name_assigned_in_expr(name, expr->as.typeof_expr.operand);
+        case EXPR_SPREAD:
+            return is_name_assigned_in_expr(name, expr->as.spread.expression);
+        case EXPR_FUNCTION:
+            // Don't recurse into nested function bodies — they have their own scope
+            return false;
+        default:
+            return false;
+    }
+}
+
+static bool is_name_assigned_in_stmt(const Token* name, Stmt* stmt) {
+    if (!stmt) return false;
+    switch (stmt->type) {
+        case STMT_EXPRESSION:
+            return is_name_assigned_in_expr(name, stmt->as.expression.expression);
+        case STMT_BLOCK: {
+            for (int i = 0; i < stmt->as.block.count; i++) {
+                if (is_name_assigned_in_stmt(name, stmt->as.block.statements[i])) return true;
+            }
+            return false;
+        }
+        case STMT_IF:
+            return is_name_assigned_in_expr(name, stmt->as.if_stmt.condition) ||
+                   is_name_assigned_in_stmt(name, stmt->as.if_stmt.then_branch) ||
+                   is_name_assigned_in_stmt(name, stmt->as.if_stmt.else_branch);
+        case STMT_WHILE:
+            return is_name_assigned_in_expr(name, stmt->as.while_stmt.condition) ||
+                   is_name_assigned_in_stmt(name, stmt->as.while_stmt.body);
+        case STMT_DO_WHILE:
+            return is_name_assigned_in_expr(name, stmt->as.do_while_stmt.condition) ||
+                   is_name_assigned_in_stmt(name, stmt->as.do_while_stmt.body);
+        case STMT_FOR:
+            return is_name_assigned_in_stmt(name, stmt->as.for_stmt.initializer) ||
+                   is_name_assigned_in_expr(name, stmt->as.for_stmt.condition) ||
+                   is_name_assigned_in_expr(name, stmt->as.for_stmt.increment) ||
+                   is_name_assigned_in_stmt(name, stmt->as.for_stmt.body);
+        case STMT_RETURN:
+            return is_name_assigned_in_expr(name, stmt->as.return_stmt.value);
+        case STMT_VAR_DECLARATION: {
+            for (int i = 0; i < stmt->as.var_declaration.count; i++) {
+                if (is_name_assigned_in_expr(name, stmt->as.var_declaration.variables[i].initializer))
+                    return true;
+            }
+            return false;
+        }
+        case STMT_SWITCH: {
+            if (is_name_assigned_in_expr(name, stmt->as.switch_stmt.expression)) return true;
+            for (int i = 0; i < stmt->as.switch_stmt.case_count; i++) {
+                CaseClause* c = &stmt->as.switch_stmt.cases[i];
+                if (is_name_assigned_in_expr(name, c->value)) return true;
+                for (int j = 0; j < c->statement_count; j++) {
+                    if (is_name_assigned_in_stmt(name, c->statements[j])) return true;
+                }
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
 static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclStmt* stmt) {
     Compiler fn_compiler = {0};  // Zero-initialize to prevent garbage values during GC
     init_compiler(&fn_compiler, current_compiler->vm, current_compiler);
@@ -4468,6 +4631,8 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     local->is_reference = false;
     local->is_ref_param = false;
     local->is_slot_param = false;
+    local->is_captured = false;
+    local->deref_cache_reg = -1;
     local->ref_target_reg = -1;
     reserve_register(&fn_compiler); // Consumes R0
 
@@ -4498,6 +4663,28 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                     fn_compiler.locals[j].ref_target_reg = -1;     // Will be set at runtime
                     break;
                 }
+            }
+        }
+    }
+
+    // --- DEREF_GET caching for ref params ---
+    // For each ref param that is never directly assigned to in the function body,
+    // emit a single DEREF_GET at function entry and cache the result in a register.
+    // This avoids repeated DEREF_GET instructions on every access in loops.
+    // The cache register is added as a hidden local so it won't be overwritten by temps.
+    for (int i = 0; i < fn_compiler.local_count; i++) {
+        if (fn_compiler.locals[i].is_ref_param) {
+            Token* param_name = &fn_compiler.locals[i].name;
+            // Check if this ref param is ever directly assigned to in the body
+            if (!is_name_assigned_in_stmt(param_name, stmt->body)) {
+                int param_reg = fn_compiler.locals[i].reg;
+                // Use add_local to register the cache as a proper local (protected from temp reuse)
+                // Use a zero-length synthetic name so resolve_local never matches it
+                Token cache_name = { .start = "", .length = 0, .line = stmt->name.line };
+                int cache_reg = add_local(&fn_compiler, cache_name);
+                fn_compiler.locals[fn_compiler.local_count - 1].is_initialized = true;
+                emit_instruction(&fn_compiler, PACK_ABC(DEREF_GET, cache_reg, param_reg, 0), stmt->name.line);
+                fn_compiler.locals[i].deref_cache_reg = cache_reg;
             }
         }
     }
@@ -4537,6 +4724,15 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
     // Pass 1: Declare variables WITHOUT evaluating initializers.
     // This reserves register slots for all local variables so they can be captured by closures.
+    // Check if the function body contains any function declarations (closures).
+    // If not, we can skip null initialization since no variable can be captured.
+    bool has_closures = false;
+    for (int i = 0; i < body->count; i++) {
+        if (body->statements[i]->type == STMT_FUNC_DECLARATION) {
+            has_closures = true;
+            break;
+        }
+    }
     for (int i = 0; i < body->count; i++) {
         if (body->statements[i]->type == STMT_VAR_DECLARATION) {
             VarDeclStmt* var_stmt = &body->statements[i]->as.var_declaration;
@@ -4544,9 +4740,12 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                 VarDecl* var = &var_stmt->variables[j];
                 declare_variable(&fn_compiler, &var->name);
                 int value_reg = reserve_register(&fn_compiler);
-                // Initialize to null for now; actual initializer will be evaluated later
-                int null_const = make_constant(&fn_compiler, NULL_VAL);
-                emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                if (has_closures) {
+                    // Initialize to null for now; actual initializer will be evaluated later.
+                    // This is needed because closures compiled in Pass 2 may capture this variable.
+                    int null_const = make_constant(&fn_compiler, NULL_VAL);
+                    emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                }
                 add_local_at_reg(&fn_compiler, var->name, value_reg);
             }
         }
