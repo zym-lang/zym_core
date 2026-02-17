@@ -86,6 +86,10 @@ ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, s
 // Returns ZYM_STATUS_OK on success, ZYM_STATUS_COMPILE_ERROR on parse error
 ZymStatus zym_defineNative(ZymVM* vm, const char* signature, void* func_ptr);
 
+// Define a global variable accessible from Zym code
+// This sets the value directly in the VM's global table
+ZymStatus zym_defineGlobal(ZymVM* vm, const char* name, ZymValue value);
+
 // =============================================================================
 // NATIVE CLOSURES
 // =============================================================================

@@ -189,6 +189,21 @@ ZymStatus zym_defineNative(ZymVM* vm, const char* signature, void* func_ptr) {
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
+ZymStatus zym_defineGlobal(ZymVM* vm, const char* name, ZymValue value) {
+    if (!vm || !name) {
+        return ZYM_STATUS_COMPILE_ERROR;
+    }
+
+    if (IS_OBJ(value)) pushTempRoot(vm, AS_OBJ(value));
+    ObjString* nameStr = copyString(vm, name, (int)strlen(name));
+    pushTempRoot(vm, (Obj*)nameStr);
+    tableSet(vm, &vm->globals, nameStr, value);
+    popTempRoot(vm);
+    if (IS_OBJ(value)) popTempRoot(vm);
+
+    return ZYM_STATUS_OK;
+}
+
 // =============================================================================
 // NATIVE CLOSURES
 // =============================================================================
