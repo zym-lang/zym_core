@@ -4785,9 +4785,12 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
                 VarDecl* var = &var_stmt->variables[j];
                 declare_variable(&fn_compiler, &var->name);
                 int value_reg = reserve_register(&fn_compiler);
-                if (has_closures) {
-                    // Initialize to null for now; actual initializer will be evaluated later.
-                    // This is needed because closures compiled in Pass 2 may capture this variable.
+                if (has_closures || var->initializer == NULL) {
+                    // Initialize to null when:
+                    // 1. Closures exist: closures compiled in Pass 2 may capture this variable
+                    //    before its initializer runs in Pass 3, so it must have a defined value.
+                    // 2. No initializer: "var x" with no initializer must be null, and there's
+                    //    no Pass 3 initializer to overwrite it.
                     int null_const = make_constant(&fn_compiler, NULL_VAL);
                     emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
                 }
