@@ -75,19 +75,31 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
     ObjContinuation* cont = newContinuation(vm);
     pushTempRoot(vm, (Obj*)cont);
 
-    cont->frame_count = capture_frame_count;
+    // Allocate and initialize buffers BEFORE publishing sizes to the GC.
+    CallFrame* frames_buf = NULL;
     if (capture_frame_count > 0) {
-        cont->frames = ALLOCATE(vm, CallFrame, capture_frame_count);
-        memcpy(cont->frames, &vm->frames[prompt_frame],
+        frames_buf = ALLOCATE(vm, CallFrame, capture_frame_count);
+        // Zero-initialize so a GC during construction sees safe NULL pointers.
+        memset(frames_buf, 0, capture_frame_count * sizeof(CallFrame));
+        memcpy(frames_buf, &vm->frames[prompt_frame],
                capture_frame_count * sizeof(CallFrame));
     }
 
-    cont->stack_size = capture_stack_size;
+    Value* stack_buf = NULL;
     if (capture_stack_size > 0) {
-        cont->stack = ALLOCATE(vm, Value, capture_stack_size);
-        memcpy(cont->stack, &vm->stack[capture_stack_base],
+        stack_buf = ALLOCATE(vm, Value, capture_stack_size);
+        // Initialize with NULL_VAL so GC marking is safe if interleaved.
+        for (int i = 0; i < capture_stack_size; i++) stack_buf[i] = NULL_VAL;
+        memcpy(stack_buf, &vm->stack[capture_stack_base],
                capture_stack_size * sizeof(Value));
     }
+
+    // Publish fields atomically with consistent pointer+size pairs.
+    cont->frames = frames_buf;
+    cont->frame_count = capture_frame_count;
+
+    cont->stack = stack_buf;
+    cont->stack_size = capture_stack_size;
 
     cont->saved_ip = vm->ip;
     cont->saved_chunk = vm->chunk;
