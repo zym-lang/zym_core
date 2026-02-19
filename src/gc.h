@@ -19,4 +19,4 @@ void freeObject(VM* vm, Obj* object);
 
 //#define GC_DEBUG
 //#define GC_DEBUG_FULL
-#define DEBUG_STRESS_GC
+//#define DEBUG_STRESS_GC

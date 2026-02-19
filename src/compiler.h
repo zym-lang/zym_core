@@ -48,10 +48,9 @@ typedef struct {
     Token name;
     int arity;
     uint8_t* param_qualifiers;  // Array of ParamQualifier values, dynamically allocated
-    int upvalue_count;          // Number of upvalues this function captures (for TCO optimization)
+    int upvalue_count;
 } HoistedFn;
 
-// Global variable type tracking (for struct type inference at compile time)
 typedef struct {
     ObjString* name;
     ObjStructSchema* schema;
@@ -90,10 +89,9 @@ typedef struct {
     bool is_resolved;           // true if label has been found and jump patched
 } PendingGoto;
 
-// Track global variable declarations with initializers for goto validation
 typedef struct {
-    int bytecode_pos;           // Bytecode position where DEFINE_GLOBAL was emitted
-    Token name;                 // Variable name
+    int bytecode_pos;
+    Token name;
 } GlobalDecl;
 
 #define MAX_GLOBAL_DECLS 256
@@ -135,29 +133,24 @@ typedef struct Compiler {
     HoistedFn local_hoisted[MAX_LOCALS];
     int local_hoisted_count;
 
-    // for freeing temporary mangled names created during compilation (locals)
     char** owned_names;
     int    owned_names_count;
     int    owned_names_cap;
 
-    // Struct schemas (supports shadowing)
     StructSchema struct_schemas[MAX_LOCALS];
     int struct_schema_count;
 
-    // Enum schemas (supports shadowing)
     EnumSchema enum_schemas[MAX_LOCALS];
     int enum_schema_count;
 
-    // Global variable type tracking (for struct type inference)
     GlobalType* global_types;
     int global_type_count;
     int global_type_capacity;
 
-    TcoMode tco_mode;  // Current tail call optimization level
-    bool in_tail_position;  // True if currently compiling in tail position
-    bool result_needed;  // True if expression result is needed (false in statement context)
+    TcoMode tco_mode;
+    bool in_tail_position;
+    bool result_needed;
 
-    // Label and goto tracking
     Label labels[MAX_LABELS];
     int label_count;
 
@@ -165,7 +158,6 @@ typedef struct Compiler {
     int pending_goto_count;
     int pending_goto_capacity;
 
-    // Global variable declaration tracking (for goto validation)
     GlobalDecl global_decls[MAX_GLOBAL_DECLS];
     int global_decl_count;
 

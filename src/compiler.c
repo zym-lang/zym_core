@@ -418,17 +418,11 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
         default: return -1;
     }
 
-    // Early return if we can't use immediate or literal and it's not a simple reg-reg case
     if (!use_immediate && !use_literal) {
-        // Try register-register branch: compile both sides, use BRANCH_XX + JUMP
-        // We use the ORIGINAL condition (op, not effective_op) with offset +1:
-        //   BRANCH_<original_op> left, right, +1   -- if original cond true, skip JUMP
-        //   JUMP <patched to skip body>             -- reached when original cond false
         int saved_top = save_temp_top(compiler);
         int left_reg = compile_sub_expression(compiler, bin->left);
         int right_reg = compile_sub_expression(compiler, bin->right);
 
-        // Use the ORIGINAL condition so +1 skip works correctly
         OpCode rr_op;
         switch (op) {
             case TOKEN_LESS:          rr_op = BRANCH_LT; break;
@@ -441,8 +435,6 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
         }
 
         if (jump_if_true) {
-            // jump_if_true: jump when original condition IS true
-            // Use negated condition with +1: if negated is true, skip JUMP; else take JUMP
             OpCode neg_op;
             switch (op) {
                 case TOKEN_LESS:          neg_op = BRANCH_GE; break;
@@ -455,11 +447,8 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
             }
             emit_instruction(compiler, PACK_ABC(neg_op, left_reg, right_reg, 1), line);
         } else {
-            // jump_if_false (normal case): jump when original condition is FALSE
-            // BRANCH_<original> +1: if true, skip the JUMP (fall into body); if false, take JUMP
             emit_instruction(compiler, PACK_ABC(rr_op, left_reg, right_reg, 1), line);
         }
-        // Emit a proper JUMP instruction so patch_jump can patch it
         int jump_addr = emit_jump_instruction(compiler, JUMP, 0, line);
         restore_temp_top(compiler, saved_top);
         return jump_addr;
@@ -924,15 +913,12 @@ static void scoped_string_free(ScopedString* s) {
     }
 }
 
-// Helper: Create reference to a variable (handles local/upvalue/global with function name mangling)
 static void emit_variable_reference_typed(Compiler* compiler, Token* var_name, int target_reg, int line, RefCreationMode ref_mode) {
     int var_reg = resolve_local(compiler, var_name);
 
-    // If not found as exact local name, try resolving as a local function by base name
     if (var_reg == -1) {
         int arity = single_local_hoisted_arity(compiler, var_name);
         if (arity >= 0) {
-            // It's a unique local function - try resolving by mangled name
             var_reg = resolve_mangled_local_by_base(compiler, var_name);
         } else if (arity == -2) {
             compiler_error_and_exit(line, "Cannot create reference to overloaded function '%.*s'. Store the function in a variable first, then create a reference to that variable.", var_name->length, var_name->start);
@@ -940,7 +926,6 @@ static void emit_variable_reference_typed(Compiler* compiler, Token* var_name, i
     }
 
     if (var_reg != -1) {
-        // Local variable - create local reference
         if (ref_mode == REF_MODE_NORMAL) {
             int ultimate_target = resolve_ref_target(compiler, var_reg);
             emit_instruction(compiler, PACK_ABC(MAKE_REF, target_reg, ultimate_target, 0), line);
@@ -948,16 +933,13 @@ static void emit_variable_reference_typed(Compiler* compiler, Token* var_name, i
             emit_instruction(compiler, PACK_ABC(SLOT_MAKE_REF, target_reg, var_reg, 0), line);
         }
     } else if ((var_reg = resolve_upvalue(compiler, var_name)) != -1) {
-        // Upvalue - create upvalue reference
         emit_instruction(compiler, PACK_ABx(MAKE_UPVALUE_REF, target_reg, var_reg), line);
     } else {
-        // Check if this is an overloaded global function
         int arity = single_hoisted_arity(compiler, var_name);
         if (arity == -2) {
             compiler_error_and_exit(line, "Cannot create reference to overloaded function '%.*s'. Store the function in a variable first, then create a reference to that variable.",
                     var_name->length, var_name->start);
         }
-        // Global variable - create global reference (handles function name mangling)
         int name_const = resolve_ref_target_name(compiler, var_name);
         OpCode opcode = (ref_mode == REF_MODE_NORMAL) ? MAKE_GLOBAL_REF : SLOT_MAKE_GLOBAL_REF;
         emit_instruction(compiler, PACK_ABx(opcode, target_reg, name_const), line);
@@ -968,7 +950,6 @@ static void emit_variable_reference(Compiler* compiler, Token* var_name, int tar
     emit_variable_reference_typed(compiler, var_name, target_reg, line, REF_MODE_NORMAL);
 }
 
-// Helper: Create reference to array[index]
 static void emit_subscript_reference_typed(Compiler* compiler, SubscriptExpr* sub_expr, int target_reg, int line, RefCreationMode ref_mode) {
     int container_reg = alloc_temp(compiler);
     int index_reg = alloc_temp(compiler);
@@ -984,14 +965,12 @@ static void emit_subscript_reference(Compiler* compiler, SubscriptExpr* sub_expr
     emit_subscript_reference_typed(compiler, sub_expr, target_reg, line, REF_MODE_NORMAL);
 }
 
-// Helper: Create reference to map.property
 static void emit_property_reference_typed(Compiler* compiler, GetExpr* get_expr, int target_reg, int line, RefCreationMode ref_mode) {
     int container_reg = alloc_temp(compiler);
     int key_reg = alloc_temp(compiler);
 
     COMPILE_REQUIRED(compiler, get_expr->object, container_reg);
 
-    // Convert property name to string constant
     int key_const = identifier_constant(compiler, &get_expr->name);
     emit_load_const(compiler, key_reg, key_const, line);
 
@@ -1003,7 +982,6 @@ static void emit_property_reference(Compiler* compiler, GetExpr* get_expr, int t
     emit_property_reference_typed(compiler, get_expr, target_reg, line, REF_MODE_NORMAL);
 }
 
-// Helper: Create reference from an expression (used for ref variable initialization)
 static void emit_reference_from_expr(Compiler* compiler, Expr* initializer, int target_reg, int line) {
     if (initializer->type == EXPR_VARIABLE) {
         emit_variable_reference(compiler, &initializer->as.variable.name, target_reg, line);
@@ -1012,7 +990,6 @@ static void emit_reference_from_expr(Compiler* compiler, Expr* initializer, int 
     } else if (initializer->type == EXPR_GET) {
         emit_property_reference(compiler, &initializer->as.get, target_reg, line);
     } else {
-        // Provide specific error messages for common mistakes
         const char* error_msg;
         if (initializer->type == EXPR_LITERAL) {
             error_msg = "Cannot create reference to literal value (number, string, boolean, null). References must point to variables, array elements, or map properties.";
@@ -1030,8 +1007,6 @@ static void emit_reference_from_expr(Compiler* compiler, Expr* initializer, int 
 }
 
 
-// Helper: Compile argument for ref parameter
-// Creates a reference to the argument that will be passed to the function
 static void compile_ref_param_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
     if (arg->type == EXPR_VARIABLE) {
         Token* var_name = &arg->as.variable.name;
@@ -1039,17 +1014,13 @@ static void compile_ref_param_argument(Compiler* compiler, Expr* arg, int arg_sl
 
         if (var_reg != -1) {
             if (is_local_ref_param(compiler, var_reg)) {
-                // Already a ref parameter - pass the reference directly
                 emit_move(compiler, arg_slot, var_reg, line);
             } else {
-                // Local variable - create a reference to it
                 emit_instruction(compiler, PACK_ABC(MAKE_REF, arg_slot, var_reg, 0), line);
             }
         } else if ((var_reg = resolve_upvalue(compiler, var_name)) != -1) {
-            // Upvalue - create upvalue reference
             emit_instruction(compiler, PACK_ABx(MAKE_UPVALUE_REF, arg_slot, var_reg), line);
         } else {
-            // Global variable - create global reference
             int name_const = identifier_constant(compiler, var_name);
             emit_instruction(compiler, PACK_ABx(MAKE_GLOBAL_REF, arg_slot, name_const), line);
         }
@@ -1058,7 +1029,6 @@ static void compile_ref_param_argument(Compiler* compiler, Expr* arg, int arg_sl
     } else if (arg->type == EXPR_GET) {
         emit_property_reference(compiler, &arg->as.get, arg_slot, line);
     } else {
-        // Complex expression - evaluate and create reference to result slot
         COMPILE_REQUIRED(compiler, arg, arg_slot);
         int temp_ref = alloc_temp(compiler);
         emit_instruction(compiler, PACK_ABC(MAKE_REF, temp_ref, arg_slot, 0), line);
@@ -1066,18 +1036,14 @@ static void compile_ref_param_argument(Compiler* compiler, Expr* arg, int arg_sl
     }
 }
 
-// Helper: Compile argument for slot parameter
-// Creates a NON-FLATTENING reference for slot semantics
 static void compile_slot_param_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
     if (arg->type == EXPR_VARIABLE) {
         Token* var_name = &arg->as.variable.name;
         int var_reg = resolve_local(compiler, var_name);
 
         if (var_reg != -1 && (is_local_ref_or_slot_param(compiler, var_reg) || is_local_holding_reference(compiler, var_reg))) {
-            // Already a ref/slot parameter or holds a reference - pass directly
             emit_move(compiler, arg_slot, var_reg, line);
         } else {
-            // Use typed reference creator with SLOT mode
             emit_variable_reference_typed(compiler, var_name, arg_slot, line, REF_MODE_SLOT);
         }
     } else if (arg->type == EXPR_SUBSCRIPT) {
@@ -1085,7 +1051,6 @@ static void compile_slot_param_argument(Compiler* compiler, Expr* arg, int arg_s
     } else if (arg->type == EXPR_GET) {
         emit_property_reference_typed(compiler, &arg->as.get, arg_slot, line, REF_MODE_SLOT);
     } else {
-        // Complex expression - evaluate and create reference
         COMPILE_REQUIRED(compiler, arg, arg_slot);
         int temp_ref = alloc_temp(compiler);
         emit_instruction(compiler, PACK_ABC(MAKE_REF, temp_ref, arg_slot, 0), line);
@@ -1093,8 +1058,6 @@ static void compile_slot_param_argument(Compiler* compiler, Expr* arg, int arg_s
     }
 }
 
-// Helper: Compile argument for dynamic call (no known signature)
-// Passes l-values as references to enable ref/slot params to work for closures
 static void compile_dynamic_call_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
     if (arg->type == EXPR_VARIABLE) {
         Token* var_name = &arg->as.variable.name;
@@ -1140,16 +1103,12 @@ static void compile_dynamic_call_argument(Compiler* compiler, Expr* arg, int arg
     }
 }
 
-// Helper: Check if TCO is compile-time safe for a given function call
 static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_count) {
-    // Check 1: Is this self-recursion?
     if (compiler->function && compiler->function->name &&
         compiler->function->name->length == name->length &&
         memcmp(compiler->function->name->chars, name->start, name->length) == 0) {
         return compiler->upvalue_count == 0;
     }
-
-    // Check 2: Mangled self-recursion (overloaded function calling itself)
     ScopedString mangled = scoped_mangle(compiler, name, arg_count);
     bool is_self = false;
     if (compiler->function && compiler->function->name &&
@@ -1184,7 +1143,6 @@ static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_co
     return false;
 }
 
-// Helper: Compile tail call - loads function into R0
 static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, int call_base, int line) {
     int reg = -1;
 
@@ -1263,9 +1221,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
     }
 }
 
-// Helper: Compile tail call optimization for return statement
 static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int line) {
-    // Check if this is even a call expression
     CallExpr* call_expr = &return_expr->as.call;
     Expr* callee = call_expr->callee;
     int arg_count = call_expr->arg_count;
@@ -1379,8 +1335,6 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     return true;
 }
 
-// Helper: Create a dispatcher for overloaded functions by collecting all matching overloads
-// Used when referencing an overloaded function name without specifying arity
 static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local) {
     int overload_regs[MAX_OVERLOADS];
     int overload_count = 0;
@@ -1431,9 +1385,6 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
     }
 }
 
-// Helper: Resolve and load a function by name with arity into target register
-// Handles mangled names, hoisted functions, locals, upvalues, and globals
-// Returns true if function was resolved, false otherwise
 static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_count, int target_reg, int line) {
     int reg = -1;
 

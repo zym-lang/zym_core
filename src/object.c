@@ -308,6 +308,7 @@ ObjContinuation* newContinuation(VM* vm) {
     cont->prompt_tag = NULL;
     cont->state = CONT_VALID;
     cont->return_slot = 0;
+    cont->preemption_disable_depth = 0;
     return cont;
 }
 

@@ -498,7 +498,6 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
         return false;
     }
 
-    // Create mangled name (funcName@arity)
     char mangled_name[256];
     snprintf(mangled_name, sizeof(mangled_name), "%s@%d", func_name, arity);
 
@@ -513,7 +512,6 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
         free(qualifiers);
     }
 
-    // Registered before compilation, bypasses slot optimization
     tableSet(vm, &vm->globals, name_obj, OBJ_VAL(native));
     popTempRoot(vm);
     popTempRoot(vm);

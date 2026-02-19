@@ -28,13 +28,15 @@
  *   - Captured continuations are heap-allocated, not limited by these values
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
  */
-#define FRAMES_MAX 64
+#define FRAMES_MAX 512
 #define STACK_MAX 65536
 #define STACK_INITIAL 256
-#define MAX_PROMPTS 32
+#define MAX_PROMPTS 64
 #define DEFAULT_TIMESLICE 10000
-#define MAX_RESUME_DEPTH 16
-#define MAX_WITH_PROMPT_DEPTH 16
+#define MAX_RESUME_DEPTH 64
+#define MAX_WITH_PROMPT_DEPTH 64
+#define FRAME_FLAG_PREEMPT 0x01
+#define FRAME_FLAG_DISABLE_PREEMPT 0x02
 
 typedef struct ObjPromptTag ObjPromptTag;
 
@@ -43,6 +45,7 @@ struct CallFrame {
     uint32_t* ip;
     int stack_base;
     Chunk* caller_chunk;
+    int flags;
 };
 typedef struct CallFrame CallFrame;
 
@@ -109,6 +112,8 @@ typedef struct VM {
     int yield_budget;
     bool preempt_requested;
     bool preemption_enabled;
+    int preemption_disable_depth;
+    Value on_preempt_callback;
     int default_timeslice;
 
     ResumeContext resume_stack[MAX_RESUME_DEPTH];
@@ -142,11 +147,13 @@ void runtimeError(VM* vm, const char* format, ...);
 
 void updateStackReferences(VM* vm, Value* old_stack, Value* new_stack);
 void closeUpvalues(VM* vm, Value* last);
+void unwindFrames(VM* vm, int new_frame_count);
 void protectLocalRefsInValue(VM* vm, Value value, Value* frame_start);
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value);
 bool globalSet(VM* vm, ObjString* name, Value value);
 
+InterpretResult runVM(VM* vm);
 InterpretResult runChunk(VM* vm, Chunk* chunk);
 
 bool zym_call_prepare(VM* vm, const char* functionName, int arity);

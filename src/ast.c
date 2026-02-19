@@ -247,7 +247,6 @@ Expr* clone_expr(VM* vm, Expr* expr) {
             return new_grouping_expr(vm, clone_expr(vm, expr->as.grouping.expression));
 
         default:
-            // Only common lvalue expressions need cloning for compound assignments
             fprintf(stderr, "Warning: clone_expr doesn't support expression type %d\n", expr->type);
             return NULL;
     }

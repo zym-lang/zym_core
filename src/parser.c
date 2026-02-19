@@ -154,7 +154,6 @@ static void error_at_current(Parser* parser, const char* message) {
         char buf[1280];
         int pos = 0;
 
-        // Location prefix
         if (parser->current_module_name) {
             char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
             pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
@@ -163,7 +162,6 @@ static void error_at_current(Parser* parser, const char* message) {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
         }
 
-        // Token context
         if (parser->current.type == TOKEN_EOF) {
             pos += snprintf(buf + pos, sizeof(buf) - pos, " at end");
         } else if (parser->current.type != TOKEN_ERROR) {
@@ -185,7 +183,6 @@ static void error_at_current(Parser* parser, const char* message) {
         }
         parser->vm->error_callback(parser->vm, 1, file, line, buf, parser->vm->error_user_data);
     } else {
-        // Default: write to stderr (original behavior)
         if (parser->current_module_name) {
             char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
             fprintf(stderr, "[%s] line %d", decoded, line);

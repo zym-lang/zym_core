@@ -25,7 +25,6 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
 
     void* result = realloc(pointer, newSize);
     if (result == NULL) {
-        // Try GC before OOM
         if (vm->gc_enabled) {
             collectGarbage(vm);
             result = realloc(pointer, newSize);

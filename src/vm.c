@@ -80,6 +80,8 @@ void initVM(VM* vm) {
     vm->default_timeslice = DEFAULT_TIMESLICE;
     vm->preempt_requested = false;
     vm->preemption_enabled = false;
+    vm->preemption_disable_depth = 0;
+    vm->on_preempt_callback = NULL_VAL;
 
     vm->resume_depth = 0;
     vm->with_prompt_depth = 0;
@@ -89,7 +91,6 @@ void initVM(VM* vm) {
 
     vm->gc_enabled = true;
 
-    // Register core modules (Cont, Preemption, GC) as part of VM init
     setupCoreModules(vm);
 }
 
@@ -442,6 +443,20 @@ void closeUpvalues(VM* vm, Value* last) {
     #undef MAX_CLOSING_UPVALUES
 }
 
+void unwindFrames(VM* vm, int new_frame_count) {
+    while (vm->frame_count > new_frame_count) {
+        CallFrame* frame = &vm->frames[--vm->frame_count];
+        if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
+            vm->preemption_disable_depth--;
+        }
+    }
+
+    while (vm->with_prompt_depth > 0 &&
+           vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
+        vm->with_prompt_depth--;
+    }
+}
+
 static bool validateUpvalue(VM* vm, ObjUpvalue* upvalue, const char* context) {
     if (upvalue == NULL || upvalue->location == NULL) {
         runtimeError(vm, "Invalid upvalue reference in %s.", context);
@@ -697,6 +712,47 @@ static bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     vm->gc_enabled = gc_was_enabled;
 
     if (old_stack_out) *old_stack_out = old_stack;
+    return true;
+}
+
+static bool pushPreemptFrame(VM* vm) {
+    if (IS_NULL(vm->on_preempt_callback) || !IS_CLOSURE(vm->on_preempt_callback)) {
+        return false;
+    }
+
+    ObjClosure* closure = AS_CLOSURE(vm->on_preempt_callback);
+    ObjFunction* function = closure->function;
+
+    if (vm->frame_count == FRAMES_MAX) {
+        return false;
+    }
+
+    if (function->arity != 0) {
+        return false;
+    }
+
+    int callee_slot = vm->stack_top;
+    int needed_top = callee_slot + function->max_regs;
+
+    if (!growStackForCall(vm, needed_top, NULL)) {
+        return false;
+    }
+
+    vm->stack[callee_slot] = vm->on_preempt_callback;
+    vm->stack_top = needed_top;
+
+    CallFrame* frame = &vm->frames[vm->frame_count++];
+    frame->closure      = closure;
+    frame->ip           = vm->ip;
+    frame->stack_base   = callee_slot;
+    frame->caller_chunk = vm->chunk;
+    frame->flags        = FRAME_FLAG_PREEMPT;
+
+    vm->chunk = function->chunk;
+    vm->ip = function->chunk->code;
+
+    vm->preemption_disable_depth++;
+
     return true;
 }
 
@@ -1331,12 +1387,15 @@ static InterpretResult run(VM* vm) {
 
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
-    if (vm->preemption_enabled && --vm->yield_budget <= 0) { \
+    if (vm->preemption_enabled && vm->preemption_disable_depth == 0 && (--vm->yield_budget <= 0 || vm->preempt_requested)) { \
         vm->yield_budget = vm->default_timeslice; \
-        if (vm->preempt_requested) { \
-            vm->preempt_requested = false; \
-            return INTERPRET_YIELD; \
+        vm->preempt_requested = false; \
+        if (IS_CLOSURE(vm->on_preempt_callback)) { \
+            if (pushPreemptFrame(vm)) { \
+                goto *dispatch_table[OPCODE(*vm->ip++)]; \
+            } \
         } \
+        return INTERPRET_YIELD; \
     } \
     goto *dispatch_table[OPCODE(*vm->ip++)]; \
 } while(0)
@@ -3455,6 +3514,7 @@ static InterpretResult run(VM* vm) {
         frame->ip           = vm->ip;
         frame->stack_base   = callee_slot;
         frame->caller_chunk = vm->chunk;
+        frame->flags        = 0;
 
         // Enter callee
         vm->chunk = function->chunk;
@@ -3517,6 +3577,7 @@ static InterpretResult run(VM* vm) {
         frame->ip           = vm->ip;
         frame->stack_base   = callee_slot;
         frame->caller_chunk = vm->chunk;
+        frame->flags        = 0;
 
         // Enter callee (same chunk, restart from beginning)
         vm->ip = function->chunk->code;
@@ -3943,6 +4004,7 @@ static InterpretResult run(VM* vm) {
             frame->ip           = vm->ip;
             frame->stack_base   = callee_slot;
             frame->caller_chunk = vm->chunk;
+            frame->flags        = 0;
 
             // Enter callee
             vm->chunk = closure->function->chunk;
@@ -4039,6 +4101,7 @@ static InterpretResult run(VM* vm) {
             frame->ip           = vm->ip;
             frame->stack_base   = callee_slot;
             frame->caller_chunk = vm->chunk;
+            frame->flags        = 0;
 
             // Enter callee
             vm->ip = function->chunk->code;
@@ -4097,6 +4160,10 @@ static InterpretResult run(VM* vm) {
 
         // Now pop the callee frame
         vm->frame_count--;
+
+        if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
+            vm->preemption_disable_depth--;
+        }
 
         // Check if we're returning from a withPrompt boundary frame
         // If so, auto-pop the prompt that withPrompt installed
@@ -6046,25 +6113,23 @@ static InterpretResult run(VM* vm) {
             return INTERPRET_RUNTIME_ERROR;  // Error already reported
         }
 
-        // Remove the captured frames and stack from the VM
-        // Unwind to the prompt's frame
-        vm->frame_count = prompt->frame_index;
+        unwindFrames(vm, prompt->frame_index);
         vm->stack_top = prompt->stack_base;
 
-        // Restore IP/chunk to the prompt's context
         if (vm->frame_count > 0) {
             CallFrame* frame = &vm->frames[vm->frame_count - 1];
             vm->ip = frame->ip;
             vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
         }
 
-        // Pop the prompt (it's been used)
         popPrompt(vm);
 
-        // Place the continuation object as the result
-        // The withPrompt will receive this as its return value
-        // Put it in the slot that withPrompt expects (the result destination)
-        // For now, we push it on top of the current stack position
+        while (vm->resume_depth > 0 &&
+               vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
+            ResumeContext* ctx = &vm->resume_stack[--vm->resume_depth];
+            vm->stack[ctx->result_slot] = OBJ_VAL(cont);
+        }
+
         vm->stack[vm->stack_top] = OBJ_VAL(cont);
         vm->stack_top++;
 
@@ -6091,8 +6156,6 @@ static InterpretResult run(VM* vm) {
             return INTERPRET_RUNTIME_ERROR;  // Error already reported
         }
 
-        // After resume, execution continues from the continuation's capture point
-        // The IP and chunk have been restored by resumeContinuation
         DISPATCH();
     }
 
@@ -6112,31 +6175,31 @@ static InterpretResult run(VM* vm) {
 
         ObjPromptTag* tag = AS_PROMPT_TAG(tag_val);
 
-        // Find the prompt
         PromptEntry* prompt = findPrompt(vm, tag);
         if (prompt == NULL) {
             runtimeError(vm, "ABORT: prompt tag not found.");
             return INTERPRET_RUNTIME_ERROR;
         }
 
-        // Close upvalues in the region being aborted
         closeUpvalues(vm, &vm->stack[prompt->stack_base]);
 
-        // Unwind to the prompt's frame
-        vm->frame_count = prompt->frame_index;
+        unwindFrames(vm, prompt->frame_index);
         vm->stack_top = prompt->stack_base;
 
-        // Restore IP/chunk to the prompt's context
         if (vm->frame_count > 0) {
             CallFrame* frame = &vm->frames[vm->frame_count - 1];
             vm->ip = frame->ip;
             vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
         }
 
-        // Pop the prompt (it's been used)
         popPrompt(vm);
 
-        // Place the abort value as the result
+        while (vm->resume_depth > 0 &&
+               vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
+            ResumeContext* ctx = &vm->resume_stack[--vm->resume_depth];
+            vm->stack[ctx->result_slot] = abort_val;
+        }
+
         vm->stack[vm->stack_top] = abort_val;
         vm->stack_top++;
 
@@ -6147,6 +6210,10 @@ static InterpretResult run(VM* vm) {
 #undef CUR_BASE
 #undef BINARY_OP
 #undef BINARY_COMPARE
+}
+
+InterpretResult runVM(VM* vm) {
+    return run(vm);
 }
 
 InterpretResult runChunk(VM* vm, Chunk* chunk) {
@@ -6255,16 +6322,23 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure      = closure;
     frame->stack_base   = frame_base;
+    frame->flags        = 0;
 
     // On return, resume at the API trampoline, not bytecode.
     frame->ip           = vm->api_trampoline.code;
     frame->caller_chunk = &vm->api_trampoline;
+
+    uint32_t* saved_ip = vm->ip;
+    Chunk* saved_chunk = vm->chunk;
 
     // Enter the callee
     vm->chunk = function->chunk;
     vm->ip    = function->chunk->code;
 
     InterpretResult result = run(vm);
+
+    vm->ip    = saved_ip;
+    vm->chunk = saved_chunk;
 
     // Result is placed in stack[frame_base] by OP(RET); expose that at API top.
     vm->api_stack_top = frame_base;

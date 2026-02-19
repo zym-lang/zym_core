@@ -16,8 +16,6 @@ static void blackenObject(VM* vm, Obj* object);
 static void sweep(VM* vm);
 static void markChunk(VM* vm, Chunk* chunk);
 
-// Protect objects during multi-step construction
-
 void pushTempRoot(VM* vm, Obj* object) {
     if (object == NULL) return;
 
@@ -186,7 +184,6 @@ static void markRoots(VM* vm) {
         markValue(vm, vm->globalSlots.values[i]);
     }
 
-    // String intern table weak roots - unmarked strings will be cleaned up in tableRemoveWhite
     for (int i = 0; i < vm->frame_count; i++) {
         markObject(vm, (Obj*)vm->frames[i].closure);
         if (vm->frames[i].caller_chunk != NULL) {
@@ -202,6 +199,7 @@ static void markRoots(VM* vm) {
         markChunk(vm, vm->chunk);
     }
     markChunk(vm, &vm->api_trampoline);
+    markValue(vm, vm->on_preempt_callback);
     #ifdef GC_DEBUG_FULL
     printf("Marking compiler roots (compiler=%p)\n", (void*)vm->compiler);
     fflush(stdout);

@@ -126,8 +126,29 @@ ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
         case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
+        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
+}
+
+ZymStatus zym_resume(ZymVM* vm)
+{
+    if (vm == NULL) return ZYM_STATUS_RUNTIME_ERROR;
+
+    InterpretResult result = runVM(vm);
+    switch (result) {
+        case INTERPRET_OK: return ZYM_STATUS_OK;
+        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
+        case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
+        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        default: return ZYM_STATUS_RUNTIME_ERROR;
+    }
+}
+
+void zym_setPreemptCallback(ZymVM* vm, ZymValue callback)
+{
+    if (vm == NULL) return;
+    vm->on_preempt_callback = callback;
 }
 
 #ifndef ZYM_RUNTIME_ONLY
@@ -1059,7 +1080,34 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     InterpretResult result = zym_call_execute(vm, argc);
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
-        case INTERPRET_RUNTIME_ERROR:
+        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
+        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        default: return ZYM_STATUS_RUNTIME_ERROR;
+    }
+}
+
+ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
+    if (!vm) return ZYM_STATUS_RUNTIME_ERROR;
+
+    int frame_base = vm->stack_top;
+
+    vm->stack[frame_base] = closure;
+
+    for (int i = 0; i < argc; i++) {
+        vm->stack[frame_base + 1 + i] = argv[i];
+    }
+    
+    int saved_api_stack_top = vm->api_stack_top;
+    vm->api_stack_top = frame_base + argc;
+
+    InterpretResult result = zym_call_execute(vm, argc);
+    
+    vm->api_stack_top = saved_api_stack_top;
+    
+    switch (result) {
+        case INTERPRET_OK: return ZYM_STATUS_OK;
+        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
+        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }

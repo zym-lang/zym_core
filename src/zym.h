@@ -20,7 +20,8 @@ typedef uint64_t ZymValue;
 typedef enum {
     ZYM_STATUS_OK,
     ZYM_STATUS_COMPILE_ERROR,
-    ZYM_STATUS_RUNTIME_ERROR
+    ZYM_STATUS_RUNTIME_ERROR,
+    ZYM_STATUS_YIELD
 } ZymStatus;
 
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
@@ -60,6 +61,8 @@ void zym_freeLineMap(ZymVM* vm, ZymLineMap* map);
 ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource);
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config);
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
+ZymStatus zym_resume(ZymVM* vm);
+void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
 
 ZymStatus zym_serializeChunk(ZymVM* vm, ZymCompilerConfig config, ZymChunk* chunk, char** out_buffer, size_t* out_size);
 ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, size_t size);
@@ -139,6 +142,10 @@ bool zym_isStruct(ZymValue value);
 bool zym_isEnum(ZymValue value);
 bool zym_isFunction(ZymValue value);
 bool zym_isReference(ZymValue value);
+bool zym_isNativeReference(ZymValue value);
+bool zym_isClosure(ZymValue value);
+bool zym_isPromptTag(ZymValue value);
+bool zym_isContinuation(ZymValue value);
 
 // =============================================================================
 // VALUE EXTRACTION (SAFE)
@@ -260,6 +267,9 @@ ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...);
 
 // Call a script function with argument array
 ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv);
+
+// Call a closure directly
+ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv);
 
 // Get the result of the last call
 ZymValue zym_getCallResult(ZymVM* vm);

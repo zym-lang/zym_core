@@ -263,6 +263,7 @@ typedef struct ObjContinuation {
     ObjPromptTag* prompt_tag;
     ContinuationState state;
     int return_slot;
+    int preemption_disable_depth;
 } ObjContinuation;
 
 ObjFunction* newFunction(VM* vm);
