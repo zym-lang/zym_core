@@ -498,7 +498,12 @@ static ObjString* keyToString(VM* vm, Value key_val) {
         return AS_STRING(key_val);
     } else if (IS_DOUBLE(key_val)) {
         char buffer[64];
-        snprintf(buffer, sizeof(buffer), "%g", AS_DOUBLE(key_val));
+        double num = AS_DOUBLE(key_val);
+        if (num == (long long)num && num >= -1e15 && num <= 1e15) {
+            snprintf(buffer, sizeof(buffer), "%.0f", num);
+        } else {
+            snprintf(buffer, sizeof(buffer), "%g", num);
+        }
         return copyString(vm, buffer, strlen(buffer));
     }
     return NULL;
