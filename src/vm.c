@@ -3550,11 +3550,6 @@ static InterpretResult run(VM* vm) {
                function->arity);
         #endif
 
-        if (arg_count != function->arity) {
-            runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
         // Handle ref/val parameters at runtime
         if (!processParamQualifiers(vm, function, callee_slot, arg_count, false)) {
             return INTERPRET_RUNTIME_ERROR;
@@ -3790,11 +3785,6 @@ static InterpretResult run(VM* vm) {
 
         // Place the closure in the callee slot
         vm->stack[callee_slot] = OBJ_VAL(closure);
-
-        if (arg_count != function->arity) {
-            runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-            return INTERPRET_RUNTIME_ERROR;
-        }
 
         // Handle ref/val parameters (TCO path: defer PARAM_REF handling)
         if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
@@ -4068,11 +4058,6 @@ static InterpretResult run(VM* vm) {
 
         // Place the closure in the callee slot
         vm->stack[callee_slot] = OBJ_VAL(closure);
-
-        if (arg_count != function->arity) {
-            runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-            return INTERPRET_RUNTIME_ERROR;
-        }
 
         // Handle ref/val parameters (use TCO mode - defer PARAM_REF handling)
         if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
