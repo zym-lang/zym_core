@@ -140,7 +140,9 @@ typedef enum {
     LIST_APPEND,
     LIST_SPREAD,         // Spread list/array into another list (Ra = target list, Rb = source to spread)
     GET_SUBSCRIPT,
+    GET_SUBSCRIPT_I,     // Ra = container[Rb][imm8] - immediate index, optimized for lists
     SET_SUBSCRIPT,
+    SET_SUBSCRIPT_I,     // container[Ra][imm8] = Rc - immediate index variant
     SLOT_SET_SUBSCRIPT,  // Like SET_SUBSCRIPT but bypasses reference dereferencing (for slot keyword)
 
     // Map Opcodes

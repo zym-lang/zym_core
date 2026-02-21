@@ -1662,25 +1662,37 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             if (expr->as.assign.target->type == EXPR_SUBSCRIPT) {
                 SubscriptExpr* sub_expr = &expr->as.assign.target->as.subscript;
 
-                // Compile the list, index, and the value to be assigned into temp registers.
+                bool use_imm = false;
+                int imm_val = 0;
+                if (!expr->as.assign.has_slot_modifier &&
+                    sub_expr->index->type == EXPR_LITERAL &&
+                    sub_expr->index->as.literal.literal.type == TOKEN_NUMBER) {
+                    double val = parse_number_literal(sub_expr->index->as.literal.literal.start,
+                                                      sub_expr->index->as.literal.literal.length);
+                    if (val == floor(val) && val >= 0 && val <= 255) {
+                        use_imm = true;
+                        imm_val = (int)val;
+                    }
+                }
+
                 int list_reg = alloc_temp(compiler);
                 COMPILE_REQUIRED(compiler, sub_expr->object, list_reg);
 
-                int index_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
+                int value_reg;
+                if (use_imm) {
+                    value_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
+                    emit_instruction(compiler, PACK_ABC(SET_SUBSCRIPT_I, list_reg, imm_val, value_reg), expr->line);
+                } else {
+                    int index_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
+                    value_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
+                    OpCode set_opcode = expr->as.assign.has_slot_modifier ? SLOT_SET_SUBSCRIPT : SET_SUBSCRIPT;
+                    emit_instruction(compiler, PACK_ABC(set_opcode, list_reg, index_reg, value_reg), expr->line);
+                }
 
-                int value_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-
-                // Emit the instruction to perform the set.
-                // Use SLOT_SET_SUBSCRIPT if has_slot_modifier is true to bypass reference dereferencing
-                OpCode set_opcode = expr->as.assign.has_slot_modifier ? SLOT_SET_SUBSCRIPT : SET_SUBSCRIPT;
-                emit_instruction(compiler, PACK_ABC(set_opcode, list_reg, index_reg, value_reg), expr->line);
-
-                // The result of an assignment is the assigned value. Move it to the target register.
                 EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
-
-                // Free temporary registers.
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
                 break;
             }
@@ -2375,10 +2387,26 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             int saved_top = save_temp_top(compiler);
 
             SubscriptExpr* sub_expr = &expr->as.subscript;
-            // Use compile_sub_expression to avoid MOVEs when object/index are local variables.
+
+            bool use_imm = false;
+            int imm_val = 0;
+            if (sub_expr->index->type == EXPR_LITERAL &&
+                sub_expr->index->as.literal.literal.type == TOKEN_NUMBER) {
+                double val = parse_number_literal(sub_expr->index->as.literal.literal.start,
+                                                  sub_expr->index->as.literal.literal.length);
+                if (val == floor(val) && val >= 0 && val <= 255) {
+                    use_imm = true;
+                    imm_val = (int)val;
+                }
+            }
+
             int list_reg = compile_sub_expression(compiler, sub_expr->object);
-            int index_reg = compile_sub_expression(compiler, sub_expr->index);
-            emit_instruction(compiler, PACK_ABC(GET_SUBSCRIPT, target_reg, list_reg, index_reg), expr->line);
+            if (use_imm) {
+                emit_instruction(compiler, PACK_ABC(GET_SUBSCRIPT_I, target_reg, list_reg, imm_val), expr->line);
+            } else {
+                int index_reg = compile_sub_expression(compiler, sub_expr->index);
+                emit_instruction(compiler, PACK_ABC(GET_SUBSCRIPT, target_reg, list_reg, index_reg), expr->line);
+            }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
         }

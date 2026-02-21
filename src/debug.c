@@ -346,7 +346,21 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case LIST_APPEND:   return reg2_instruction("LIST_APPEND", chunk, offset);
         case LIST_SPREAD:   return reg2_instruction("LIST_SPREAD", chunk, offset);
         case GET_SUBSCRIPT: return reg_instruction_abc("GET_SUBSCRIPT", instruction, offset);
+        case GET_SUBSCRIPT_I: {
+            uint8_t a = REG_A(instruction);
+            uint8_t b = REG_B(instruction);
+            uint8_t c = REG_C(instruction);
+            printf("%-16s R%d, R%d, #%d\n", "GET_SUBSCRIPT_I", a, b, c);
+            return offset + 1;
+        }
         case SET_SUBSCRIPT: return reg_instruction_abc("SET_SUBSCRIPT", instruction, offset);
+        case SET_SUBSCRIPT_I: {
+            uint8_t a = REG_A(instruction);
+            uint8_t b = REG_B(instruction);
+            uint8_t c = REG_C(instruction);
+            printf("%-16s R%d, #%d, R%d\n", "SET_SUBSCRIPT_I", a, b, c);
+            return offset + 1;
+        }
         case SLOT_SET_SUBSCRIPT: return reg_instruction_abc("SLOT_SET_SUBSCRIPT", instruction, offset);
         case NEW_MAP:       return reg_instruction_a("NEW_MAP", instruction, offset);
         case MAP_SET:       return reg_instruction_abc("MAP_SET", instruction, offset);

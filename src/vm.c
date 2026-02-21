@@ -1349,7 +1349,9 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(LIST_APPEND),
         JUMP_ENTRY(LIST_SPREAD),
         JUMP_ENTRY(GET_SUBSCRIPT),
+        JUMP_ENTRY(GET_SUBSCRIPT_I),
         JUMP_ENTRY(SET_SUBSCRIPT),
+        JUMP_ENTRY(SET_SUBSCRIPT_I),
         JUMP_ENTRY(SLOT_SET_SUBSCRIPT),
         JUMP_ENTRY(NEW_MAP),
         JUMP_ENTRY(MAP_SET),
@@ -4652,6 +4654,42 @@ static InterpretResult run(VM* vm) {
         vm->stack[a] = result;
         DISPATCH();
     }
+    OP(GET_SUBSCRIPT_I) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int b = CUR_BASE() + REG_B(instr);
+        int index = REG_C(instr);
+        Value obj_val = vm->stack[b];
+
+        if (!derefContainer(vm, &obj_val, "access subscript")) return INTERPRET_RUNTIME_ERROR;
+
+        if (IS_LIST(obj_val)) {
+            ObjList* list = AS_LIST(obj_val);
+            if (index >= list->items.count) {
+                runtimeError(vm, "List index out of bounds.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            vm->stack[a] = list->items.values[index];
+            DISPATCH();
+        }
+
+        if (IS_MAP(obj_val)) {
+            ObjMap* map = AS_MAP(obj_val);
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d", index);
+            ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
+            Value result;
+            if (tableGet(map->table, key_str, &result)) {
+                vm->stack[a] = result;
+            } else {
+                vm->stack[a] = NULL_VAL;
+            }
+            DISPATCH();
+        }
+
+        runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+        return INTERPRET_RUNTIME_ERROR;
+    }
     OP(SET_SUBSCRIPT) {
         uint32_t instr = vm->ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Object register (list or map)
@@ -4735,6 +4773,71 @@ static InterpretResult run(VM* vm) {
             list->items.values[index] = value_val;
         }
         DISPATCH();
+    }
+    OP(SET_SUBSCRIPT_I) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int index = REG_B(instr);
+        int c = CUR_BASE() + REG_C(instr);
+        Value obj_val = vm->stack[a];
+        Value value_val = vm->stack[c];
+
+        if (!derefContainer(vm, &obj_val, "set subscript")) return INTERPRET_RUNTIME_ERROR;
+
+        if (IS_LIST(obj_val)) {
+            ObjList* list = AS_LIST(obj_val);
+            if (index >= list->items.count) {
+                runtimeError(vm, "List index out of bounds.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            Value existing = list->items.values[index];
+            if (IS_REFERENCE(existing)) {
+                if (!writeThruReference(vm, AS_REFERENCE(existing), value_val, false)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+            } else if (IS_OBJ(existing) && IS_NATIVE_REFERENCE(existing)) {
+                if (!writeReferenceValue(vm, existing, value_val)) {
+                    runtimeError(vm, "Failed to write through native reference in list.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+            } else {
+                list->items.values[index] = value_val;
+            }
+            DISPATCH();
+        }
+
+        if (IS_MAP(obj_val)) {
+            ObjMap* map = AS_MAP(obj_val);
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d", index);
+            ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
+
+            Value existing;
+            if (tableGet(map->table, key_str, &existing)) {
+                if (IS_REFERENCE(existing)) {
+                    if (!writeThruReference(vm, AS_REFERENCE(existing), value_val, false)) {
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    DISPATCH();
+                } else if (IS_OBJ(existing) && IS_NATIVE_REFERENCE(existing)) {
+                    if (!writeReferenceValue(vm, existing, value_val)) {
+                        runtimeError(vm, "Failed to write through native reference in map subscript.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    DISPATCH();
+                }
+            }
+
+            if (IS_NULL(value_val)) {
+                tableDelete(map->table, key_str);
+            } else {
+                tableSet(vm, map->table, key_str, value_val);
+            }
+            DISPATCH();
+        }
+
+        runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+        return INTERPRET_RUNTIME_ERROR;
     }
     OP(SLOT_SET_SUBSCRIPT) {
         // SLOT_SET_SUBSCRIPT: directly replace the element value, bypassing reference dereferencing
