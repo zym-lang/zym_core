@@ -129,11 +129,11 @@ static int upvalueInstruction(const char* name, uint32_t instr, int offset) {
     return offset + 1;
 }
 
-static int jump_if_false_instruction(uint32_t instr, int offset) {
+static int jump_conditional_instruction(const char* name, uint32_t instr, int offset) {
     uint8_t  a   = REG_A(instr);
     int32_t  off = sign_extend_16(REG_Bx(instr));
     int      tgt = offset + 1 + off;
-    printf("%-16s R%-2u, off %+5d -> %04d\n", "JUMP_IF_FALSE", a, (int)off, tgt);
+    printf("%-16s R%-2u, off %+5d -> %04d\n", name, a, (int)off, tgt);
     return offset + 1;
 }
 
@@ -303,7 +303,8 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case NEG:           return reg_instruction_ab("NEG", instruction, offset);
         case NOT:           return reg_instruction_ab("NOT", instruction, offset);
         case BNOT:          return reg_instruction_ab("BNOT", instruction, offset);
-        case JUMP_IF_FALSE: return jump_if_false_instruction(instruction, offset);
+        case JUMP_IF_FALSE: return jump_conditional_instruction("JUMP_IF_FALSE", instruction, offset);
+        case JUMP_IF_TRUE:  return jump_conditional_instruction("JUMP_IF_TRUE", instruction, offset);
         case JUMP:          return jump_instruction(instruction, offset);
         case BRANCH_EQ:     return reg3_instruction("BRANCH_EQ", instruction, offset);
         case BRANCH_NE:     return reg3_instruction("BRANCH_NE", instruction, offset);

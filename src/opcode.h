@@ -84,6 +84,7 @@ typedef enum {
 
     // Control Flow
     JUMP_IF_FALSE,
+    JUMP_IF_TRUE,
     JUMP,
     CALL,
     CALL_SELF,              // Call current function (recursive call optimization)

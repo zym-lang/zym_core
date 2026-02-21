@@ -1306,6 +1306,7 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(LE_L),
         JUMP_ENTRY(GE_L),
         JUMP_ENTRY(JUMP_IF_FALSE),
+        JUMP_ENTRY(JUMP_IF_TRUE),
         JUMP_ENTRY(JUMP),
         JUMP_ENTRY(BRANCH_EQ),
         JUMP_ENTRY(BRANCH_NE),
@@ -2810,6 +2811,21 @@ static InterpretResult run(VM* vm) {
 
         // falsey = null, false, or 0
         if (IS_NULL(condition) || (IS_BOOL(condition) && !AS_BOOL(condition)) || (IS_DOUBLE(condition) && AS_DOUBLE(condition) == 0.0)) {
+            vm->ip += off;
+        }
+        DISPATCH();
+    }
+    OP(JUMP_IF_TRUE) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        uint16_t raw = REG_Bx(instr);
+        int32_t off = sign_extend_16(raw);
+
+        Value condition = vm->stack[a];
+
+        if (!derefOperand(vm, &condition, "conditional")) return INTERPRET_RUNTIME_ERROR;
+
+        if (!(IS_NULL(condition) || (IS_BOOL(condition) && !AS_BOOL(condition)) || (IS_DOUBLE(condition) && AS_DOUBLE(condition) == 0.0))) {
             vm->ip += off;
         }
         DISPATCH();

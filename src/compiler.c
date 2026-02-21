@@ -1843,11 +1843,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 // If left is true, skip right and result is true (left value)
                 // If left is false, result is right value
                 COMPILE_REQUIRED(compiler, expr->as.binary.left, target_reg);
-                // We need to jump if true, but we only have JUMP_IF_FALSE
-                // So: if left is false, continue to evaluate right; otherwise jump over right
-                int eval_right_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, target_reg, expr->line);
-                int skip_right_jump = emit_jump_instruction(compiler, JUMP, 0, expr->line);
-                patch_jump(compiler, eval_right_jump);
+                int skip_right_jump = emit_jump_instruction(compiler, JUMP_IF_TRUE, target_reg, expr->line);
                 COMPILE_REQUIRED(compiler, expr->as.binary.right, target_reg);
                 patch_jump(compiler, skip_right_jump);
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
@@ -2522,12 +2518,15 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // Compile: condition ? then_expr : else_expr
             TernaryExpr* ternary = &expr->as.ternary;
 
-            // Compile condition
-            int cond_reg = alloc_temp(compiler);
-            COMPILE_REQUIRED(compiler, ternary->condition, cond_reg);
-
-            // Emit conditional jump: if condition is false, jump to else branch
-            int jump_to_else = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, expr->line);
+            // Compile condition, unwrapping NOT to use JUMP_IF_TRUE
+            int jump_to_else;
+            if (ternary->condition->type == EXPR_UNARY && ternary->condition->as.unary.operator.type == TOKEN_BANG) {
+                int cond_reg = compile_sub_expression(compiler, ternary->condition->as.unary.right);
+                jump_to_else = emit_jump_instruction(compiler, JUMP_IF_TRUE, cond_reg, expr->line);
+            } else {
+                int cond_reg = compile_sub_expression(compiler, ternary->condition);
+                jump_to_else = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, expr->line);
+            }
 
             // Compile then branch
             COMPILE_REQUIRED(compiler, ternary->then_expr, target_reg);
@@ -3747,14 +3746,15 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             bool saved_tail_if = compiler->in_tail_position;
             compiler->in_tail_position = false;
 
-            // Try to optimize with branch-compare instruction
-            int then_jump = try_emit_branch_compare(compiler, stmt->as.if_stmt.condition, false, stmt->line);
+            Expr* if_cond = stmt->as.if_stmt.condition;
+            bool if_negated = (if_cond->type == EXPR_UNARY && if_cond->as.unary.operator.type == TOKEN_BANG);
+            Expr* if_inner = if_negated ? if_cond->as.unary.right : if_cond;
+
+            int then_jump = try_emit_branch_compare(compiler, if_inner, if_negated, stmt->line);
 
             if (then_jump == -1) {
-                // Fallback: use regular comparison + JUMP_IF_FALSE
-                int condition_reg = alloc_temp(compiler);
-                compile_expression(compiler, stmt->as.if_stmt.condition, condition_reg);
-                then_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, condition_reg, stmt->line);
+                int condition_reg = compile_sub_expression(compiler, if_inner);
+                then_jump = emit_jump_instruction(compiler, if_negated ? JUMP_IF_TRUE : JUMP_IF_FALSE, condition_reg, stmt->line);
             }
 
             // Propagate tail position to both branches
@@ -3788,14 +3788,15 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             compiler->in_tail_position = false;
             int loop_start = compiler->compiling_chunk->count;
 
-            // Try to optimize with branch-compare instruction
-            int exit_jump = try_emit_branch_compare(compiler, stmt->as.while_stmt.condition, false, stmt->line);
+            Expr* while_cond = stmt->as.while_stmt.condition;
+            bool while_negated = (while_cond->type == EXPR_UNARY && while_cond->as.unary.operator.type == TOKEN_BANG);
+            Expr* while_inner = while_negated ? while_cond->as.unary.right : while_cond;
+
+            int exit_jump = try_emit_branch_compare(compiler, while_inner, while_negated, stmt->line);
 
             if (exit_jump == -1) {
-                // Fallback: use regular comparison + JUMP_IF_FALSE
-                int condition_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, stmt->as.while_stmt.condition, condition_reg);
-                exit_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, condition_reg, stmt->line);
+                int condition_reg = compile_sub_expression(compiler, while_inner);
+                exit_jump = emit_jump_instruction(compiler, while_negated ? JUMP_IF_TRUE : JUMP_IF_FALSE, condition_reg, stmt->line);
             }
 
             // Mark the start of this loop's 'break' jump list.
@@ -3906,14 +3907,15 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             int exit_jump = -1;
             if (stmt->as.for_stmt.condition) {
-                // Try to optimize with branch-compare instruction
-                exit_jump = try_emit_branch_compare(compiler, stmt->as.for_stmt.condition, false, stmt->line);
+                Expr* for_cond = stmt->as.for_stmt.condition;
+                bool for_negated = (for_cond->type == EXPR_UNARY && for_cond->as.unary.operator.type == TOKEN_BANG);
+                Expr* for_inner = for_negated ? for_cond->as.unary.right : for_cond;
+
+                exit_jump = try_emit_branch_compare(compiler, for_inner, for_negated, stmt->line);
 
                 if (exit_jump == -1) {
-                    // Fallback: use regular comparison + JUMP_IF_FALSE
-                    int cond_reg = alloc_temp(compiler);
-                    COMPILE_REQUIRED(compiler, stmt->as.for_stmt.condition, cond_reg);
-                    exit_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, stmt->line);
+                    int cond_reg = compile_sub_expression(compiler, for_inner);
+                    exit_jump = emit_jump_instruction(compiler, for_negated ? JUMP_IF_TRUE : JUMP_IF_FALSE, cond_reg, stmt->line);
                 }
             }
 
