@@ -4487,7 +4487,6 @@ static InterpretResult run(VM* vm) {
         uint32_t instr = vm->ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int count = REG_Bx(instr);
-        fflush(stdout);
         ObjList* list = newList(vm);
         // Protect the list from GC during writeValueArray and stack write
         pushTempRoot(vm, (Obj*)list);
