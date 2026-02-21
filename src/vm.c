@@ -3545,51 +3545,58 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(CALL_SELF) {
-        // Optimized recursive call - no global lookup needed
-        // The current function's closure is in the current frame
         uint32_t instr = vm->ip[-1];
-        int callee_slot = CUR_BASE() + REG_A(instr);
-        uint16_t arg_count = REG_Bx(instr);
-
-        // Get the current frame's closure (the function we're already in)
         CallFrame* current_frame = &vm->frames[vm->frame_count - 1];
+        int callee_slot = current_frame->stack_base + REG_A(instr);
         ObjClosure* closure = current_frame->closure;
         ObjFunction* function = closure->function;
 
-        // Place the closure in the callee slot
         vm->stack[callee_slot] = OBJ_VAL(closure);
 
         #ifdef DEBUG_CALL
+        uint16_t arg_count_dbg = REG_Bx(instr);
         printf("[VM CALL_SELF] CUR_BASE=%d, REG_A=%d, callee_slot=%d, arg_count=%u\n",
-               CUR_BASE(), REG_A(instr), callee_slot, arg_count);
+               CUR_BASE(), REG_A(instr), callee_slot, arg_count_dbg);
         printf("[VM CALL_SELF] Function: %.*s, arity=%d\n",
                function->name ? function->name->length : 6,
                function->name ? function->name->chars : "<anon>",
                function->arity);
         #endif
 
-        // Handle ref/val parameters at runtime
-        if (!processParamQualifiers(vm, function, callee_slot, arg_count, false)) {
-            return INTERPRET_RUNTIME_ERROR;
+        if (function->qualifier_sig == QUAL_SIG_ALL_NORMAL) {
+            uint16_t arg_count = REG_Bx(instr);
+            for (int i = 0; i < arg_count; i++) {
+                if (__builtin_expect(IS_REFERENCE(vm->stack[callee_slot + 1 + i]), 0)) {
+                    Value deref_value;
+                    if (!dereferenceValue(vm, vm->stack[callee_slot + 1 + i], &deref_value)) {
+                        deref_value = NULL_VAL;
+                    }
+                    vm->stack[callee_slot + 1 + i] = deref_value;
+                }
+            }
+        } else if (function->qualifier_sig != QUAL_SIG_ALL_NORMAL_NO_REFS) {
+            uint16_t arg_count = REG_Bx(instr);
+            if (!processParamQualifiers(vm, function, callee_slot, arg_count, false)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
         }
 
-        if (vm->frame_count == FRAMES_MAX) {
+        if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
             runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
             return INTERPRET_RUNTIME_ERROR;
         }
 
-        // Calculate required stack size and grow if needed
         int needed_top = callee_slot + function->max_regs;
-        if (!growStackForCall(vm, needed_top, NULL)) {
-            return INTERPRET_RUNTIME_ERROR;
+        if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
+            if (!growStackForCall(vm, needed_top, NULL)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
         }
 
-        // Update stack_top to track highest used slot
         if (needed_top > vm->stack_top) {
             vm->stack_top = needed_top;
         }
 
-        // Push frame
         CallFrame* frame = &vm->frames[vm->frame_count++];
         frame->closure      = closure;
         frame->ip           = vm->ip;
@@ -3597,7 +3604,6 @@ static InterpretResult run(VM* vm) {
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
 
-        // Enter callee (same chunk, restart from beginning)
         vm->ip = function->chunk->code;
         DISPATCH();
     }
@@ -3791,29 +3797,35 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(TAIL_CALL_SELF) {
-        // Optimized recursive tail call - no global lookup needed
         uint32_t instr = vm->ip[-1];
-        int callee_slot = CUR_BASE() + REG_A(instr);
-        uint16_t arg_count = REG_Bx(instr);
-
-        // Get the current frame's closure (the function we're already in)
         CallFrame* current_frame = &vm->frames[vm->frame_count - 1];
+        int callee_slot = current_frame->stack_base + REG_A(instr);
+        uint16_t arg_count = REG_Bx(instr);
         ObjClosure* closure = current_frame->closure;
         ObjFunction* function = closure->function;
 
-        // Place the closure in the callee slot
         vm->stack[callee_slot] = OBJ_VAL(closure);
 
-        // Handle ref/val parameters (TCO path: defer PARAM_REF handling)
-        if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
-            return INTERPRET_RUNTIME_ERROR;
+        if (function->qualifier_sig == QUAL_SIG_ALL_NORMAL) {
+            for (int i = 0; i < arg_count; i++) {
+                if (__builtin_expect(IS_REFERENCE(vm->stack[callee_slot + 1 + i]), 0)) {
+                    Value deref_value;
+                    if (!dereferenceValue(vm, vm->stack[callee_slot + 1 + i], &deref_value)) {
+                        deref_value = NULL_VAL;
+                    }
+                    vm->stack[callee_slot + 1 + i] = deref_value;
+                }
+            }
+        } else if (function->qualifier_sig != QUAL_SIG_ALL_NORMAL_NO_REFS) {
+            if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
         }
 
-        // Reuse current frame (tail call optimization)
         int frame_base = current_frame->stack_base;
         int needed_top = frame_base + function->max_regs;
 
-        if (needed_top > STACK_MAX) {
+        if (__builtin_expect(needed_top > STACK_MAX, 0)) {
             runtimeError(vm, "Stack overflow.");
             return INTERPRET_RUNTIME_ERROR;
         }
@@ -4062,48 +4074,50 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(SMART_TAIL_CALL_SELF) {
-        // Optimized recursive smart tail call - no global lookup needed
-        // For recursive self-calls, we know we're calling the same function,
-        // so we can skip upvalue checks and directly perform tail call
         uint32_t instr = vm->ip[-1];
-        int callee_slot = CUR_BASE() + REG_A(instr);
-        uint16_t arg_count = REG_Bx(instr);
-
-        // Get the current frame's closure (the function we're already in)
         CallFrame* current_frame = &vm->frames[vm->frame_count - 1];
+        int callee_slot = current_frame->stack_base + REG_A(instr);
+        uint16_t arg_count = REG_Bx(instr);
         ObjClosure* closure = current_frame->closure;
         ObjFunction* function = closure->function;
 
-        // Place the closure in the callee slot
         vm->stack[callee_slot] = OBJ_VAL(closure);
 
-        // Handle ref/val parameters (use TCO mode - defer PARAM_REF handling)
-        if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
-            return INTERPRET_RUNTIME_ERROR;
+        if (function->qualifier_sig == QUAL_SIG_ALL_NORMAL) {
+            for (int i = 0; i < arg_count; i++) {
+                if (__builtin_expect(IS_REFERENCE(vm->stack[callee_slot + 1 + i]), 0)) {
+                    Value deref_value;
+                    if (!dereferenceValue(vm, vm->stack[callee_slot + 1 + i], &deref_value)) {
+                        deref_value = NULL_VAL;
+                    }
+                    vm->stack[callee_slot + 1 + i] = deref_value;
+                }
+            }
+        } else if (function->qualifier_sig != QUAL_SIG_ALL_NORMAL_NO_REFS) {
+            if (!processParamQualifiers(vm, function, callee_slot, arg_count, true)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
         }
 
-        // Check if function has upvalues
         if (closure->upvalue_count > 0) {
-            // HAS UPVALUES: Fall back to normal call to preserve upvalue semantics
-            // Close any upvalues in the current frame before making the call
             closeUpvalues(vm, &vm->stack[current_frame->stack_base]);
 
-            if (vm->frame_count == FRAMES_MAX) {
-                runtimeError(vm, "Stack overflow.");
+            if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
+                runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
                 return INTERPRET_RUNTIME_ERROR;
             }
 
-            // Calculate required stack size and grow if needed
             int needed_top = callee_slot + function->max_regs;
-            if (!growStackForCall(vm, needed_top, NULL)) {
-                return INTERPRET_RUNTIME_ERROR;
+            if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
+                if (!growStackForCall(vm, needed_top, NULL)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
             }
 
             if (needed_top > vm->stack_top) {
                 vm->stack_top = needed_top;
             }
 
-            // Push frame (normal call)
             CallFrame* frame = &vm->frames[vm->frame_count++];
             frame->closure      = closure;
             frame->ip           = vm->ip;
@@ -4111,16 +4125,14 @@ static InterpretResult run(VM* vm) {
             frame->caller_chunk = vm->chunk;
             frame->flags        = 0;
 
-            // Enter callee
             vm->ip = function->chunk->code;
             DISPATCH();
         }
 
-        // NO UPVALUES: Perform tail call optimization
         int frame_base = current_frame->stack_base;
         int needed_top = frame_base + function->max_regs;
 
-        if (needed_top > STACK_MAX) {
+        if (__builtin_expect(needed_top > STACK_MAX, 0)) {
             runtimeError(vm, "Stack overflow.");
             return INTERPRET_RUNTIME_ERROR;
         }
