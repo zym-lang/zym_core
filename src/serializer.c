@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "chunk.h"
 #include "config.h"
@@ -276,13 +277,13 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 int32_t nestedSize = 0;
                 READ_BYTES_OR_FAIL(&nestedSize, sizeof(int32_t));
                 if (nestedSize < 0) {
-                    fprintf(stderr, "Function deserialization: invalid nestedSize=%d\n", nestedSize);
+                    fprintf(stderr, "Function deserialization: invalid nestedSize=%" PRId32 "\n", nestedSize);
                     goto fn_deserialize_fail;
                 }
                 if (nestedSize > 0) {
                     const uint8_t* nestedStart = p;
                     if ((size_t)(p - buffer) + (size_t)nestedSize > size) {
-                        fprintf(stderr, "Function deserialization: nested chunk out of bounds, offset=%zu, nestedSize=%d, total_size=%zu\n", (size_t)(p - buffer), nestedSize, size);
+                        fprintf(stderr, "Function deserialization: nested chunk out of bounds, offset=%zu, nestedSize=%" PRId32 ", total_size=%zu\n", (size_t)(p - buffer), nestedSize, size);
                         goto fn_deserialize_fail;
                     }
 

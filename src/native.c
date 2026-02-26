@@ -353,14 +353,14 @@ NativeDispatcher getNativeClosureDispatcher(int arity) {
 }
 
 static const char* skipWhitespace(const char* str) {
-    while (*str && isspace(*str)) str++;
+    while (*str && isspace((unsigned char)*str)) str++;
     return str;
 }
 
 static const char* parseIdentifier(const char* str, char* out, int max_len) {
     str = skipWhitespace(str);
     int i = 0;
-    while (*str && (isalnum(*str) || *str == '_') && i < max_len - 1) {
+    while (*str && (isalnum((unsigned char)*str) || *str == '_') && i < max_len - 1) {
         out[i++] = *str++;
     }
     out[i] = '\0';
@@ -373,7 +373,7 @@ static const char* parseQualifier(const char* str, uint8_t* out_qualifier) {
     char qualifier[16];
     const char* start = str;
     int i = 0;
-    while (*str && isalpha(*str) && i < 15) {
+    while (*str && isalpha((unsigned char)*str) && i < 15) {
         qualifier[i++] = *str++;
     }
     qualifier[i] = '\0';
@@ -498,7 +498,7 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
         return false;
     }
 
-    char mangled_name[256];
+    char mangled_name[256 + 16];
     snprintf(mangled_name, sizeof(mangled_name), "%s@%d", func_name, arity);
 
     ObjString* name_obj = copyString(vm, mangled_name, (int)strlen(mangled_name));

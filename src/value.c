@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "./value.h"
 
@@ -190,6 +191,25 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
             case OBJ_INT64:
                 printf("%lld", ((ObjInt64*)obj)->value);
                 break;
+            case OBJ_DISPATCHER:
+                printf("<overloaded function>");
+                break;
+            case OBJ_PROMPT_TAG: {
+                ObjPromptTag* tag = AS_PROMPT_TAG(value);
+                if (tag->name != NULL) {
+                    printf("<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
+                } else {
+                    printf("<prompt-tag #%" PRIu32 ">", tag->id);
+                }
+                break;
+            }
+            case OBJ_CONTINUATION: {
+                ObjContinuation* cont = AS_CONTINUATION(value);
+                const char* state_str = cont->state == CONT_VALID ? "valid" :
+                                        cont->state == CONT_CONSUMED ? "consumed" : "invalid";
+                printf("<continuation %s, %d frames>", state_str, cont->frame_count);
+                break;
+            }
             case OBJ_MAP: {
                     ObjMap* map = AS_MAP(value);
                     printf("{");
@@ -224,6 +244,9 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
                                 break;
                             case REF_PROPERTY:
                                 printf("<ref to map property>");
+                                break;
+                            case REF_UPVALUE:
+                                printf("<ref to upvalue>");
                                 break;
                         }
                         break;

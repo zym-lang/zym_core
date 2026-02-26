@@ -122,6 +122,7 @@ static char* encode_path_to_identifier(const char* path) {
 }
 
 /* "src_slash_math_dot_zym" -> "src/math.zym" */
+#if 0
 static char* decode_identifier_to_path(const char* encoded, int length) {
     char* result = (char*)malloc(length + 1);
     size_t j = 0;
@@ -150,6 +151,7 @@ static char* decode_identifier_to_path(const char* encoded, int length) {
 
     return result;
 }
+#endif
 
 typedef struct {
     char* buffer;
@@ -482,16 +484,15 @@ static bool scan_for_imports(const char* source, const char* base_path, ModuleQu
     const char* p = source;
 
     while (*p) {
-        if (strncmp(p, "import", 6) == 0 && !isalnum(p[6]) && p[6] != '_') {
-            const char* import_start = p;
+        if (strncmp(p, "import", 6) == 0 && !isalnum((unsigned char)p[6]) && p[6] != '_') {
             p += 6;
 
-            while (*p && isspace(*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
 
             if (*p == '(') {
                 p++;
 
-                while (*p && isspace(*p)) p++;
+                while (*p && isspace((unsigned char)*p)) p++;
 
                 if (*p == '"') {
                     p++;
@@ -518,19 +519,19 @@ static bool scan_for_imports(const char* source, const char* base_path, ModuleQu
                     }
                 }
             }
-            else if (isalpha(*p) || *p == '_') {
+            else if (isalpha((unsigned char)*p) || *p == '_') {
                 const char* symbol_start = p;
-                while (*p && (isalnum(*p) || *p == '_')) {
+                while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
                     p++;
                 }
                 size_t symbol_len = p - symbol_start;
 
-                while (*p && isspace(*p)) p++;
+                while (*p && isspace((unsigned char)*p)) p++;
 
-                if (strncmp(p, "from", 4) == 0 && !isalnum(p[4]) && p[4] != '_') {
+                if (strncmp(p, "from", 4) == 0 && !isalnum((unsigned char)p[4]) && p[4] != '_') {
                     p += 4;
 
-                    while (*p && isspace(*p)) p++;
+                    while (*p && isspace((unsigned char)*p)) p++;
 
                     if (*p == '"') {
                         p++;
@@ -616,6 +617,7 @@ static bool stack_contains(ImportStack* stack, const char* module) {
     return false;
 }
 
+#if 0
 static char* stack_to_string(ImportStack* stack, const char* new_module) {
     size_t total_len = 0;
     for (int i = 0; i < stack->count; i++) {
@@ -636,6 +638,7 @@ static char* stack_to_string(ImportStack* stack, const char* new_module) {
 
     return result;
 }
+#endif
 
 static void stack_free(ImportStack* stack) {
     for (int i = 0; i < stack->count; i++) {
@@ -751,6 +754,7 @@ static bool load_module_recursive(
     return true;
 }
 
+#if 0
 static int count_newlines(const char* str) {
     int count = 0;
     while (*str) {
@@ -759,6 +763,7 @@ static int count_newlines(const char* str) {
     }
     return count;
 }
+#endif
 
 static void add_mapped_lines(VM* vm, const char* text, LineMap* source_linemap, LineMap* combined_linemap, int* source_line_idx) {
     const char* p = text;
@@ -791,7 +796,7 @@ static char* transform_imports(const char* source, const char* base_path, String
     const char* last = source;
 
     while (*p) {
-        if (strncmp(p, "import", 6) == 0 && !isalnum(p[6]) && p[6] != '_') {
+        if (strncmp(p, "import", 6) == 0 && !isalnum((unsigned char)p[6]) && p[6] != '_') {
             const char* import_start = p;
 
             while (last < import_start) {
@@ -800,20 +805,20 @@ static char* transform_imports(const char* source, const char* base_path, String
 
             p += 6;
 
-            while (*p && isspace(*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
 
-            if (isalpha(*p) || *p == '_') {
+            if (isalpha((unsigned char)*p) || *p == '_') {
                 const char* symbol_start = p;
-                while (*p && (isalnum(*p) || *p == '_')) {
+                while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
                     p++;
                 }
 
-                while (*p && isspace(*p)) p++;
+                while (*p && isspace((unsigned char)*p)) p++;
 
-                if (strncmp(p, "from", 4) == 0 && !isalnum(p[4]) && p[4] != '_') {
+                if (strncmp(p, "from", 4) == 0 && !isalnum((unsigned char)p[4]) && p[4] != '_') {
                     p += 4;
 
-                    while (*p && isspace(*p)) p++;
+                    while (*p && isspace((unsigned char)*p)) p++;
 
                     if (*p == '"') {
                         p++;
@@ -828,7 +833,7 @@ static char* transform_imports(const char* source, const char* base_path, String
                             p++;
                         }
 
-                        while (*p && isspace(*p)) p++;
+                        while (*p && isspace((unsigned char)*p)) p++;
                         if (*p == ';') p++;
 
                         last = p;
@@ -840,7 +845,7 @@ static char* transform_imports(const char* source, const char* base_path, String
             if (*p == '(') {
                 p++;
 
-                while (*p && isspace(*p)) p++;
+                while (*p && isspace((unsigned char)*p)) p++;
 
                 if (*p == '"') {
                     p++;
@@ -862,7 +867,7 @@ static char* transform_imports(const char* source, const char* base_path, String
 
                         p++;
 
-                        while (*p && isspace(*p)) p++;
+                        while (*p && isspace((unsigned char)*p)) p++;
 
                         if (*p == ')') {
                             p++;
@@ -892,14 +897,14 @@ static char* transform_imports(const char* source, const char* base_path, String
                 }
             }
         }
-        else if (isalpha(*p) || *p == '_') {
+        else if (isalpha((unsigned char)*p) || *p == '_') {
             const char* symbol_start = p;
-            while (*p && (isalnum(*p) || *p == '_')) {
+            while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
                 p++;
             }
             size_t symbol_len = p - symbol_start;
 
-            while (*p && isspace(*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
 
             if (*p == '(' && *(p + 1) == ')') {
                 char* symbol = (char*)malloc(symbol_len + 1);

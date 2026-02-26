@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <inttypes.h>
 
 #include "./vm.h"
 #include "./chunk.h"
@@ -638,7 +639,7 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
                 ObjPromptTag* tag = AS_PROMPT_TAG(value);
                 int len;
                 if (tag->name != NULL) len = snprintf(temp, sizeof(temp), "<prompt_tag: %.*s>", tag->name->length, tag->name->chars);
-                else len = snprintf(temp, sizeof(temp), "<prompt_tag #%u>", tag->id);
+                else len = snprintf(temp, sizeof(temp), "<prompt_tag #%" PRIu32 ">", tag->id);
                 APPEND(temp, len);
                 break;
             }

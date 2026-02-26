@@ -48,7 +48,7 @@
 
 static char* mangle_name(Compiler* compiler, Token* name, int arity);
 static void declare_function(Compiler* compiler, Stmt* stmt);
-static void define_function(Compiler* compiler, Stmt* stmt);
+/* static void define_function(Compiler* compiler, Stmt* stmt); */
 static bool compile_statement(Compiler* compiler, Stmt* stmt);
 static void compile_expression(Compiler* compiler, Expr* expr, int target_reg);
 static int compile_sub_expression(Compiler* c, Expr* e);
@@ -245,10 +245,12 @@ static int is_local_reg(Compiler* c, int r) {
     return get_local_by_reg(c, r) != NULL;
 }
 
+/*
 static bool is_local_reference(Compiler* c, int reg) {
     Local* local = get_local_by_reg(c, reg);
     return local != NULL && local->is_reference;
 }
+*/
 
 static bool is_local_ref_param(Compiler* c, int reg) {
     Local* local = get_local_by_reg(c, reg);
@@ -328,9 +330,11 @@ static int reserve_register(Compiler* c) {
     return r;
 }
 
+/*
 static void free_register(Compiler* c) {
     if (c->next_register > 0) c->next_register--;
 }
+*/
 
 static void begin_scope(Compiler* compiler) { compiler->scope_depth++; }
 
@@ -495,7 +499,7 @@ static void end_scope(Compiler* c) {
         if (c->locals[c->local_count - 1].is_captured) {
             emit_instruction(c, PACK_ABx(CLOSE_UPVALUE, c->locals[c->local_count - 1].reg, 0), 0);
         }
-        int r = c->locals[--c->local_count].reg;
+        --c->local_count;
     }
 }
 
@@ -883,11 +887,13 @@ static void free_owned_names(Compiler* c) {
     c->owned_names_cap = 0;
 }
 
+/*
 static char* mangle_name_tracked(Compiler* c, Token* name, int arity) {
     char* mangled = mangle_name(c, name, arity);
     track_owned_name(c, mangled);
     return mangled;
 }
+*/
 
 typedef enum {
     REF_MODE_NORMAL,
@@ -1906,7 +1912,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             // Determine the opcode based on operator type
             OpCode op_base;
-            bool is_math_or_bitwise = true;
+            /* bool is_math_or_bitwise = true; */
             switch (expr->as.binary.operator.type) {
                 case TOKEN_PLUS:          op_base = ADD; break;
                 case TOKEN_MINUS:         op_base = SUB; break;
@@ -1970,7 +1976,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 // Try to get source register directly if left is a simple variable
                 int src_reg = -1;
-                bool need_free_src = false;
+                /* bool need_free_src = false; */
 
                 if (expr->as.binary.left->type == EXPR_VARIABLE) {
                     Token* name = &expr->as.binary.left->as.variable.name;
@@ -1981,7 +1987,6 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 // Use smart targeting to potentially avoid a MOVE
                 if (src_reg == -1) {
                     src_reg = compile_sub_expression_to(compiler, expr->as.binary.left, target_reg);
-                    need_free_src = !is_local_reg(compiler, src_reg);
                 }
 
                 // Map base opcode to _L variant
@@ -3575,7 +3580,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     };
 
                     declare_variable(compiler, &mangled_token);
-                    int name_ident = add_local(compiler, mangled_token);
+                    add_local(compiler, mangled_token);
 
                     // Mark as initialized so it can be referenced
                     compiler->locals[compiler->local_count - 1].is_initialized = true;
@@ -3884,7 +3889,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             compile_statement(compiler, stmt->as.do_while_stmt.body);
 
             // condition_start: Patch the continue jump to here
-            int condition_start = compiler->compiling_chunk->count;
+            /* int condition_start = compiler->compiling_chunk->count; */
             patch_jump(compiler, jump_to_condition);
 
             int condition_reg = alloc_temp(compiler);
@@ -3930,7 +3935,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             }
 
             // 4) condition label; patch the first-entry jump to here
-            int cond_label = compiler->compiling_chunk->count;
+            /* int cond_label = compiler->compiling_chunk->count; */
             patch_jump(compiler, jump_to_cond);
 
             int exit_jump = -1;
@@ -4021,7 +4026,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     // Otherwise fall through to normal return
                 }
 
-            normal_return:
+            /* normal_return: */
                 // Normal return path - optimize for direct variable returns
                 if (stmt->as.return_stmt.value->type == EXPR_VARIABLE) {
                     Token* name = &stmt->as.return_stmt.value->as.variable.name;
@@ -4156,7 +4161,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             // First pass: emit all case comparisons
             int default_body_start = -1;
-            int case_body_count = 0;
+            /* int case_body_count = 0; */
 
             for (int i = 0; i < stmt->as.switch_stmt.case_count; i++) {
                 CaseClause* case_clause = &stmt->as.switch_stmt.cases[i];
@@ -4199,7 +4204,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 CaseClause* case_clause = &stmt->as.switch_stmt.cases[i];
 
                 // Mark the start of this case's body
-                int body_start = compiler->compiling_chunk->count;
+                /* int body_start = compiler->compiling_chunk->count; */
 
                 // Patch the jump from the comparison to here
                 if (case_clause->value != NULL) {
@@ -4239,6 +4244,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         }
         default: return false;
     }
+    return false;
 }
 
 static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
@@ -4744,7 +4750,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
             };
 
             declare_variable(&fn_compiler, &mangled_token);
-            int name_ident = add_local(&fn_compiler, mangled_token);
+            add_local(&fn_compiler, mangled_token);
 
             // Mark as initialized so it can be referenced
             fn_compiler.locals[fn_compiler.local_count - 1].is_initialized = true;

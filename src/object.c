@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "./object.h"
 #include "./memory.h"
@@ -356,9 +357,9 @@ void printObject(Value value) {
         case OBJ_PROMPT_TAG: {
             ObjPromptTag* tag = AS_PROMPT_TAG(value);
             if (tag->name != NULL) {
-                printf("<prompt-tag '%s' #%u>", tag->name->chars, tag->id);
+                printf("<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
             } else {
-                printf("<prompt-tag #%u>", tag->id);
+                printf("<prompt-tag #%" PRIu32 ">", tag->id);
             }
             break;
         }
