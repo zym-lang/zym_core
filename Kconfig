@@ -1,0 +1,3 @@
+config ZYM_RUNTIME_ONLY
+    bool "Build ZYM runtime only (no compiler)"
+    default n

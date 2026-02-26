@@ -1,3 +1,8 @@
+if(DEFINED ESP_PLATFORM)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/esp-idf.cmake)
+    return()
+endif()
+
 cmake_minimum_required(VERSION 3.20)
 project(zym_core C)
 

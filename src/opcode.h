@@ -189,11 +189,4 @@ typedef enum {
     // Type Introspection
     TYPEOF,        // Ra = typeof(stack[Rb]) (returns type as string)
 
-    // Delimited Continuations (Control Effects)
-    PUSH_PROMPT,   // Push prompt boundary: tag in Ra
-    POP_PROMPT,    // Pop topmost prompt from prompt stack
-    CAPTURE,       // Capture continuation: tag in Ra, result in Rb (transfers control to prompt)
-    RESUME,        // Resume continuation: cont in Ra, value in Rb, result in Rc
-    ABORT,         // Abort to prompt: tag in Ra, value in Rb (transfers control to prompt)
-
 } OpCode;

@@ -394,11 +394,6 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case DEREF_SET:      return reg_instruction_ab("DEREF_SET", instruction, offset);
         case SLOT_DEREF_SET: return reg_instruction_ab("SLOT_DEREF_SET", instruction, offset);
         case TYPEOF:         return reg_instruction_ab("TYPEOF", instruction, offset);
-        case PUSH_PROMPT:    return reg_instruction_a("PUSH_PROMPT", instruction, offset);
-        case POP_PROMPT:     return simpleInstruction("POP_PROMPT", offset);
-        case CAPTURE:        return reg_instruction_ab("CAPTURE", instruction, offset);
-        case RESUME:         return reg_instruction_abc("RESUME", instruction, offset);
-        case ABORT:          return reg_instruction_ab("ABORT", instruction, offset);
         case RET: {
             uint32_t instr = instruction;
             uint8_t  a  = REG_A(instr);
