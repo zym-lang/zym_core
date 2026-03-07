@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "allocator.h"
 
 #define UTF8_MAX_CODEPOINT 0x10FFFF
 #define UTF8_REPLACEMENT_CHAR 0xFFFD
@@ -22,7 +23,7 @@ bool utf8_substring(const char* str, int byte_len,
                     int start_char, int end_char,
                     int* out_start_byte, int* out_end_byte);
 
-char* utf8_toupper(const char* str, int byte_len, int* out_len);
-char* utf8_tolower(const char* str, int byte_len, int* out_len);
+char* utf8_toupper(ZymAllocator* alloc, const char* str, int byte_len, int* out_len);
+char* utf8_tolower(ZymAllocator* alloc, const char* str, int byte_len, int* out_len);
 
 #endif

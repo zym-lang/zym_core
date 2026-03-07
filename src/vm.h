@@ -4,6 +4,7 @@
 #include "./value.h"
 #include "./table.h"
 #include "./config.h"
+#include "./allocator.h"
 
 /*
  * VM Configuration Limits
@@ -70,6 +71,8 @@ typedef void (*ErrorCallback)(struct VM* vm, int type, const char* file,
                               int line, const char* message, void* user_data);
 
 typedef struct VM {
+    ZymAllocator allocator;
+
     Chunk* chunk;
     uint32_t* ip;
 

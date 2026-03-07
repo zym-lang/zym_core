@@ -1,4 +1,5 @@
 #include "utf8.h"
+#include "memory.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -233,13 +234,13 @@ bool utf8_substring(const char* str, int byte_len,
     return true;
 }
 
-char* utf8_toupper(const char* str, int byte_len, int* out_len) {
+char* utf8_toupper(ZymAllocator* alloc, const char* str, int byte_len, int* out_len) {
     if (str == NULL || byte_len == 0) {
         *out_len = 0;
         return NULL;
     }
 
-    char* result = (char*)malloc(byte_len + 1);
+    char* result = (char*)ZYM_ALLOC(alloc, byte_len + 1);
     if (result == NULL) {
         *out_len = 0;
         return NULL;
@@ -258,13 +259,13 @@ char* utf8_toupper(const char* str, int byte_len, int* out_len) {
     return result;
 }
 
-char* utf8_tolower(const char* str, int byte_len, int* out_len) {
+char* utf8_tolower(ZymAllocator* alloc, const char* str, int byte_len, int* out_len) {
     if (str == NULL || byte_len == 0) {
         *out_len = 0;
         return NULL;
     }
 
-    char* result = (char*)malloc(byte_len + 1);
+    char* result = (char*)ZYM_ALLOC(alloc, byte_len + 1);
     if (result == NULL) {
         *out_len = 0;
         return NULL;

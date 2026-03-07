@@ -3,6 +3,7 @@
 #include <string.h>
 #include "list.h"
 #include "../object.h"
+#include "../memory.h"
 
 // =============================================================================
 // LIST MANIPULATION FUNCTIONS
@@ -247,7 +248,8 @@ ZymValue nativeList_join(ZymVM* vm, ZymValue list, ZymValue sepVal) {
     totalBytes += sepLen * (len - 1);
 
     // Second pass: build the result
-    char* buf = malloc(totalBytes + 1);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    char* buf = ZYM_ALLOC((ZymAllocator*)alloc, totalBytes + 1);
     if (!buf) {
         for (int i = 0; i < len; i++) zym_popRoot(vm);
         zym_runtimeError(vm, "join() out of memory");
@@ -273,7 +275,7 @@ ZymValue nativeList_join(ZymVM* vm, ZymValue list, ZymValue sepVal) {
     for (int i = 0; i < len; i++) zym_popRoot(vm);
 
     ZymValue result = zym_newStringN(vm, buf, totalBytes);
-    free(buf);
+    ZYM_FREE((ZymAllocator*)alloc, buf, totalBytes + 1);
     return result;
 }
 

@@ -22,7 +22,8 @@ void pushTempRoot(VM* vm, Obj* object) {
     if (vm->temp_root_count >= vm->temp_root_capacity) {
         int old_capacity = vm->temp_root_capacity;
         vm->temp_root_capacity = old_capacity < 8 ? 8 : old_capacity * 2;
-        vm->temp_roots = (Obj**)realloc(vm->temp_roots, sizeof(Obj*) * vm->temp_root_capacity);
+        vm->temp_roots = (Obj**)ZYM_REALLOC(&vm->allocator, vm->temp_roots,
+            sizeof(Obj*) * old_capacity, sizeof(Obj*) * vm->temp_root_capacity);
         if (vm->temp_roots == NULL) {
             fprintf(stderr, "Fatal: Out of memory for temp roots\n");
             exit(1);
@@ -93,7 +94,8 @@ void markObject(VM* vm, Obj* object) {
         fflush(stdout);
         #endif
 
-        vm->gray_stack = (Obj**)realloc(vm->gray_stack, sizeof(Obj*) * vm->gray_capacity);
+        vm->gray_stack = (Obj**)ZYM_REALLOC(&vm->allocator, vm->gray_stack,
+            sizeof(Obj*) * old_capacity, sizeof(Obj*) * vm->gray_capacity);
 
         #ifdef GC_DEBUG_FULL
         printf("Gray stack reallocated: new_ptr=%p\n", (void*)vm->gray_stack);

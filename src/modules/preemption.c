@@ -67,9 +67,9 @@ typedef struct {
 } PreemptData;
 
 static void preempt_cleanup(ZymVM* vm, void* ptr) {
-    (void)vm;
     PreemptData* data = (PreemptData*)ptr;
-    free(data);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    ZYM_FREE((ZymAllocator*)alloc, data, sizeof(PreemptData));
 }
 
 static ZymValue preempt_enable(ZymVM* vm, ZymValue context) {
@@ -241,7 +241,8 @@ static ZymValue preempt_yield(ZymVM* vm, ZymValue context) {
 // ============================================================================
 
 ZymValue nativePreempt_create(ZymVM* vm) {
-    PreemptData* data = calloc(1, sizeof(PreemptData));
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    PreemptData* data = ZYM_CALLOC((ZymAllocator*)alloc, 1, sizeof(PreemptData));
     if (!data) {
         zym_runtimeError(vm, "Out of memory");
         return ZYM_ERROR;

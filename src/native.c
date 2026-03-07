@@ -399,7 +399,7 @@ static const char* parseQualifier(const char* str, uint8_t* out_qualifier) {
     return start;
 }
 
-bool parseNativeSignature(const char* signature, char* out_name, int* out_arity, uint8_t** out_qualifiers) {
+bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_name, int* out_arity, uint8_t** out_qualifiers) {
     if (!signature || !out_name || !out_arity || !out_qualifiers) {
         return false;
     }
@@ -463,7 +463,7 @@ bool parseNativeSignature(const char* signature, char* out_name, int* out_arity,
     *out_arity = arity;
 
     if (arity > 0) {
-        *out_qualifiers = (uint8_t*)malloc(arity * sizeof(uint8_t));
+        *out_qualifiers = (uint8_t*)ZYM_ALLOC(alloc, arity * sizeof(uint8_t));
         if (!*out_qualifiers) {
             fprintf(stderr, "Native function signature parse error: memory allocation failed\n");
             return false;
@@ -481,20 +481,20 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
     int arity;
     uint8_t* qualifiers = NULL;
 
-    if (!parseNativeSignature(signature, func_name, &arity, &qualifiers)) {
+    if (!parseNativeSignature(&vm->allocator, signature, func_name, &arity, &qualifiers)) {
         return false;
     }
 
     if (arity > MAX_NATIVE_ARITY) {
         fprintf(stderr, "Native function '%s' has too many parameters (max %d)\n", func_name, MAX_NATIVE_ARITY);
-        if (qualifiers) free(qualifiers);
+        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return false;
     }
 
     NativeDispatcher dispatcher = getNativeDispatcher(arity);
     if (!dispatcher) {
         fprintf(stderr, "No dispatcher available for arity %d\n", arity);
-        if (qualifiers) free(qualifiers);
+        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return false;
     }
 
@@ -509,7 +509,7 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
 
     if (arity > 0 && qualifiers) {
         memcpy(native->param_qualifiers, qualifiers, arity * sizeof(uint8_t));
-        free(qualifiers);
+        ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
     }
 
     tableSet(vm, &vm->globals, name_obj, OBJ_VAL(native));

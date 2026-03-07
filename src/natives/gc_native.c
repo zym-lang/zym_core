@@ -30,9 +30,9 @@ typedef struct {
 // =============================================================================
 
 void gc_cleanup(ZymVM* vm, void* ptr) {
-    (void)vm;  // Unused
     GCData* gc = (GCData*)ptr;
-    free(gc);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    ZYM_FREE((ZymAllocator*)alloc, gc, sizeof(GCData));
 }
 
 // =============================================================================
@@ -119,7 +119,8 @@ ZymValue gc_setBytesThreshold(ZymVM* vm, ZymValue context, ZymValue thresholdVal
 
 ZymValue nativeGC_create(ZymVM* vm) {
     // Allocate GC context (minimal, just a placeholder)
-    GCData* gc = calloc(1, sizeof(GCData));
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    GCData* gc = ZYM_CALLOC((ZymAllocator*)alloc, 1, sizeof(GCData));
     if (!gc) {
         zym_runtimeError(vm, "Out of memory");
         return ZYM_ERROR;

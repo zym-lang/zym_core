@@ -199,16 +199,15 @@ static double parse_number_literal(const char* start, int length) {
         }
         value = (double)bin;
     } else {
-        char* clean = (char*)malloc(length + 1);
+        char clean[256];
         int pos = 0;
-        for (int i = 0; i < length; i++) {
+        for (int i = 0; i < length && pos < 255; i++) {
             if (start[i] != '_') {
                 clean[pos++] = start[i];
             }
         }
         clean[pos] = '\0';
         value = strtod(clean, NULL);
-        free(clean);
     }
 
     return value;
@@ -1286,7 +1285,7 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     }
 
     // Compile arguments into temporary registers first to avoid overwriting current parameters
-    int* temp_regs = (int*)malloc(sizeof(int) * arg_count);
+    int* temp_regs = (int*)ZYM_ALLOC(&compiler->vm->allocator, sizeof(int) * arg_count);
     for (int i = 0; i < arg_count; i++) {
         temp_regs[i] = reserve_register(compiler);
         Expr* arg = call_expr->args[i];
@@ -1315,7 +1314,7 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     for (int i = 0; i < arg_count; i++) {
         emit_move(compiler, 1 + i, temp_regs[i], line);
     }
-    free(temp_regs);
+    ZYM_FREE(&compiler->vm->allocator, temp_regs, sizeof(int) * arg_count);
 
     // Emit appropriate tail call instruction
     if (use_smart_fallback) {
@@ -1803,7 +1802,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     const char* error_msg = NULL;
                     int error_pos = 0;
 
-                    char* processed = processEscapeSequences(raw_str, raw_len, &processed_len,
+                    char* processed = processEscapeSequences(&compiler->vm->allocator, raw_str, raw_len, &processed_len,
                                                             &error_msg, &error_pos);
 
                     if (!processed) {
@@ -1816,7 +1815,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     ObjString* str = copyString(compiler->vm, processed, processed_len);
                     pushTempRoot(compiler->vm, (Obj*)str);
                     Value str_val = OBJ_VAL(str);
-                    free(processed);
+                    ZYM_FREE(&compiler->vm->allocator, processed, raw_len + 1);
                     const_index = make_constant(compiler, str_val);
                     popTempRoot(compiler->vm);
                     break;
@@ -2489,7 +2488,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             } else {
                 // Named initialization: StructName{field1: value1, field2: value2, ...}
                 // Track which fields have been initialized to detect duplicates
-                bool* field_initialized = (bool*)calloc(schema->field_count, sizeof(bool));
+                bool* field_initialized = (bool*)ZYM_CALLOC(&compiler->vm->allocator, schema->field_count, sizeof(bool));
 
                 // Set field values
                 for (int i = 0; i < struct_expr->field_count; i++) {
@@ -2540,7 +2539,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_instruction(compiler, PACK_ABC(SET_STRUCT_FIELD, target_reg, field_index, value_reg), expr->line);
                 }
 
-                free(field_initialized);
+                ZYM_FREE(&compiler->vm->allocator, field_initialized, schema->field_count * sizeof(bool));
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -4641,9 +4640,9 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     if (stmt->name.length > 9 && memcmp(stmt->name.start, "__module_", 9) == 0) {
         // Case 1: We are compiling a Module Factory.
         // Decode encoded path: "__module_src_slash_math_dot_zym" -> "src/math.zym"
-        char* decoded_path = decodeModulePath(stmt->name.start + 9, stmt->name.length - 9);
+        char* decoded_path = decodeModulePath(&fn_compiler.vm->allocator, stmt->name.start + 9, stmt->name.length - 9);
         fn_compiler.current_module_name = copyString(fn_compiler.vm, decoded_path, strlen(decoded_path));
-        free(decoded_path);
+        ZYM_FREE(&fn_compiler.vm->allocator, decoded_path, stmt->name.length - 9 + 1);
     }
     else if (current_compiler->current_module_name != NULL) {
         // Case 2: We are inside a module (e.g. 'sum' inside 'array_utils'). Inherit it.

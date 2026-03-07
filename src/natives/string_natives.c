@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include "string_natives.h"
 #include "../utf8.h"
+#include "../memory.h"
 
 // =============================================================================
 // STRING MANIPULATION FUNCTIONS
@@ -242,14 +243,15 @@ ZymValue nativeString_toUpperCase(ZymVM* vm, ZymValue str) {
     }
 
     int result_len;
-    char* result = utf8_toupper(cstr, byte_len, &result_len);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    char* result = utf8_toupper((ZymAllocator*)alloc, cstr, byte_len, &result_len);
     if (result == NULL) {
         zym_runtimeError(vm, "toUpperCase() out of memory");
         return ZYM_ERROR;
     }
 
     ZymValue newStr = zym_newString(vm, result);
-    free(result);
+    ZYM_FREE((ZymAllocator*)alloc, result, byte_len + 1);
     return newStr;
 }
 
@@ -270,14 +272,15 @@ ZymValue nativeString_toLowerCase(ZymVM* vm, ZymValue str) {
     }
 
     int result_len;
-    char* result = utf8_tolower(cstr, byte_len, &result_len);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    char* result = utf8_tolower((ZymAllocator*)alloc, cstr, byte_len, &result_len);
     if (result == NULL) {
         zym_runtimeError(vm, "toLowerCase() out of memory");
         return ZYM_ERROR;
     }
 
     ZymValue newStr = zym_newString(vm, result);
-    free(result);
+    ZYM_FREE((ZymAllocator*)alloc, result, byte_len + 1);
     return newStr;
 }
 

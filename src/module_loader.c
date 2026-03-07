@@ -8,10 +8,10 @@
 #include "memory.h"
 #include "linemap.h"
 
-static char* normalize_path(const char* path) {
+static char* normalize_path(ZymAllocator* alloc, const char* path) {
     if (!path) return NULL;
 
-    char* path_copy = strdup(path);
+    char* path_copy = zym_strdup(alloc, path);
     char* components[256];
     int count = 0;
 
@@ -34,7 +34,7 @@ static char* normalize_path(const char* path) {
         total_len += strlen(components[i]) + 1;
     }
 
-    char* result = (char*)malloc(total_len + 1);
+    char* result = (char*)ZYM_ALLOC(alloc, total_len + 1);
     result[0] = '\0';
 
     for (int i = 0; i < count; i++) {
@@ -44,28 +44,28 @@ static char* normalize_path(const char* path) {
         strcat(result, components[i]);
     }
 
-    free(path_copy);
+    ZYM_FREE_STR(alloc, path_copy);
     return result;
 }
 
-static char* resolve_module_path(const char* base_path, const char* module_path) {
+static char* resolve_module_path(ZymAllocator* alloc, const char* base_path, const char* module_path) {
     const char* last_slash = strrchr(base_path, '/');
     const char* last_backslash = strrchr(base_path, '\\');
     const char* separator = last_slash > last_backslash ? last_slash : last_backslash;
 
     char* combined;
     if (!separator) {
-        combined = strdup(module_path);
+        combined = zym_strdup(alloc, module_path);
     } else {
         size_t base_dir_len = separator - base_path + 1;
         size_t result_len = base_dir_len + strlen(module_path) + 1;
-        combined = (char*)malloc(result_len);
+        combined = (char*)ZYM_ALLOC(alloc, result_len);
         memcpy(combined, base_path, base_dir_len);
         strcpy(combined + base_dir_len, module_path);
     }
 
-    char* normalized = normalize_path(combined);
-    free(combined);
+    char* normalized = normalize_path(alloc, combined);
+    ZYM_FREE_STR(alloc, combined);
 
     return normalized;
 }
@@ -80,7 +80,7 @@ static unsigned int hash_path(const char* path) {
 }
 
 /* "src/math.zym" -> "src_slash_math_dot_zym" */
-static char* encode_path_to_identifier(const char* path) {
+static char* encode_path_to_identifier(ZymAllocator* alloc, const char* path) {
     size_t len = strlen(path);
     size_t result_len = 0;
     for (size_t i = 0; i < len; i++) {
@@ -93,7 +93,7 @@ static char* encode_path_to_identifier(const char* path) {
         else result_len += 1;
     }
 
-    char* result = (char*)malloc(result_len + 1);
+    char* result = (char*)ZYM_ALLOC(alloc, result_len + 1);
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
@@ -154,23 +154,26 @@ static char* decode_identifier_to_path(const char* encoded, int length) {
 #endif
 
 typedef struct {
+    ZymAllocator* alloc;
     char* buffer;
     size_t length;
     size_t capacity;
 } StringBuilder;
 
-static void sb_init(StringBuilder* sb) {
+static void sb_init(StringBuilder* sb, ZymAllocator* alloc) {
+    sb->alloc = alloc;
     sb->capacity = 1024;
     sb->length = 0;
-    sb->buffer = (char*)malloc(sb->capacity);
+    sb->buffer = (char*)ZYM_ALLOC(alloc, sb->capacity);
     sb->buffer[0] = '\0';
 }
 
 static void sb_append(StringBuilder* sb, const char* str) {
     size_t len = strlen(str);
     while (sb->length + len + 1 > sb->capacity) {
+        size_t old = sb->capacity;
         sb->capacity *= 2;
-        sb->buffer = (char*)realloc(sb->buffer, sb->capacity);
+        sb->buffer = (char*)ZYM_REALLOC(sb->alloc, sb->buffer, old, sb->capacity);
     }
     memcpy(sb->buffer + sb->length, str, len);
     sb->length += len;
@@ -179,21 +182,23 @@ static void sb_append(StringBuilder* sb, const char* str) {
 
 static void sb_append_char(StringBuilder* sb, char c) {
     if (sb->length + 2 > sb->capacity) {
+        size_t old = sb->capacity;
         sb->capacity *= 2;
-        sb->buffer = (char*)realloc(sb->buffer, sb->capacity);
+        sb->buffer = (char*)ZYM_REALLOC(sb->alloc, sb->buffer, old, sb->capacity);
     }
     sb->buffer[sb->length++] = c;
     sb->buffer[sb->length] = '\0';
 }
 
 static void sb_free(StringBuilder* sb) {
-    free(sb->buffer);
+    if (sb->buffer) ZYM_FREE(sb->alloc, sb->buffer, sb->capacity);
     sb->buffer = NULL;
     sb->length = 0;
     sb->capacity = 0;
 }
 
 typedef struct {
+    ZymAllocator* alloc;
     char** items;
     int count;
     int capacity;
@@ -206,15 +211,17 @@ typedef struct {
 } SymbolMapping;
 
 typedef struct {
+    ZymAllocator* alloc;
     SymbolMapping* mappings;
     int count;
     int capacity;
 } SymbolMap;
 
-static void set_init(StringSet* set) {
+static void set_init(StringSet* set, ZymAllocator* alloc) {
+    set->alloc = alloc;
     set->capacity = 16;
     set->count = 0;
-    set->items = (char**)malloc(sizeof(char*) * set->capacity);
+    set->items = (char**)ZYM_ALLOC(alloc, sizeof(char*) * set->capacity);
 }
 
 static bool set_contains(StringSet* set, const char* str) {
@@ -230,26 +237,28 @@ static void set_add(StringSet* set, const char* str) {
     if (set_contains(set, str)) return;
 
     if (set->count >= set->capacity) {
+        int old = set->capacity;
         set->capacity *= 2;
-        set->items = (char**)realloc(set->items, sizeof(char*) * set->capacity);
+        set->items = (char**)ZYM_REALLOC(set->alloc, set->items, sizeof(char*) * old, sizeof(char*) * set->capacity);
     }
-    set->items[set->count++] = strdup(str);
+    set->items[set->count++] = zym_strdup(set->alloc, str);
 }
 
 static void set_free(StringSet* set) {
     for (int i = 0; i < set->count; i++) {
-        free(set->items[i]);
+        ZYM_FREE_STR(set->alloc, set->items[i]);
     }
-    free(set->items);
+    ZYM_FREE(set->alloc, set->items, sizeof(char*) * set->capacity);
     set->items = NULL;
     set->count = 0;
     set->capacity = 0;
 }
 
-static void symbolmap_init(SymbolMap* map) {
+static void symbolmap_init(SymbolMap* map, ZymAllocator* alloc) {
+    map->alloc = alloc;
     map->capacity = 16;
     map->count = 0;
-    map->mappings = (SymbolMapping*)malloc(sizeof(SymbolMapping) * map->capacity);
+    map->mappings = (SymbolMapping*)ZYM_ALLOC(alloc, sizeof(SymbolMapping) * map->capacity);
 }
 
 static bool symbolmap_add(SymbolMap* map, const char* symbol, const char* module_path, const char* source_file, char** error_msg) {
@@ -257,7 +266,7 @@ static bool symbolmap_add(SymbolMap* map, const char* symbol, const char* module
         if (strcmp(map->mappings[i].symbol, symbol) == 0 &&
             strcmp(map->mappings[i].source_file, source_file) == 0) {
             size_t error_size = 512 + strlen(symbol) + strlen(map->mappings[i].module_path) + strlen(module_path) + strlen(source_file);
-            *error_msg = (char*)malloc(error_size);
+            *error_msg = (char*)ZYM_ALLOC(map->alloc, error_size);
             snprintf(*error_msg, error_size,
                 "Duplicate import symbol '%s' in [%s]:\n  First imported from: [%s]\n  Duplicate import from: [%s]",
                 symbol, source_file, map->mappings[i].module_path, module_path);
@@ -266,12 +275,13 @@ static bool symbolmap_add(SymbolMap* map, const char* symbol, const char* module
     }
 
     if (map->count >= map->capacity) {
+        int old = map->capacity;
         map->capacity *= 2;
-        map->mappings = (SymbolMapping*)realloc(map->mappings, sizeof(SymbolMapping) * map->capacity);
+        map->mappings = (SymbolMapping*)ZYM_REALLOC(map->alloc, map->mappings, sizeof(SymbolMapping) * old, sizeof(SymbolMapping) * map->capacity);
     }
-    map->mappings[map->count].symbol = strdup(symbol);
-    map->mappings[map->count].module_path = strdup(module_path);
-    map->mappings[map->count].source_file = strdup(source_file);
+    map->mappings[map->count].symbol = zym_strdup(map->alloc, symbol);
+    map->mappings[map->count].module_path = zym_strdup(map->alloc, module_path);
+    map->mappings[map->count].source_file = zym_strdup(map->alloc, source_file);
     map->count++;
     return true;
 }
@@ -288,11 +298,11 @@ static const char* symbolmap_get(SymbolMap* map, const char* symbol, const char*
 
 static void symbolmap_free(SymbolMap* map) {
     for (int i = 0; i < map->count; i++) {
-        free(map->mappings[i].symbol);
-        free(map->mappings[i].module_path);
-        free(map->mappings[i].source_file);
+        ZYM_FREE_STR(map->alloc, map->mappings[i].symbol);
+        ZYM_FREE_STR(map->alloc, map->mappings[i].module_path);
+        ZYM_FREE_STR(map->alloc, map->mappings[i].source_file);
     }
-    free(map->mappings);
+    ZYM_FREE(map->alloc, map->mappings, sizeof(SymbolMapping) * map->capacity);
     map->mappings = NULL;
     map->count = 0;
     map->capacity = 0;
@@ -304,17 +314,19 @@ typedef struct {
 } ModuleQueueItem;
 
 typedef struct {
+    ZymAllocator* alloc;
     ModuleQueueItem* items;
     int front;
     int rear;
     int capacity;
 } ModuleQueue;
 
-static void queue_init(ModuleQueue* q) {
+static void queue_init(ModuleQueue* q, ZymAllocator* alloc) {
+    q->alloc = alloc;
     q->capacity = 16;
     q->front = 0;
     q->rear = 0;
-    q->items = (ModuleQueueItem*)malloc(sizeof(ModuleQueueItem) * q->capacity);
+    q->items = (ModuleQueueItem*)ZYM_ALLOC(alloc, sizeof(ModuleQueueItem) * q->capacity);
 }
 
 static bool queue_empty(ModuleQueue* q) {
@@ -325,7 +337,7 @@ static void queue_push(ModuleQueue* q, const char* module_path, const char* base
     if ((q->rear + 1) % q->capacity == q->front) {
         int old_cap = q->capacity;
         q->capacity *= 2;
-        ModuleQueueItem* new_items = (ModuleQueueItem*)malloc(sizeof(ModuleQueueItem) * q->capacity);
+        ModuleQueueItem* new_items = (ModuleQueueItem*)ZYM_ALLOC(q->alloc, sizeof(ModuleQueueItem) * q->capacity);
 
         int i = 0;
         while (q->front != q->rear) {
@@ -333,14 +345,14 @@ static void queue_push(ModuleQueue* q, const char* module_path, const char* base
             q->front = (q->front + 1) % old_cap;
         }
 
-        free(q->items);
+        ZYM_FREE(q->alloc, q->items, sizeof(ModuleQueueItem) * old_cap);
         q->items = new_items;
         q->front = 0;
         q->rear = i;
     }
 
-    q->items[q->rear].module_path = strdup(module_path);
-    q->items[q->rear].base_path = strdup(base_path);
+    q->items[q->rear].module_path = zym_strdup(q->alloc, module_path);
+    q->items[q->rear].base_path = zym_strdup(q->alloc, base_path);
     q->rear = (q->rear + 1) % q->capacity;
 }
 
@@ -355,10 +367,10 @@ static ModuleQueueItem queue_pop(ModuleQueue* q) {
 static void queue_free(ModuleQueue* q) {
     while (!queue_empty(q)) {
         ModuleQueueItem item = queue_pop(q);
-        free(item.module_path);
-        free(item.base_path);
+        ZYM_FREE_STR(q->alloc, item.module_path);
+        ZYM_FREE_STR(q->alloc, item.base_path);
     }
-    free(q->items);
+    ZYM_FREE(q->alloc, q->items, sizeof(ModuleQueueItem) * q->capacity);
     q->items = NULL;
 }
 
@@ -368,6 +380,7 @@ typedef struct {
 } MapEntry;
 
 typedef struct {
+    ZymAllocator* alloc;
     MapEntry* entries;
     int count;
     int capacity;
@@ -379,15 +392,17 @@ typedef struct {
 } LineMapEntry;
 
 typedef struct {
+    ZymAllocator* alloc;
     LineMapEntry* entries;
     int count;
     int capacity;
 } LineMapMap;
 
-static void map_init(StringMap* map) {
+static void map_init(StringMap* map, ZymAllocator* alloc) {
+    map->alloc = alloc;
     map->capacity = 16;
     map->count = 0;
-    map->entries = (MapEntry*)malloc(sizeof(MapEntry) * map->capacity);
+    map->entries = (MapEntry*)ZYM_ALLOC(alloc, sizeof(MapEntry) * map->capacity);
 }
 
 static char* map_get(StringMap* map, const char* key) {
@@ -402,37 +417,39 @@ static char* map_get(StringMap* map, const char* key) {
 static void map_set(StringMap* map, const char* key, const char* value) {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].key, key) == 0) {
-            free(map->entries[i].value);
-            map->entries[i].value = strdup(value);
+            ZYM_FREE_STR(map->alloc, map->entries[i].value);
+            map->entries[i].value = zym_strdup(map->alloc, value);
             return;
         }
     }
 
     if (map->count >= map->capacity) {
+        int old = map->capacity;
         map->capacity *= 2;
-        map->entries = (MapEntry*)realloc(map->entries, sizeof(MapEntry) * map->capacity);
+        map->entries = (MapEntry*)ZYM_REALLOC(map->alloc, map->entries, sizeof(MapEntry) * old, sizeof(MapEntry) * map->capacity);
     }
 
-    map->entries[map->count].key = strdup(key);
-    map->entries[map->count].value = strdup(value);
+    map->entries[map->count].key = zym_strdup(map->alloc, key);
+    map->entries[map->count].value = zym_strdup(map->alloc, value);
     map->count++;
 }
 
 static void map_free(StringMap* map) {
     for (int i = 0; i < map->count; i++) {
-        free(map->entries[i].key);
-        free(map->entries[i].value);
+        ZYM_FREE_STR(map->alloc, map->entries[i].key);
+        ZYM_FREE_STR(map->alloc, map->entries[i].value);
     }
-    free(map->entries);
+    ZYM_FREE(map->alloc, map->entries, sizeof(MapEntry) * map->capacity);
     map->entries = NULL;
     map->count = 0;
     map->capacity = 0;
 }
 
-static void linemap_map_init(LineMapMap* map) {
+static void linemap_map_init(LineMapMap* map, ZymAllocator* alloc) {
+    map->alloc = alloc;
     map->capacity = 16;
     map->count = 0;
-    map->entries = (LineMapEntry*)malloc(sizeof(LineMapEntry) * map->capacity);
+    map->entries = (LineMapEntry*)ZYM_ALLOC(alloc, sizeof(LineMapEntry) * map->capacity);
 }
 
 static LineMap* linemap_map_get(LineMapMap* map, const char* key) {
@@ -453,24 +470,25 @@ static void linemap_map_set(LineMapMap* map, const char* key, LineMap* value) {
     }
 
     if (map->count >= map->capacity) {
+        int old = map->capacity;
         map->capacity *= 2;
-        map->entries = (LineMapEntry*)realloc(map->entries, sizeof(LineMapEntry) * map->capacity);
+        map->entries = (LineMapEntry*)ZYM_REALLOC(map->alloc, map->entries, sizeof(LineMapEntry) * old, sizeof(LineMapEntry) * map->capacity);
     }
 
-    map->entries[map->count].key = strdup(key);
+    map->entries[map->count].key = zym_strdup(map->alloc, key);
     map->entries[map->count].value = value;
     map->count++;
 }
 
 static void linemap_map_free(VM* vm, LineMapMap* map) {
     for (int i = 0; i < map->count; i++) {
-        free(map->entries[i].key);
+        ZYM_FREE_STR(map->alloc, map->entries[i].key);
         if (map->entries[i].value) {
             freeLineMap(vm, map->entries[i].value);
-            free(map->entries[i].value);
+            ZYM_FREE(map->alloc, map->entries[i].value, sizeof(LineMap));
         }
     }
-    free(map->entries);
+    ZYM_FREE(map->alloc, map->entries, sizeof(LineMapEntry) * map->capacity);
     map->entries = NULL;
     map->count = 0;
     map->capacity = 0;
@@ -480,7 +498,7 @@ static void linemap_map_free(VM* vm, LineMapMap* map) {
  * - import("path")
  * - import symbol from "path"
  */
-static bool scan_for_imports(const char* source, const char* base_path, ModuleQueue* queue, SymbolMap* symbol_map, char** error_msg) {
+static bool scan_for_imports(ZymAllocator* alloc, const char* source, const char* base_path, ModuleQueue* queue, SymbolMap* symbol_map, char** error_msg) {
     const char* p = source;
 
     while (*p) {
@@ -508,12 +526,12 @@ static bool scan_for_imports(const char* source, const char* base_path, ModuleQu
 
                     if (*p == '"') {
                         size_t len = p - start;
-                        char* path = (char*)malloc(len + 1);
+                        char* path = (char*)ZYM_ALLOC(alloc, len + 1);
                         memcpy(path, start, len);
                         path[len] = '\0';
 
                         queue_push(queue, path, base_path);
-                        free(path);
+                        ZYM_FREE(alloc, path, len + 1);
 
                         p++;
                     }
@@ -547,28 +565,28 @@ static bool scan_for_imports(const char* source, const char* base_path, ModuleQu
 
                         if (*p == '"') {
                             size_t path_len = p - path_start;
-                            char* path = (char*)malloc(path_len + 1);
+                            char* path = (char*)ZYM_ALLOC(alloc, path_len + 1);
                             memcpy(path, path_start, path_len);
                             path[path_len] = '\0';
 
-                            char* symbol = (char*)malloc(symbol_len + 1);
+                            char* symbol = (char*)ZYM_ALLOC(alloc, symbol_len + 1);
                             memcpy(symbol, symbol_start, symbol_len);
                             symbol[symbol_len] = '\0';
 
-                            char* resolved_path = resolve_module_path(base_path, path);
+                            char* resolved_path = resolve_module_path(alloc, base_path, path);
 
                             if (!symbolmap_add(symbol_map, symbol, resolved_path, base_path, error_msg)) {
-                                free(path);
-                                free(symbol);
-                                free(resolved_path);
+                                ZYM_FREE(alloc, path, path_len + 1);
+                                ZYM_FREE(alloc, symbol, symbol_len + 1);
+                                ZYM_FREE_STR(alloc, resolved_path);
                                 return false;
                             }
 
                             queue_push(queue, path, base_path);
 
-                            free(path);
-                            free(symbol);
-                            free(resolved_path);
+                            ZYM_FREE(alloc, path, path_len + 1);
+                            ZYM_FREE(alloc, symbol, symbol_len + 1);
+                            ZYM_FREE_STR(alloc, resolved_path);
 
                             p++;
                         }
@@ -583,28 +601,31 @@ static bool scan_for_imports(const char* source, const char* base_path, ModuleQu
 }
 
 typedef struct {
+    ZymAllocator* alloc;
     char** modules;
     int count;
     int capacity;
 } ImportStack;
 
-static void stack_init(ImportStack* stack) {
+static void stack_init(ImportStack* stack, ZymAllocator* alloc) {
+    stack->alloc = alloc;
     stack->capacity = 16;
     stack->count = 0;
-    stack->modules = (char**)malloc(sizeof(char*) * stack->capacity);
+    stack->modules = (char**)ZYM_ALLOC(alloc, sizeof(char*) * stack->capacity);
 }
 
 static void stack_push(ImportStack* stack, const char* module) {
     if (stack->count >= stack->capacity) {
+        int old = stack->capacity;
         stack->capacity *= 2;
-        stack->modules = (char**)realloc(stack->modules, sizeof(char*) * stack->capacity);
+        stack->modules = (char**)ZYM_REALLOC(stack->alloc, stack->modules, sizeof(char*) * old, sizeof(char*) * stack->capacity);
     }
-    stack->modules[stack->count++] = strdup(module);
+    stack->modules[stack->count++] = zym_strdup(stack->alloc, module);
 }
 
 static void stack_pop(ImportStack* stack) {
     if (stack->count > 0) {
-        free(stack->modules[--stack->count]);
+        ZYM_FREE_STR(stack->alloc, stack->modules[--stack->count]);
     }
 }
 
@@ -626,7 +647,7 @@ static char* stack_to_string(ImportStack* stack, const char* new_module) {
     total_len += strlen(new_module) + 4; // " -> " + new_module
     total_len += strlen(stack->modules[0]) + 1; // " -> " + first module again (to complete cycle)
 
-    char* result = (char*)malloc(total_len);
+    char* result = (char*)ZYM_ALLOC(stack->alloc, total_len);
     result[0] = '\0';
 
     for (int i = 0; i < stack->count; i++) {
@@ -642,9 +663,9 @@ static char* stack_to_string(ImportStack* stack, const char* new_module) {
 
 static void stack_free(ImportStack* stack) {
     for (int i = 0; i < stack->count; i++) {
-        free(stack->modules[i]);
+        ZYM_FREE_STR(stack->alloc, stack->modules[i]);
     }
-    free(stack->modules);
+    ZYM_FREE(stack->alloc, stack->modules, sizeof(char*) * stack->capacity);
     stack->modules = NULL;
     stack->count = 0;
     stack->capacity = 0;
@@ -677,7 +698,7 @@ static bool load_module_recursive(
         }
         error_size += strlen(module_path) + 200;
 
-        *error_msg = (char*)malloc(error_size);
+        *error_msg = (char*)ZYM_ALLOC(&vm->allocator, error_size);
         char* ptr = *error_msg;
 
         ptr += sprintf(ptr, "Circular import detected:\n\n");
@@ -710,7 +731,7 @@ static bool load_module_recursive(
     ModuleReadResult read_result = read_callback(module_path, user_data);
     if (!read_result.source) {
         size_t error_size = 256 + strlen(module_path);
-        *error_msg = (char*)malloc(error_size);
+        *error_msg = (char*)ZYM_ALLOC(&vm->allocator, error_size);
         snprintf(*error_msg, error_size, "Failed to read/preprocess module: [%s]", module_path);
         stack_pop(import_stack);
         return false;
@@ -721,8 +742,8 @@ static bool load_module_recursive(
     set_add(loaded_modules, module_path);
 
     ModuleQueue deps;
-    queue_init(&deps);
-    if (!scan_for_imports(read_result.source, module_path, &deps, symbol_map, error_msg)) {
+    queue_init(&deps, &vm->allocator);
+    if (!scan_for_imports(&vm->allocator, read_result.source, module_path, &deps, symbol_map, error_msg)) {
         queue_free(&deps);
         stack_pop(import_stack);
         return false;
@@ -730,22 +751,22 @@ static bool load_module_recursive(
 
     while (!queue_empty(&deps)) {
         ModuleQueueItem item = queue_pop(&deps);
-        char* resolved_path = resolve_module_path(item.base_path, item.module_path);
+        char* resolved_path = resolve_module_path(&vm->allocator, item.base_path, item.module_path);
 
         if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    loaded_modules, import_stack, module_sources,
                                    module_linemaps, symbol_map, error_msg)) {
-            free(resolved_path);
-            free(item.module_path);
-            free(item.base_path);
+            ZYM_FREE_STR(&vm->allocator, resolved_path);
+            ZYM_FREE_STR(&vm->allocator, item.module_path);
+            ZYM_FREE_STR(&vm->allocator, item.base_path);
             queue_free(&deps);
             stack_pop(import_stack);
             return false;
         }
 
-        free(resolved_path);
-        free(item.module_path);
-        free(item.base_path);
+        ZYM_FREE_STR(&vm->allocator, resolved_path);
+        ZYM_FREE_STR(&vm->allocator, item.module_path);
+        ZYM_FREE_STR(&vm->allocator, item.base_path);
     }
 
     queue_free(&deps);
@@ -787,10 +808,10 @@ static bool is_fresh_module(const char* source) {
     return strncmp(p, "\"use fresh\"", 11) == 0;
 }
 
-static char* transform_imports(const char* source, const char* base_path, StringSet* loaded_modules,
+static char* transform_imports(ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
                                SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules) {
     StringBuilder sb;
-    sb_init(&sb);
+    sb_init(&sb, alloc);
 
     const char* p = source;
     const char* last = source;
@@ -861,7 +882,7 @@ static char* transform_imports(const char* source, const char* base_path, String
 
                     if (*p == '"') {
                         size_t len = p - start;
-                        char* path = (char*)malloc(len + 1);
+                        char* path = (char*)ZYM_ALLOC(alloc, len + 1);
                         memcpy(path, start, len);
                         path[len] = '\0';
 
@@ -872,13 +893,13 @@ static char* transform_imports(const char* source, const char* base_path, String
                         if (*p == ')') {
                             p++;
 
-                            char* resolved = resolve_module_path(base_path, path);
+                            char* resolved = resolve_module_path(alloc, base_path, path);
 
                             if (debug_names) {
                                 sb_append(&sb, "__module_");
-                                char* encoded = encode_path_to_identifier(resolved);
+                                char* encoded = encode_path_to_identifier(alloc, resolved);
                                 sb_append(&sb, encoded);
-                                free(encoded);
+                                ZYM_FREE_STR(alloc, encoded);
                             } else {
                                 char hash_str[16];
                                 snprintf(hash_str, sizeof(hash_str), "_%x", hash_path(resolved));
@@ -888,11 +909,11 @@ static char* transform_imports(const char* source, const char* base_path, String
                                 sb_append(&sb, "()");
                             }
 
-                            free(resolved);
+                            ZYM_FREE_STR(alloc, resolved);
                             last = p;
                         }
 
-                        free(path);
+                        ZYM_FREE(alloc, path, len + 1);
                     }
                 }
             }
@@ -907,7 +928,7 @@ static char* transform_imports(const char* source, const char* base_path, String
             while (*p && isspace((unsigned char)*p)) p++;
 
             if (*p == '(' && *(p + 1) == ')') {
-                char* symbol = (char*)malloc(symbol_len + 1);
+                char* symbol = (char*)ZYM_ALLOC(alloc, symbol_len + 1);
                 memcpy(symbol, symbol_start, symbol_len);
                 symbol[symbol_len] = '\0';
 
@@ -919,9 +940,9 @@ static char* transform_imports(const char* source, const char* base_path, String
 
                     if (debug_names) {
                         sb_append(&sb, "__module_");
-                        char* encoded = encode_path_to_identifier(module_path);
+                        char* encoded = encode_path_to_identifier(alloc, module_path);
                         sb_append(&sb, encoded);
-                        free(encoded);
+                        ZYM_FREE_STR(alloc, encoded);
                     } else {
                         char hash_str[16];
                         snprintf(hash_str, sizeof(hash_str), "_%x", hash_path(module_path));
@@ -935,7 +956,7 @@ static char* transform_imports(const char* source, const char* base_path, String
                     last = p;
                 }
 
-                free(symbol);
+                ZYM_FREE(alloc, symbol, symbol_len + 1);
             }
 
             p++;
@@ -966,7 +987,8 @@ ModuleLoadResult* loadModules(
     bool write_debug_output,
     const char* debug_output_path)
 {
-    ModuleLoadResult* result = (ModuleLoadResult*)malloc(sizeof(ModuleLoadResult));
+    ZymAllocator* alloc = &vm->allocator;
+    ModuleLoadResult* result = (ModuleLoadResult*)ZYM_ALLOC(alloc, sizeof(ModuleLoadResult));
     result->combined_source = NULL;
     result->line_map = NULL;
     result->module_paths = NULL;
@@ -975,29 +997,29 @@ ModuleLoadResult* loadModules(
     result->error_message = NULL;
 
     StringSet loaded_modules;
-    set_init(&loaded_modules);
+    set_init(&loaded_modules, alloc);
 
     StringMap module_sources;
-    map_init(&module_sources);
+    map_init(&module_sources, alloc);
 
     LineMapMap module_linemaps;
-    linemap_map_init(&module_linemaps);
+    linemap_map_init(&module_linemaps, alloc);
 
     ImportStack import_stack;
-    stack_init(&import_stack);
+    stack_init(&import_stack, alloc);
 
     SymbolMap symbol_map;
-    symbolmap_init(&symbol_map);
+    symbolmap_init(&symbol_map, alloc);
 
     StringSet fresh_modules;
-    set_init(&fresh_modules);
+    set_init(&fresh_modules, alloc);
 
     set_add(&loaded_modules, entry_path);
     map_set(&module_sources, entry_path, entry_source);
 
     ModuleQueue entry_deps;
-    queue_init(&entry_deps);
-    if (!scan_for_imports(entry_source, entry_path, &entry_deps, &symbol_map, &result->error_message)) {
+    queue_init(&entry_deps, alloc);
+    if (!scan_for_imports(alloc, entry_source, entry_path, &entry_deps, &symbol_map, &result->error_message)) {
         result->has_error = true;
         queue_free(&entry_deps);
         goto cleanup;
@@ -1005,30 +1027,30 @@ ModuleLoadResult* loadModules(
 
     while (!queue_empty(&entry_deps)) {
         ModuleQueueItem item = queue_pop(&entry_deps);
-        char* resolved_path = resolve_module_path(item.base_path, item.module_path);
+        char* resolved_path = resolve_module_path(alloc, item.base_path, item.module_path);
 
         if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    &loaded_modules, &import_stack, &module_sources,
                                    &module_linemaps, &symbol_map, &result->error_message)) {
             result->has_error = true;
-            free(resolved_path);
-            free(item.module_path);
-            free(item.base_path);
+            ZYM_FREE_STR(alloc, resolved_path);
+            ZYM_FREE_STR(alloc, item.module_path);
+            ZYM_FREE_STR(alloc, item.base_path);
             queue_free(&entry_deps);
             goto cleanup;
         }
 
-        free(resolved_path);
-        free(item.module_path);
-        free(item.base_path);
+        ZYM_FREE_STR(alloc, resolved_path);
+        ZYM_FREE_STR(alloc, item.module_path);
+        ZYM_FREE_STR(alloc, item.base_path);
     }
 
     queue_free(&entry_deps);
 
     StringBuilder combined;
-    sb_init(&combined);
+    sb_init(&combined, alloc);
 
-    LineMap* combined_linemap = (LineMap*)malloc(sizeof(LineMap));
+    LineMap* combined_linemap = (LineMap*)ZYM_ALLOC(alloc, sizeof(LineMap));
     initLineMap(combined_linemap);
 
     for (int i = 0; i < loaded_modules.count; i++) {
@@ -1048,7 +1070,7 @@ ModuleLoadResult* loadModules(
         }
 
         if (debug_names) {
-            char* encoded = encode_path_to_identifier(module_path);
+            char* encoded = encode_path_to_identifier(alloc, module_path);
             if (is_fresh) {
                 sb_append(&combined, "func __module_");
                 sb_append(&combined, encoded);
@@ -1057,7 +1079,7 @@ ModuleLoadResult* loadModules(
                 sb_append(&combined, encoded);
                 sb_append(&combined, "_init");
             }
-            free(encoded);
+            ZYM_FREE_STR(alloc, encoded);
         } else {
             char hash_str[32];
             if (is_fresh) {
@@ -1071,13 +1093,13 @@ ModuleLoadResult* loadModules(
         sb_append(&combined, "() {\n");
         addLineMapping(vm, combined_linemap, 0);
 
-        char* transformed = transform_imports(source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
+        char* transformed = transform_imports(alloc, source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
         int source_line_idx = 0;
         add_mapped_lines(vm, transformed, source_linemap, combined_linemap, &source_line_idx);
 
         sb_append(&combined, transformed);
-        free(transformed);
+        ZYM_FREE_STR(alloc, transformed);
 
         sb_append(&combined, "\n}\n");
         addLineMapping(vm, combined_linemap, 0);
@@ -1085,13 +1107,13 @@ ModuleLoadResult* loadModules(
 
         if (!is_fresh) {
             if (debug_names) {
-                char* encoded = encode_path_to_identifier(module_path);
+                char* encoded = encode_path_to_identifier(alloc, module_path);
                 sb_append(&combined, "var __module_");
                 sb_append(&combined, encoded);
                 sb_append(&combined, " = __module_");
                 sb_append(&combined, encoded);
                 sb_append(&combined, "_init()\n");
-                free(encoded);
+                ZYM_FREE_STR(alloc, encoded);
             } else {
                 char hash_str[64];
                 snprintf(hash_str, sizeof(hash_str), "var _%x = _%x_init()\n",
@@ -1105,13 +1127,13 @@ ModuleLoadResult* loadModules(
         addLineMapping(vm, combined_linemap, 0);
     }
 
-    char* transformed_entry = transform_imports(entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
+    char* transformed_entry = transform_imports(alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
     int entry_line_idx = 0;
     add_mapped_lines(vm, transformed_entry, entry_line_map, combined_linemap, &entry_line_idx);
 
     sb_append(&combined, transformed_entry);
-    free(transformed_entry);
+    ZYM_FREE_STR(alloc, transformed_entry);
 
     result->combined_source = combined.buffer;
     result->line_map = combined_linemap;
@@ -1134,9 +1156,9 @@ ModuleLoadResult* loadModules(
     }
 
     result->module_count = loaded_modules.count;
-    result->module_paths = (char**)malloc(sizeof(char*) * result->module_count);
+    result->module_paths = (char**)ZYM_ALLOC(alloc, sizeof(char*) * result->module_count);
     for (int i = 0; i < loaded_modules.count; i++) {
-        result->module_paths[i] = strdup(loaded_modules.items[i]);
+        result->module_paths[i] = zym_strdup(alloc, loaded_modules.items[i]);
     }
 
 cleanup:
@@ -1152,19 +1174,20 @@ cleanup:
 
 void freeModuleLoadResult(VM* vm, ModuleLoadResult* result) {
     if (!result) return;
+    ZymAllocator* alloc = &vm->allocator;
 
-    free(result->combined_source);
+    ZYM_FREE_STR(alloc, result->combined_source);
 
     if (result->line_map) {
         freeLineMap(vm, result->line_map);
-        free(result->line_map);
+        ZYM_FREE(alloc, result->line_map, sizeof(LineMap));
     }
 
     for (int i = 0; i < result->module_count; i++) {
-        free(result->module_paths[i]);
+        ZYM_FREE_STR(alloc, result->module_paths[i]);
     }
-    free(result->module_paths);
+    ZYM_FREE(alloc, result->module_paths, sizeof(char*) * result->module_count);
 
-    free(result->error_message);
-    free(result);
+    ZYM_FREE_STR(alloc, result->error_message);
+    ZYM_FREE(alloc, result, sizeof(ModuleLoadResult));
 }

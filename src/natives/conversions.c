@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "conversions.h"
+#include "../memory.h"
 
 // =============================================================================
 // CONVERSION FUNCTIONS
@@ -47,10 +48,11 @@ ZymValue nativeConversions_num(ZymVM* vm, ZymValue value) {
 }
 
 // Helper to ensure buffer has space
-static bool ensureBufferSpace(char** buffer, size_t* buffer_size, size_t* current_pos, size_t needed) {
+static bool ensureBufferSpace(ZymAllocator* alloc, char** buffer, size_t* buffer_size, size_t* current_pos, size_t needed) {
     while (*current_pos + needed >= *buffer_size) {
+        size_t old = *buffer_size;
         *buffer_size *= 2;
-        *buffer = realloc(*buffer, *buffer_size);
+        *buffer = ZYM_REALLOC(alloc, *buffer, old, *buffer_size);
         if (*buffer == NULL) {
             return false;
         }
@@ -59,8 +61,8 @@ static bool ensureBufferSpace(char** buffer, size_t* buffer_size, size_t* curren
 }
 
 // Helper to append string to buffer
-static bool appendToBuffer(char** buffer, size_t* buffer_size, size_t* current_pos, const char* str, size_t len) {
-    if (!ensureBufferSpace(buffer, buffer_size, current_pos, len)) {
+static bool appendToBuffer(ZymAllocator* alloc, char** buffer, size_t* buffer_size, size_t* current_pos, const char* str, size_t len) {
+    if (!ensureBufferSpace(alloc, buffer, buffer_size, current_pos, len)) {
         return false;
     }
     memcpy(*buffer + *current_pos, str, len);
@@ -69,7 +71,7 @@ static bool appendToBuffer(char** buffer, size_t* buffer_size, size_t* current_p
 }
 
 // Helper to append formatted value to buffer using zym_valueToString
-static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, size_t* current_pos,
+static bool appendFormattedValue(ZymVM* vm, ZymAllocator* alloc, char** buffer, size_t* buffer_size, size_t* current_pos,
                                   char format, ZymValue val, int argIndex) {
     char temp[256];
 
@@ -79,7 +81,7 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
                 zym_runtimeError(vm, "str() format %%s at position %d expects string, got %s", argIndex, zym_typeName(val));
                 return false;
             }
-            return appendToBuffer(buffer, buffer_size, current_pos, zym_asCString(val), strlen(zym_asCString(val)));
+            return appendToBuffer(alloc, buffer, buffer_size, current_pos, zym_asCString(val), strlen(zym_asCString(val)));
 
         case 'n': // Number
             if (!zym_isNumber(val)) {
@@ -94,7 +96,7 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
                 } else {
                     len = snprintf(temp, sizeof(temp), "%g", num);
                 }
-                return appendToBuffer(buffer, buffer_size, current_pos, temp, len);
+                return appendToBuffer(alloc, buffer, buffer_size, current_pos, temp, len);
             }
 
         case 'b': // Boolean
@@ -104,7 +106,7 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
             }
             {
                 const char* str = zym_asBool(val) ? "true" : "false";
-                return appendToBuffer(buffer, buffer_size, current_pos, str, strlen(str));
+                return appendToBuffer(alloc, buffer, buffer_size, current_pos, str, strlen(str));
             }
 
         case 'v': // Any value
@@ -112,7 +114,7 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
                 ZymValue str_val = zym_valueToString(vm, val);
                 if (str_val == ZYM_ERROR) return false;
                 const char* str = zym_asCString(str_val);
-                return appendToBuffer(buffer, buffer_size, current_pos, str, strlen(str));
+                return appendToBuffer(alloc, buffer, buffer_size, current_pos, str, strlen(str));
             }
 
         default:
@@ -123,8 +125,9 @@ static bool appendFormattedValue(ZymVM* vm, char** buffer, size_t* buffer_size, 
 
 // Core str implementation that processes format string and arguments
 static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int arg_count) {
+    ZymAllocator* alloc = (ZymAllocator*)zym_getAllocator(vm);
     size_t buffer_size = 256;
-    char* buffer = malloc(buffer_size);
+    char* buffer = ZYM_ALLOC(alloc, buffer_size);
     if (buffer == NULL) {
         zym_runtimeError(vm, "str() out of memory");
         return ZYM_ERROR;
@@ -138,33 +141,29 @@ static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int 
         if (*ptr == '%') {
             ptr++;
             if (*ptr == '\0') {
-                free(buffer);
+                ZYM_FREE(alloc, buffer, buffer_size);
                 zym_runtimeError(vm, "str() format string ends with incomplete format specifier");
                 return ZYM_ERROR;
             }
 
             if (*ptr == '%') {
                 // Escaped % - append literal %
-                if (current_pos >= buffer_size - 1) {
-                    buffer_size *= 2;
-                    buffer = realloc(buffer, buffer_size);
-                    if (buffer == NULL) {
-                        zym_runtimeError(vm, "str() out of memory");
-                        return ZYM_ERROR;
-                    }
+                if (!ensureBufferSpace(alloc, &buffer, &buffer_size, &current_pos, 1)) {
+                    zym_runtimeError(vm, "str() out of memory");
+                    return ZYM_ERROR;
                 }
                 buffer[current_pos++] = '%';
                 ptr++;
             } else {
                 // Format specifier
                 if (arg_index >= arg_count) {
-                    free(buffer);
+                    ZYM_FREE(alloc, buffer, buffer_size);
                     zym_runtimeError(vm, "str() format string requires more arguments than provided");
                     return ZYM_ERROR;
                 }
 
-                if (!appendFormattedValue(vm, &buffer, &buffer_size, &current_pos, *ptr, args[arg_index], arg_index + 1)) {
-                    free(buffer);
+                if (!appendFormattedValue(vm, alloc, &buffer, &buffer_size, &current_pos, *ptr, args[arg_index], arg_index + 1)) {
+                    ZYM_FREE(alloc, buffer, buffer_size);
                     return ZYM_ERROR;
                 }
 
@@ -173,13 +172,9 @@ static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int 
             }
         } else {
             // Regular character
-            if (current_pos >= buffer_size - 1) {
-                buffer_size *= 2;
-                buffer = realloc(buffer, buffer_size);
-                if (buffer == NULL) {
-                    zym_runtimeError(vm, "str() out of memory");
-                    return ZYM_ERROR;
-                }
+            if (!ensureBufferSpace(alloc, &buffer, &buffer_size, &current_pos, 1)) {
+                zym_runtimeError(vm, "str() out of memory");
+                return ZYM_ERROR;
             }
             buffer[current_pos++] = *ptr;
             ptr++;
@@ -188,7 +183,7 @@ static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int 
 
     // Check if we have unused arguments
     if (arg_index < arg_count) {
-        free(buffer);
+        ZYM_FREE(alloc, buffer, buffer_size);
         zym_runtimeError(vm, "str() provided %d arguments but format string only uses %d", arg_count, arg_index);
         return ZYM_ERROR;
     }
@@ -196,7 +191,7 @@ static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int 
     // Null-terminate and create string
     buffer[current_pos] = '\0';
     ZymValue result = zym_newString(vm, buffer);
-    free(buffer);
+    ZYM_FREE(alloc, buffer, buffer_size);
 
     return result;
 }

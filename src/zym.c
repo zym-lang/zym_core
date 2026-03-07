@@ -25,10 +25,12 @@
 // VM LIFECYCLE
 // =============================================================================
 
-ZymVM* zym_newVM()
+ZymVM* zym_newVM(ZymAllocator* allocator)
 {
-    ZymVM* vm = (ZymVM*)malloc(sizeof(ZymVM));
+    ZymAllocator alloc = allocator ? *allocator : zym_defaultAllocator();
+    ZymVM* vm = (ZymVM*)ZYM_ALLOC(&alloc, sizeof(ZymVM));
     if (vm == NULL) return NULL;
+    vm->allocator = alloc;
     initVM(vm);
     return vm;
 }
@@ -36,8 +38,15 @@ ZymVM* zym_newVM()
 void zym_freeVM(ZymVM* vm)
 {
     if (vm == NULL) return;
+    ZymAllocator alloc = vm->allocator;
     freeVM(vm);
-    free(vm);
+    ZYM_FREE(&alloc, vm, sizeof(ZymVM));
+}
+
+const ZymAllocator* zym_getAllocator(ZymVM* vm)
+{
+    if (vm == NULL) return NULL;
+    return &vm->allocator;
 }
 
 // =============================================================================
@@ -57,7 +66,7 @@ void zym_setErrorCallback(ZymVM* vm, ErrorCallback callback, void* user_data)
 
 ZymChunk* zym_newChunk(ZymVM* vm)
 {
-    ZymChunk* chunk = (ZymChunk*)malloc(sizeof(ZymChunk));
+    ZymChunk* chunk = (ZymChunk*)ZYM_ALLOC(&vm->allocator, sizeof(ZymChunk));
     if (chunk == NULL) return NULL;
     initChunk(chunk);
     return chunk;
@@ -67,13 +76,13 @@ void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
 {
     if (chunk == NULL) return;
     freeChunk(vm, chunk);
-    free(chunk);
+    ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
 
 ZymLineMap* zym_newLineMap(ZymVM* vm)
 {
 #ifndef ZYM_RUNTIME_ONLY
-    ZymLineMap* map = (ZymLineMap*)malloc(sizeof(ZymLineMap));
+    ZymLineMap* map = (ZymLineMap*)ZYM_ALLOC(&vm->allocator, sizeof(ZymLineMap));
     if (map == NULL) return NULL;
     initLineMap(map);
     return map;
@@ -88,7 +97,7 @@ void zym_freeLineMap(ZymVM* vm, ZymLineMap* map)
 #ifndef ZYM_RUNTIME_ONLY
     if (map == NULL) return;
     freeLineMap(vm, map);
-    free(map);
+    ZYM_FREE(&vm->allocator, map, sizeof(ZymLineMap));
 #else
     (void)vm;
     (void)map;
@@ -169,7 +178,7 @@ ZymStatus zym_serializeChunk(ZymVM* vm, ZymCompilerConfig config, ZymChunk* chun
     printf("\n");
     printf(" *** BYTECODE END ***\n\n");
 */
-    char* host_buffer = (char*)malloc(temp_buffer.count);
+    char* host_buffer = (char*)ZYM_ALLOC(&vm->allocator, temp_buffer.count);
     if (host_buffer == NULL) {
         freeOutputBuffer(vm, &temp_buffer);
         *out_buffer = NULL;
@@ -260,20 +269,20 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
     int arity;
     uint8_t* qualifiers = NULL;
 
-    if (!parseNativeSignature(signature, func_name, &arity, &qualifiers)) {
+    if (!parseNativeSignature(&vm->allocator, signature, func_name, &arity, &qualifiers)) {
         return NULL_VAL;
     }
 
     if (arity > MAX_NATIVE_ARITY) {
         fprintf(stderr, "Native closure '%s' has too many parameters (max %d)\n", func_name, MAX_NATIVE_ARITY);
-        if (qualifiers) free(qualifiers);
+        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return NULL_VAL;
     }
 
     NativeDispatcher dispatcher = getNativeClosureDispatcher(arity);
     if (!dispatcher) {
         fprintf(stderr, "No closure dispatcher available for arity %d\n", arity);
-        if (qualifiers) free(qualifiers);
+        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return NULL_VAL;
     }
 
@@ -286,7 +295,7 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
 
     if (arity > 0 && qualifiers) {
         memcpy(closure->param_qualifiers, qualifiers, arity * sizeof(uint8_t));
-        free(qualifiers);
+        ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
     }
 
     return OBJ_VAL(closure);
@@ -481,14 +490,14 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
 
     if (depth >= 100) {
         size_t need = 3;
-        while (*pos + need >= *buf_size) { *buf_size *= 2; *buffer = realloc(*buffer, *buf_size); if (!*buffer) return false; }
+        while (*pos + need >= *buf_size) { size_t old = *buf_size; *buf_size *= 2; *buffer = ZYM_REALLOC(&vm->allocator, *buffer, old, *buf_size); if (!*buffer) return false; }
         memcpy(*buffer + *pos, "...", 3); *pos += 3;
         return true;
     }
 
 #define APPEND(s, n) do { \
     size_t _n = (n); \
-    while (*pos + _n >= *buf_size) { *buf_size *= 2; *buffer = realloc(*buffer, *buf_size); if (!*buffer) return false; } \
+    while (*pos + _n >= *buf_size) { size_t _old = *buf_size; *buf_size *= 2; *buffer = ZYM_REALLOC(&vm->allocator, *buffer, _old, *buf_size); if (!*buffer) return false; } \
     memcpy(*buffer + *pos, (s), _n); *pos += _n; \
 } while(0)
 
@@ -674,20 +683,20 @@ ZymValue zym_valueToString(ZymVM* vm, ZymValue value) {
     if (vm == NULL) return ZYM_ERROR;
 
     size_t buf_size = 256;
-    char* buffer = malloc(buf_size);
+    char* buffer = ZYM_ALLOC(&vm->allocator, buf_size);
     if (buffer == NULL) return ZYM_ERROR;
 
     size_t pos = 0;
     Obj* visited[100] = {0};
 
     if (!valueToStringHelper(vm, value, &buffer, &buf_size, &pos, visited, 0)) {
-        free(buffer);
+        ZYM_FREE(&vm->allocator, buffer, buf_size);
         return ZYM_ERROR;
     }
 
     buffer[pos] = '\0';
     ZymValue result = zym_newString(vm, buffer);
-    free(buffer);
+    ZYM_FREE(&vm->allocator, buffer, buf_size);
     return result;
 }
 
@@ -1118,7 +1127,7 @@ ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...) {
 
     ZymValue* args = NULL;
     if (argc > 0) {
-        args = (ZymValue*)malloc(sizeof(ZymValue) * argc);
+        args = (ZymValue*)ZYM_ALLOC(&vm->allocator, sizeof(ZymValue) * argc);
         if (!args) return ZYM_STATUS_RUNTIME_ERROR;
 
         va_list ap;
@@ -1131,7 +1140,7 @@ ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...) {
 
     ZymStatus result = zym_callv(vm, funcName, argc, args);
 
-    if (args) free(args);
+    if (args) ZYM_FREE(&vm->allocator, args, sizeof(ZymValue) * argc);
     return result;
 }
 

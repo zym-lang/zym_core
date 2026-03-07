@@ -72,9 +72,9 @@ static int parseOctalDigit(char c) {
     return -1;
 }
 
-char* processEscapeSequences(const char* input, int input_len, int* out_len,
+char* processEscapeSequences(ZymAllocator* alloc, const char* input, int input_len, int* out_len,
                              const char** error_msg, int* error_pos) {
-    char* output = (char*)malloc(input_len + 1);
+    char* output = (char*)ZYM_ALLOC(alloc, input_len + 1);
     if (!output) {
         *error_msg = "Out of memory";
         *error_pos = 0;
@@ -102,7 +102,7 @@ char* processEscapeSequences(const char* input, int input_len, int* out_len,
 
                 case 'x': {
                     if (i + 2 >= input_len) {
-                        free(output);
+                        ZYM_FREE(alloc, output, input_len + 1);
                         *error_msg = "Incomplete hex escape sequence";
                         *error_pos = i - 1;
                         return NULL;
@@ -112,7 +112,7 @@ char* processEscapeSequences(const char* input, int input_len, int* out_len,
                     int digit2 = parseHexDigit(input[i + 2]);
 
                     if (digit1 == -1 || digit2 == -1) {
-                        free(output);
+                        ZYM_FREE(alloc, output, input_len + 1);
                         *error_msg = "Invalid hex escape sequence";
                         *error_pos = i - 1;
                         return NULL;
@@ -125,7 +125,7 @@ char* processEscapeSequences(const char* input, int input_len, int* out_len,
 
                 case 'u': {
                     if (i + 4 >= input_len) {
-                        free(output);
+                        ZYM_FREE(alloc, output, input_len + 1);
                         *error_msg = "Incomplete unicode escape sequence";
                         *error_pos = i - 1;
                         return NULL;
@@ -135,7 +135,7 @@ char* processEscapeSequences(const char* input, int input_len, int* out_len,
                     for (int j = 0; j < 4; j++) {
                         int digit = parseHexDigit(input[i + 1 + j]);
                         if (digit == -1) {
-                            free(output);
+                            ZYM_FREE(alloc, output, input_len + 1);
                             *error_msg = "Invalid unicode escape sequence";
                             *error_pos = i - 1;
                             return NULL;
@@ -214,8 +214,8 @@ char* processEscapeSequences(const char* input, int input_len, int* out_len,
     return output;
 }
 
-char* decodeModulePath(const char* encoded, int length) {
-    char* result = (char*)malloc(length + 1);
+char* decodeModulePath(ZymAllocator* alloc, const char* encoded, int length) {
+    char* result = (char*)ZYM_ALLOC(alloc, length + 1);
     size_t j = 0;
 
     for (int i = 0; i < length; ) {

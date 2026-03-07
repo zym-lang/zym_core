@@ -200,9 +200,9 @@ typedef struct {
 } ContData;
 
 static void cont_cleanup(ZymVM* vm, void* ptr) {
-    (void)vm;
     ContData* data = (ContData*)ptr;
-    free(data);
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    ZYM_FREE((ZymAllocator*)alloc, data, sizeof(ContData));
 }
 
 static ZymValue cont_newPrompt_0(ZymVM* vm, ZymValue context) {
@@ -728,7 +728,8 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
 }
 
 ZymValue nativeCont_create(ZymVM* vm) {
-    ContData* data = calloc(1, sizeof(ContData));
+    const ZymAllocator* alloc = zym_getAllocator(vm);
+    ContData* data = ZYM_CALLOC((ZymAllocator*)alloc, 1, sizeof(ContData));
     if (!data) {
         zym_runtimeError(vm, "Out of memory");
         return ZYM_ERROR;

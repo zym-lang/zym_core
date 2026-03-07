@@ -6,6 +6,7 @@
 #include <stdarg.h>
 
 #include "./config.h"
+#include "./allocator.h"
 
 // =============================================================================
 // CORE TYPES
@@ -36,8 +37,9 @@ typedef enum {
 // VM LIFECYCLE
 // =============================================================================
 
-ZymVM* zym_newVM();
+ZymVM* zym_newVM(ZymAllocator* allocator);
 void zym_freeVM(ZymVM* vm);
+const ZymAllocator* zym_getAllocator(ZymVM* vm);
 
 // =============================================================================
 // ERROR CALLBACK

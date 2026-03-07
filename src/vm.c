@@ -117,8 +117,8 @@ void freeVM(VM* vm) {
         object = next;
     }
 
-    free(vm->gray_stack);
-    free(vm->temp_roots);
+    ZYM_FREE(&vm->allocator, vm->gray_stack, sizeof(Obj*) * vm->gray_capacity);
+    ZYM_FREE(&vm->allocator, vm->temp_roots, sizeof(Obj*) * vm->temp_root_capacity);
 
     reallocate(vm, vm->stack, sizeof(Value) * vm->stack_capacity, 0);
     vm->stack = NULL;

@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include "./allocator.h"
 
 typedef struct VM VM;
 
@@ -32,9 +33,11 @@ IfState* peekConditionalStack(ConditionalStack* stack);
 void popConditionalStack(ConditionalStack* stack);
 void freeConditionalStack(VM* vm, ConditionalStack* stack);
 
-// Returns allocated string with escapes processed, or NULL on error. Caller must free().
-char* processEscapeSequences(const char* input, int input_len, int* out_len,
+// Returns allocated string with escapes processed, or NULL on error.
+// Caller must free with the same allocator.
+char* processEscapeSequences(ZymAllocator* alloc, const char* input, int input_len, int* out_len,
                              const char** error_msg, int* error_pos);
 
 // Decodes module identifier to file path: "src_slash_math_dot_zym" -> "src/math.zym"
-char* decodeModulePath(const char* encoded, int length);
+// Caller must free with the same allocator.
+char* decodeModulePath(ZymAllocator* alloc, const char* encoded, int length);

@@ -174,11 +174,11 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
     int entryFileLen = 0;
     READ_BYTES(&entryFileLen, sizeof(int));
     if (entryFileLen > 0) {
-        char* entryFileChars = (char*)malloc(entryFileLen + 1);
+        char* entryFileChars = (char*)ZYM_ALLOC(&vm->allocator, entryFileLen + 1);
         READ_BYTES(entryFileChars, entryFileLen);
         entryFileChars[entryFileLen] = '\0';
         vm->entry_file = copyString(vm, entryFileChars, entryFileLen);
-        free(entryFileChars);
+        ZYM_FREE(&vm->allocator, entryFileChars, entryFileLen + 1);
     } else {
         vm->entry_file = NULL;
     }

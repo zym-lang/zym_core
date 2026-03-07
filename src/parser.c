@@ -155,9 +155,9 @@ static void error_at_current(Parser* parser, const char* message) {
         int pos = 0;
 
         if (parser->current_module_name) {
-            char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
+            char* decoded = decodeModulePath(&parser->vm->allocator, parser->current_module_name, parser->module_name_length);
             pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
-            free(decoded);
+            ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
         }
@@ -184,9 +184,9 @@ static void error_at_current(Parser* parser, const char* message) {
         parser->vm->error_callback(parser->vm, 1, file, line, buf, parser->vm->error_user_data);
     } else {
         if (parser->current_module_name) {
-            char* decoded = decodeModulePath(parser->current_module_name, parser->module_name_length);
+            char* decoded = decodeModulePath(&parser->vm->allocator, parser->current_module_name, parser->module_name_length);
             fprintf(stderr, "[%s] line %d", decoded, line);
-            free(decoded);
+            ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
         } else {
             fprintf(stderr, "[line %d]", line);
         }

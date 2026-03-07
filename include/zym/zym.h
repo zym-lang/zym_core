@@ -6,6 +6,12 @@
 #include <stdarg.h>
 
 // =============================================================================
+// CUSTOM ALLOCATOR (defined in allocator.h, shared with internal headers)
+// =============================================================================
+
+#include "../../src/allocator.h"
+
+// =============================================================================
 // CORE TYPES
 // =============================================================================
 
@@ -37,8 +43,14 @@ typedef enum {
 // VM LIFECYCLE
 // =============================================================================
 
-ZymVM* zym_newVM();
+// Create a new VM with an optional custom allocator.
+// If allocator is NULL, the default (malloc/free) allocator is used.
+// The allocator is copied into the VM and used for all internal allocations.
+ZymVM* zym_newVM(ZymAllocator* allocator);
 void zym_freeVM(ZymVM* vm);
+
+// Get the allocator associated with a VM
+const ZymAllocator* zym_getAllocator(ZymVM* vm);
 
 // =============================================================================
 // ERROR CALLBACK
