@@ -351,28 +351,6 @@ bool zym_addOverload(ZymVM* vm, ZymValue dispatcher, ZymValue closure) {
     return true;
 }
 
-// =============================================================================
-// NATIVE REFERENCES
-// =============================================================================
-
-ZymValue zym_createNativeReference(ZymVM* vm, ZymValue context, size_t value_offset,
-                                   ZymValue (*get_hook)(ZymVM*, ZymValue, ZymValue),
-                                   void (*set_hook)(ZymVM*, ZymValue, ZymValue)) {
-    if (!IS_OBJ(context) || !IS_NATIVE_CONTEXT(context)) {
-        fprintf(stderr, "ERROR: zym_createNativeReference requires a native context\n");
-        return NULL_VAL;
-    }
-
-    pushTempRoot(vm, AS_OBJ(context));
-
-    ObjNativeReference* ref = newNativeReference(vm, context, value_offset,
-                                                 (NativeRefGetHook)get_hook,
-                                                 (NativeRefSetHook)set_hook);
-
-    popTempRoot(vm);
-
-    return OBJ_VAL(ref);
-}
 
 // =============================================================================
 // VALUE TYPE CHECKING
@@ -389,8 +367,6 @@ bool zym_isEnum(ZymValue value) { return IS_ENUM(value); }
 bool zym_isFunction(ZymValue value) {
     return IS_FUNCTION(value) || IS_CLOSURE(value) || IS_NATIVE_FUNCTION(value) || IS_NATIVE_CLOSURE(value);
 }
-bool zym_isReference(ZymValue value) { return IS_REFERENCE(value); }
-bool zym_isNativeReference(ZymValue value) { return IS_OBJ(value) && IS_NATIVE_REFERENCE(value); }
 bool zym_isClosure(ZymValue value) { return IS_CLOSURE(value); }
 bool zym_isPromptTag(ZymValue value) { return IS_OBJ(value) && IS_PROMPT_TAG(value); }
 bool zym_isContinuation(ZymValue value) { return IS_OBJ(value) && IS_CONTINUATION(value); }
@@ -455,8 +431,6 @@ const char* zym_typeName(ZymValue value) {
             case OBJ_NATIVE_FUNCTION: return "native_function";
             case OBJ_NATIVE_CLOSURE: return "native_closure";
             case OBJ_NATIVE_CONTEXT: return "native_context";
-            case OBJ_NATIVE_REFERENCE: return "native_reference";
-            case OBJ_REFERENCE: return "reference";
             case OBJ_PROMPT_TAG: return "prompt_tag";
             case OBJ_CONTINUATION: return "continuation";
             case OBJ_STRUCT_SCHEMA: return "struct_schema";
@@ -616,17 +590,6 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
                 if (closure->name) len = snprintf(temp, sizeof(temp), "<native closure %.*s/%d>", closure->name->length, closure->name->chars, closure->arity);
                 else len = snprintf(temp, sizeof(temp), "<native closure /%d>", closure->arity);
                 APPEND(temp, len);
-                break;
-            }
-            case OBJ_REFERENCE:
-            case OBJ_NATIVE_REFERENCE: {
-                Value deref_value;
-                if (dereferenceValue(vm, value, &deref_value)) {
-                    if (!valueToStringHelper(vm, deref_value, buffer, buf_size, pos, visited, depth + 1)) return false;
-                } else {
-                    const char* msg = obj->type == OBJ_REFERENCE ? "<undefined ref>" : "<dead native ref>";
-                    APPEND(msg, strlen(msg));
-                }
                 break;
             }
             case OBJ_STRUCT_INSTANCE: {
@@ -1042,21 +1005,6 @@ int zym_enumVariantIndex(ZymVM* vm, ZymValue enumVal) {
     return ENUM_VARIANT(enumVal);
 }
 
-// =============================================================================
-// REFERENCE OPERATIONS
-// =============================================================================
-
-ZymValue zym_deref(ZymVM* vm, ZymValue val) {
-    Value result;
-    if (dereferenceValue(vm, val, &result)) {
-        return result;
-    }
-    return val;
-}
-
-bool zym_refSet(ZymVM* vm, ZymValue refVal, ZymValue newVal) {
-    return writeReferenceValue(vm, refVal, newVal);
-}
 
 // =============================================================================
 // CALLING SCRIPT FUNCTIONS FROM C

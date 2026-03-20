@@ -66,5 +66,3 @@ void freeValueArray(VM* vm, ValueArray* array);
 void printValue(VM* vm, Value value);
 Value cloneValue(VM* vm, Value value);
 Value deepCloneValue(VM* vm, Value value);
-bool dereferenceValue(VM* vm, Value refValue, Value* out);
-bool writeReferenceValue(VM* vm, Value refValue, Value new_value);

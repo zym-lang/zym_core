@@ -19,13 +19,11 @@ typedef struct CallFrame CallFrame;
 #define IS_NATIVE_FUNCTION(value) isObjType(value, OBJ_NATIVE_FUNCTION)
 #define IS_NATIVE_CONTEXT(value) isObjType(value, OBJ_NATIVE_CONTEXT)
 #define IS_NATIVE_CLOSURE(value) isObjType(value, OBJ_NATIVE_CLOSURE)
-#define IS_NATIVE_REFERENCE(value) isObjType(value, OBJ_NATIVE_REFERENCE)
 #define IS_CLOSURE(value)     isObjType(value, OBJ_CLOSURE)
 #define IS_UPVALUE(value)     isObjType(value, OBJ_UPVALUE)
 #define IS_LIST(value)        isObjType(value, OBJ_LIST)
 #define IS_MAP(value)         isObjType(value, OBJ_MAP)
 #define IS_DISPATCHER(value)  isObjType(value, OBJ_DISPATCHER)
-#define IS_REFERENCE(value)   isObjType(value, OBJ_REFERENCE)
 #define IS_STRUCT_SCHEMA(value) isObjType(value, OBJ_STRUCT_SCHEMA)
 #define IS_STRUCT_INSTANCE(value) isObjType(value, OBJ_STRUCT_INSTANCE)
 #define IS_ENUM_SCHEMA(value) isObjType(value, OBJ_ENUM_SCHEMA)
@@ -37,14 +35,12 @@ typedef struct CallFrame CallFrame;
 #define AS_NATIVE_FUNCTION(value) ((ObjNativeFunction*)AS_OBJ(value))
 #define AS_NATIVE_CONTEXT(value) ((ObjNativeContext*)AS_OBJ(value))
 #define AS_NATIVE_CLOSURE(value) ((ObjNativeClosure*)AS_OBJ(value))
-#define AS_NATIVE_REFERENCE(value) ((ObjNativeReference*)AS_OBJ(value))
 #define AS_CLOSURE(value)     ((ObjClosure*)AS_OBJ(value))
 #define AS_UPVALUE(value)     ((ObjUpvalue*)AS_OBJ(value))
 #define AS_CSTRING(value)     (((ObjString*)AS_OBJ(value))->chars)
 #define AS_LIST(value)        ((ObjList*)AS_OBJ(value))
 #define AS_MAP(value)         ((ObjMap*)AS_OBJ(value))
 #define AS_DISPATCHER(value)  ((ObjDispatcher*)AS_OBJ(value))
-#define AS_REFERENCE(value)   ((ObjReference*)AS_OBJ(value))
 #define AS_STRUCT_SCHEMA(value) ((ObjStructSchema*)AS_OBJ(value))
 #define AS_STRUCT_INSTANCE(value) ((ObjStructInstance*)AS_OBJ(value))
 #define AS_ENUM_SCHEMA(value) ((ObjEnumSchema*)AS_OBJ(value))
@@ -58,13 +54,11 @@ typedef enum {
     OBJ_NATIVE_FUNCTION,
     OBJ_NATIVE_CONTEXT,
     OBJ_NATIVE_CLOSURE,
-    OBJ_NATIVE_REFERENCE,
     OBJ_INT64,
     OBJ_STRING,
     OBJ_LIST,
     OBJ_MAP,
     OBJ_DISPATCHER,
-    OBJ_REFERENCE,
     OBJ_STRUCT_SCHEMA,
     OBJ_STRUCT_INSTANCE,
     OBJ_ENUM_SCHEMA,
@@ -129,16 +123,6 @@ typedef struct {
     Value context;
 } ObjNativeClosure;
 
-typedef Value (*NativeRefGetHook)(VM* vm, Value context, Value current_value);
-typedef void (*NativeRefSetHook)(VM* vm, Value context, Value new_value);
-
-typedef struct {
-    Obj obj;
-    Value context;
-    size_t value_offset;
-    NativeRefGetHook get_hook;
-    NativeRefSetHook set_hook;
-} ObjNativeReference;
 
 typedef struct ObjUpvalue {
     Obj obj;
@@ -171,37 +155,6 @@ typedef struct {
     int count;
 } ObjDispatcher;
 
-typedef enum {
-    REF_LOCAL,
-    REF_GLOBAL,
-    REF_INDEX,
-    REF_PROPERTY,
-    REF_UPVALUE
-} RefType;
-
-typedef struct {
-    Obj obj;
-    RefType ref_type;
-    union {
-        struct {
-            Value* location;
-        } local;
-        struct {
-            ObjString* global_name;
-        } global;
-        struct {
-            Value container;
-            Value index;
-        } index;
-        struct {
-            Value container;
-            Value key;
-        } property;
-        struct {
-            ObjUpvalue* upvalue;
-        } upvalue;
-    } as;
-} ObjReference;
 
 typedef struct ObjStructSchema {
     Obj obj;
@@ -257,7 +210,6 @@ ObjFunction* newFunction(VM* vm);
 ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher);
 ObjNativeContext* newNativeContext(VM* vm, void* native_data, NativeFinalizerFunc finalizer);
 ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher, Value context);
-ObjNativeReference* newNativeReference(VM* vm, Value context, size_t value_offset, NativeRefGetHook get_hook, NativeRefSetHook set_hook);
 ObjString* takeString(VM* vm, char* chars, int length);
 ObjString* copyString(VM* vm, const char* chars, int length);
 void printObject(Value value);
@@ -266,12 +218,6 @@ ObjClosure* newClosure(VM* vm, ObjFunction* function);
 ObjList* newList(VM* vm);
 ObjMap* newMap(VM* vm);
 ObjDispatcher* newDispatcher(VM* vm);
-ObjReference* newReference(VM* vm, Value* location);
-ObjReference* newStackSlotReference(VM* vm, int slot_index);
-ObjReference* newGlobalReference(VM* vm, ObjString* global_name);
-ObjReference* newIndexReference(VM* vm, Value container, Value index);
-ObjReference* newPropertyReference(VM* vm, Value container, Value key);
-ObjReference* newUpvalueReference(VM* vm, ObjUpvalue* upvalue);
 ObjStructSchema* newStructSchema(VM* vm, ObjString* name, ObjString** field_names, int field_count);
 ObjStructInstance* newStructInstance(VM* vm, ObjStructSchema* schema);
 ObjEnumSchema* newEnumSchema(VM* vm, ObjString* name, ObjString** variant_names, int variant_count);

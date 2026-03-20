@@ -129,17 +129,6 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
 // Returns ZYM_NULL if the value is not a native closure
 ZymValue zym_getClosureContext(ZymValue closure);
 
-// Create a native reference pointing to a Value field in native context data
-// Parameters:
-//   vm: VM instance
-//   context: Native context containing the data
-//   value_offset: offsetof(YourStruct, your_value_field)
-//   get_hook: Optional getter (called after read, can transform/log)
-//   set_hook: Optional setter (called before write, can validate/clamp)
-// Returns: Native reference object
-ZymValue zym_createNativeReference(ZymVM* vm, ZymValue context, size_t value_offset,
-                                   ZymValue (*get_hook)(ZymVM*, ZymValue, ZymValue),
-                                   void (*set_hook)(ZymVM*, ZymValue, ZymValue));
 
 // =============================================================================
 // FUNCTION OVERLOADING (DISPATCHER)
@@ -169,8 +158,6 @@ bool zym_isMap(ZymValue value);
 bool zym_isStruct(ZymValue value);
 bool zym_isEnum(ZymValue value);
 bool zym_isFunction(ZymValue value);
-bool zym_isReference(ZymValue value);
-bool zym_isNativeReference(ZymValue value);
 bool zym_isClosure(ZymValue value);
 bool zym_isPromptTag(ZymValue value);
 bool zym_isContinuation(ZymValue value);
@@ -284,12 +271,6 @@ const char* zym_enumGetVariant(ZymVM* vm, ZymValue enumVal);     // Returns vari
 bool zym_enumEquals(ZymValue a, ZymValue b);                     // Safe comparison
 int zym_enumVariantIndex(ZymVM* vm, ZymValue enumVal);           // 0-based variant index
 
-// =============================================================================
-// REFERENCE OPERATIONS
-// =============================================================================
-
-ZymValue zym_deref(ZymVM* vm, ZymValue val);
-bool zym_refSet(ZymVM* vm, ZymValue refVal, ZymValue newVal);
 
 // =============================================================================
 // CALLING SCRIPT FUNCTIONS FROM C
