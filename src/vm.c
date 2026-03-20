@@ -665,7 +665,6 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(POST_INC),
         JUMP_ENTRY(PRE_DEC),
         JUMP_ENTRY(POST_DEC),
-        JUMP_ENTRY(TYPEOF),
     };
 #undef JUMP_ENTRY
 
@@ -3735,91 +3734,6 @@ static InterpretResult run(VM* vm) {
         double old_value = AS_DOUBLE(val_b);
         vm->stack[b] = DOUBLE_VAL(old_value - 1.0);
         vm->stack[a] = DOUBLE_VAL(old_value);
-
-        DISPATCH();
-    }
-
-    OP(TYPEOF) {
-        uint32_t instr = vm->ip[-1];
-        int a = CUR_BASE() + REG_A(instr);
-        int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
-
-        // Do NOT dereference - we want to check if it's a reference itself
-        // This allows typeof to distinguish between a reference and the value it points to
-        const char* type_name = NULL;
-        if (IS_DOUBLE(val_b)) {
-            type_name = "number";
-        } else if (IS_BOOL(val_b)) {
-            type_name = "boolean";
-        } else if (IS_NULL(val_b)) {
-            type_name = "null";
-        } else if (IS_ENUM(val_b)) {
-            type_name = "enum";
-        } else if (IS_OBJ(val_b)) {
-            Obj* obj = AS_OBJ(val_b);
-            switch (obj->type) {
-                case OBJ_STRING:
-                    type_name = "string";
-                    break;
-                case OBJ_FUNCTION:
-                case OBJ_CLOSURE:
-                case OBJ_DISPATCHER:
-                    type_name = "function";
-                    break;
-                case OBJ_NATIVE_FUNCTION:
-                    type_name = "native_function";
-                    break;
-                case OBJ_NATIVE_CLOSURE:
-                    type_name = "native_closure";
-                    break;
-                case OBJ_LIST:
-                    type_name = "list";
-                    break;
-                case OBJ_MAP:
-                    type_name = "map";
-                    break;
-                case OBJ_REFERENCE:
-                    type_name = "reference";
-                    break;
-                case OBJ_NATIVE_REFERENCE:
-                    type_name = "native_reference";
-                    break;
-                case OBJ_NATIVE_CONTEXT:
-                    type_name = "native_context";
-                    break;
-                case OBJ_STRUCT_SCHEMA:
-                    type_name = "struct_schema";
-                    break;
-                case OBJ_STRUCT_INSTANCE:
-                    type_name = "struct";
-                    break;
-                case OBJ_ENUM_SCHEMA:
-                    type_name = "enum_schema";
-                    break;
-                case OBJ_UPVALUE:
-                    type_name = "upvalue";
-                    break;
-                case OBJ_INT64:
-                    type_name = "number";
-                    break;
-                case OBJ_PROMPT_TAG:
-                    type_name = "prompt_tag";
-                    break;
-                case OBJ_CONTINUATION:
-                    type_name = "continuation";
-                    break;
-                default:
-                    type_name = "unknown";
-                    break;
-            }
-        } else {
-            type_name = "unknown";
-        }
-
-        // Create a string object with the type name
-        ObjString* type_string = copyString(vm, type_name, strlen(type_name));
-        vm->stack[a] = OBJ_VAL(type_string);
 
         DISPATCH();
     }

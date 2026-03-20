@@ -157,21 +157,6 @@ typedef enum {
     NEW_DISPATCHER,
     ADD_OVERLOAD,
 
-    // Reference and Value Opcodes
-    CLONE_VALUE,
-    DEEP_CLONE_VALUE,
-    MAKE_REF,         // Ra = new reference to stack[Rb] (flattens if Rb is a ref)
-    SLOT_MAKE_REF,    // Ra = new reference to stack[Rb] (NO flattening - for slot parameters)
-    MAKE_GLOBAL_REF,  // Ra = new reference to global[Bx] (flattens if global is a ref)
-    SLOT_MAKE_GLOBAL_REF, // Ra = new reference to global[Bx] (NO flattening - for slot parameters)
-    MAKE_UPVALUE_REF, // Ra = new reference to upvalue[Bx] (creates REF_UPVALUE)
-    MAKE_INDEX_REF,   // Ra = new reference to array[Rb][Rc] (flattens if element is a ref)
-    SLOT_MAKE_INDEX_REF, // Ra = new reference to array[Rb][Rc] (NO flattening - for slot parameters)
-    MAKE_PROPERTY_REF,// Ra = new reference to map[Rb].key[Rc] (flattens if property is a ref)
-    SLOT_MAKE_PROPERTY_REF, // Ra = new reference to map[Rb].key[Rc] (NO flattening - for slot parameters)
-    DEREF_GET,        // Ra = dereference stack[Rb] (read through reference)
-    DEREF_SET,        // dereference stack[Ra] and write stack[Rb] to it
-    SLOT_DEREF_SET,   // dereference stack[Ra] ONE LEVEL and replace with stack[Rb] (no ref chain following)
 
     // Struct Opcodes
     NEW_STRUCT,            // Ra = new struct instance, Bx = schema constant index
@@ -185,8 +170,5 @@ typedef enum {
     POST_INC,      // Ra = stack[Rb]++ (return old value then increment)
     PRE_DEC,       // Ra = --stack[Rb] (decrement then return new value)
     POST_DEC,      // Ra = stack[Rb]-- (return old value then decrement)
-
-    // Type Introspection
-    TYPEOF,        // Ra = typeof(stack[Rb]) (returns type as string)
 
 } OpCode;

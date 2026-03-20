@@ -370,8 +370,6 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case SLOT_SET_MAP_PROPERTY: return reg_instruction_abc("SLOT_SET_MAP_PROPERTY", instruction, offset);
         case NEW_DISPATCHER: return reg_instruction_a("NEW_DISPATCHER", instruction, offset);
         case ADD_OVERLOAD:   return reg2_instruction("ADD_OVERLOAD", chunk, offset);
-        case CLONE_VALUE:    return reg_instruction_ab("CLONE_VALUE", instruction, offset);
-        case DEEP_CLONE_VALUE: return reg_instruction_ab("DEEP_CLONE_VALUE", instruction, offset);
         case NEW_STRUCT: return constantInstruction("NEW_STRUCT", chunk, instruction, offset);
         case STRUCT_SPREAD: return reg2_instruction("STRUCT_SPREAD", chunk, offset);
         case GET_STRUCT_FIELD: return reg_instruction_abc("GET_STRUCT_FIELD", instruction, offset);
@@ -381,19 +379,6 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case POST_INC: return reg_instruction_ab("POST_INC", instruction, offset);
         case PRE_DEC: return reg_instruction_ab("PRE_DEC", instruction, offset);
         case POST_DEC: return reg_instruction_ab("POST_DEC", instruction, offset);
-        case MAKE_REF:       return reg_instruction_ab("MAKE_REF", instruction, offset);
-        case SLOT_MAKE_REF:  return reg_instruction_ab("SLOT_MAKE_REF", instruction, offset);
-        case MAKE_GLOBAL_REF: return constantInstruction("MAKE_GLOBAL_REF", chunk, instruction, offset);
-        case SLOT_MAKE_GLOBAL_REF: return constantInstruction("SLOT_MAKE_GLOBAL_REF", chunk, instruction, offset);
-        case MAKE_UPVALUE_REF: return upvalueInstruction("MAKE_UPVALUE_REF", instruction, offset);
-        case MAKE_INDEX_REF: return reg_instruction_abc("MAKE_INDEX_REF", instruction, offset);
-        case SLOT_MAKE_INDEX_REF: return reg_instruction_abc("SLOT_MAKE_INDEX_REF", instruction, offset);
-        case MAKE_PROPERTY_REF: return reg_instruction_abc("MAKE_PROPERTY_REF", instruction, offset);
-        case SLOT_MAKE_PROPERTY_REF: return reg_instruction_abc("SLOT_MAKE_PROPERTY_REF", instruction, offset);
-        case DEREF_GET:      return reg_instruction_ab("DEREF_GET", instruction, offset);
-        case DEREF_SET:      return reg_instruction_ab("DEREF_SET", instruction, offset);
-        case SLOT_DEREF_SET: return reg_instruction_ab("SLOT_DEREF_SET", instruction, offset);
-        case TYPEOF:         return reg_instruction_ab("TYPEOF", instruction, offset);
         case RET: {
             uint32_t instr = instruction;
             uint8_t  a  = REG_A(instr);
