@@ -267,22 +267,19 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
 
     char func_name[256];
     int arity;
-    uint8_t* qualifiers = NULL;
 
-    if (!parseNativeSignature(&vm->allocator, signature, func_name, &arity, &qualifiers)) {
+    if (!parseNativeSignature(signature, func_name, &arity)) {
         return NULL_VAL;
     }
 
     if (arity > MAX_NATIVE_ARITY) {
         fprintf(stderr, "Native closure '%s' has too many parameters (max %d)\n", func_name, MAX_NATIVE_ARITY);
-        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return NULL_VAL;
     }
 
     NativeDispatcher dispatcher = getNativeClosureDispatcher(arity);
     if (!dispatcher) {
         fprintf(stderr, "No closure dispatcher available for arity %d\n", arity);
-        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return NULL_VAL;
     }
 
@@ -292,10 +289,6 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
     ObjNativeClosure* closure = newNativeClosure(vm, name_obj, arity, func_ptr, dispatcher, context);
     popTempRoot(vm);
     popTempRoot(vm);
-
-    if (qualifiers) {
-        ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
-    }
 
     return OBJ_VAL(closure);
 }
