@@ -244,35 +244,6 @@ static int is_local_reg(Compiler* c, int r) {
     return get_local_by_reg(c, r) != NULL;
 }
 
-/*
-static bool is_local_reference(Compiler* c, int reg) {
-    Local* local = get_local_by_reg(c, reg);
-    return local != NULL && local->is_reference;
-}
-*/
-
-static bool is_local_ref_param(Compiler* c, int reg) {
-    Local* local = get_local_by_reg(c, reg);
-    return local != NULL && local->is_ref_param;
-}
-
-static bool is_local_slot_param(Compiler* c, int reg) {
-    Local* local = get_local_by_reg(c, reg);
-    return local != NULL && local->is_slot_param;
-}
-
-static bool is_local_ref_or_slot_param(Compiler* c, int reg) {
-    Local* local = get_local_by_reg(c, reg);
-    return local != NULL && (local->is_ref_param || local->is_slot_param);
-}
-
-static bool is_local_holding_reference(Compiler* c, int reg) {
-    Local* local = get_local_by_reg(c, reg);
-    return local != NULL && local->is_reference;
-}
-
-
-
 static int alloc_temp(Compiler* c) {
     if (c->next_register < c->local_count) {
         c->next_register = c->local_count;
@@ -502,21 +473,7 @@ static void end_scope(Compiler* c) {
     }
 }
 
-static int resolve_ref_target(Compiler* compiler, int reg) {
-    for (int i = 0; i < compiler->local_count; i++) {
-        if (compiler->locals[i].reg == reg && compiler->locals[i].is_reference) {
-            int target = compiler->locals[i].ref_target_reg;
-            if (target >= 0) {
-                return resolve_ref_target(compiler, target);
-            } else {
-                return reg;
-            }
-        }
-    }
-    return reg;
-}
-
-static int resolve_ref_target_name(Compiler* compiler, Token* name) {
+static int resolve_hoisted_name(Compiler* compiler, Token* name) {
     int ar = single_hoisted_arity(compiler, name);
     if (ar >= 0) {
         char* mangled = mangle_name(compiler, name, ar);
@@ -635,12 +592,7 @@ static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
     local->depth = compiler->scope_depth;
     local->reg = reg;
     local->is_initialized = true;
-    local->is_reference = false;
-    local->is_ref_param = false;
-    local->is_slot_param = false;
     local->is_captured = false;
-    local->deref_cache_reg = -1;
-    local->ref_target_reg = -1;
     local->struct_type = NULL;
 }
 
@@ -654,12 +606,7 @@ static int add_local(Compiler* compiler, Token name) {
     local->depth = compiler->scope_depth;
     local->reg = compiler->next_register;
     local->is_initialized = false;
-    local->is_reference = false;
-    local->is_ref_param = false;
-    local->is_slot_param = false;
     local->is_captured = false;
-    local->deref_cache_reg = -1;
-    local->ref_target_reg = -1;
     local->struct_type = NULL;
     return reserve_register(compiler);
 }
@@ -746,17 +693,7 @@ static int compile_sub_expression_to(Compiler* c, Expr* e, int preferred_target)
     if (e->type == EXPR_VARIABLE) {
         int reg = resolve_local(c, &e->as.variable.name);
         if (reg != -1) {
-            bool is_ref = false;
-            for (int i = 0; i < c->local_count; i++) {
-                if (c->locals[i].reg == reg && c->locals[i].is_reference) {
-                    is_ref = true;
-                    break;
-                }
-            }
-
-            if (!is_ref) {
-                return reg;
-            }
+            return reg;
         }
     }
 
@@ -918,194 +855,8 @@ static void scoped_string_free(ScopedString* s) {
     }
 }
 
-static void emit_variable_reference_typed(Compiler* compiler, Token* var_name, int target_reg, int line, RefCreationMode ref_mode) {
-    int var_reg = resolve_local(compiler, var_name);
-
-    if (var_reg == -1) {
-        int arity = single_local_hoisted_arity(compiler, var_name);
-        if (arity >= 0) {
-            var_reg = resolve_mangled_local_by_base(compiler, var_name);
-        } else if (arity == -2) {
-            compiler_error_and_exit(line, "Cannot create reference to overloaded function '%.*s'. Store the function in a variable first, then create a reference to that variable.", var_name->length, var_name->start);
-        }
-    }
-
-    if (var_reg != -1) {
-        if (ref_mode == REF_MODE_NORMAL) {
-            int ultimate_target = resolve_ref_target(compiler, var_reg);
-            emit_instruction(compiler, PACK_ABC(MAKE_REF, target_reg, ultimate_target, 0), line);
-        } else {
-            emit_instruction(compiler, PACK_ABC(SLOT_MAKE_REF, target_reg, var_reg, 0), line);
-        }
-    } else if ((var_reg = resolve_upvalue(compiler, var_name)) != -1) {
-        emit_instruction(compiler, PACK_ABx(MAKE_UPVALUE_REF, target_reg, var_reg), line);
-    } else {
-        int arity = single_hoisted_arity(compiler, var_name);
-        if (arity == -2) {
-            compiler_error_and_exit(line, "Cannot create reference to overloaded function '%.*s'. Store the function in a variable first, then create a reference to that variable.",
-                    var_name->length, var_name->start);
-        }
-        int name_const = resolve_ref_target_name(compiler, var_name);
-        OpCode opcode = (ref_mode == REF_MODE_NORMAL) ? MAKE_GLOBAL_REF : SLOT_MAKE_GLOBAL_REF;
-        emit_instruction(compiler, PACK_ABx(opcode, target_reg, name_const), line);
-    }
-}
-
-static void emit_variable_reference(Compiler* compiler, Token* var_name, int target_reg, int line) {
-    emit_variable_reference_typed(compiler, var_name, target_reg, line, REF_MODE_NORMAL);
-}
-
-static void emit_subscript_reference_typed(Compiler* compiler, SubscriptExpr* sub_expr, int target_reg, int line, RefCreationMode ref_mode) {
-    int container_reg = alloc_temp(compiler);
-    int index_reg = alloc_temp(compiler);
-
-    COMPILE_REQUIRED(compiler, sub_expr->object, container_reg);
-    COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
-
-    OpCode opcode = (ref_mode == REF_MODE_NORMAL) ? MAKE_INDEX_REF : SLOT_MAKE_INDEX_REF;
-    emit_instruction(compiler, PACK_ABC(opcode, target_reg, container_reg, index_reg), line);
-}
-
-static void emit_subscript_reference(Compiler* compiler, SubscriptExpr* sub_expr, int target_reg, int line) {
-    emit_subscript_reference_typed(compiler, sub_expr, target_reg, line, REF_MODE_NORMAL);
-}
-
-static void emit_property_reference_typed(Compiler* compiler, GetExpr* get_expr, int target_reg, int line, RefCreationMode ref_mode) {
-    int container_reg = alloc_temp(compiler);
-    int key_reg = alloc_temp(compiler);
-
-    COMPILE_REQUIRED(compiler, get_expr->object, container_reg);
-
-    int key_const = identifier_constant(compiler, &get_expr->name);
-    emit_load_const(compiler, key_reg, key_const, line);
-
-    OpCode opcode = (ref_mode == REF_MODE_NORMAL) ? MAKE_PROPERTY_REF : SLOT_MAKE_PROPERTY_REF;
-    emit_instruction(compiler, PACK_ABC(opcode, target_reg, container_reg, key_reg), line);
-}
-
-static void emit_property_reference(Compiler* compiler, GetExpr* get_expr, int target_reg, int line) {
-    emit_property_reference_typed(compiler, get_expr, target_reg, line, REF_MODE_NORMAL);
-}
-
-static void emit_reference_from_expr(Compiler* compiler, Expr* initializer, int target_reg, int line) {
-    if (initializer->type == EXPR_VARIABLE) {
-        emit_variable_reference(compiler, &initializer->as.variable.name, target_reg, line);
-    } else if (initializer->type == EXPR_SUBSCRIPT) {
-        emit_subscript_reference(compiler, &initializer->as.subscript, target_reg, line);
-    } else if (initializer->type == EXPR_GET) {
-        emit_property_reference(compiler, &initializer->as.get, target_reg, line);
-    } else {
-        const char* error_msg;
-        if (initializer->type == EXPR_LITERAL) {
-            error_msg = "Cannot create reference to literal value (number, string, boolean, null). References must point to variables, array elements, or map properties.";
-        } else if (initializer->type == EXPR_CALL) {
-            error_msg = "Cannot create reference directly to function call result. Assign the result to a variable first, then create a reference to that variable.";
-        } else if (initializer->type == EXPR_BINARY || initializer->type == EXPR_UNARY) {
-            error_msg = "Cannot create reference to expression result. Assign the expression to a variable first, then create a reference to that variable.";
-        } else if (initializer->type == EXPR_LIST || initializer->type == EXPR_MAP) {
-            error_msg = "Cannot create reference to inline list or map literal. Assign the literal to a variable first, then create a reference to that variable.";
-        } else {
-            error_msg = "Invalid reference target. References can only point to variables, array elements (array[index]), or map properties (map.property).";
-        }
-        compiler_error_and_exit(line, "%s", error_msg);
-    }
-}
-
-
-static void compile_ref_param_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
-    if (arg->type == EXPR_VARIABLE) {
-        Token* var_name = &arg->as.variable.name;
-        int var_reg = resolve_local(compiler, var_name);
-
-        if (var_reg != -1) {
-            if (is_local_ref_param(compiler, var_reg)) {
-                emit_move(compiler, arg_slot, var_reg, line);
-            } else {
-                emit_instruction(compiler, PACK_ABC(MAKE_REF, arg_slot, var_reg, 0), line);
-            }
-        } else if ((var_reg = resolve_upvalue(compiler, var_name)) != -1) {
-            emit_instruction(compiler, PACK_ABx(MAKE_UPVALUE_REF, arg_slot, var_reg), line);
-        } else {
-            int name_const = identifier_constant(compiler, var_name);
-            emit_instruction(compiler, PACK_ABx(MAKE_GLOBAL_REF, arg_slot, name_const), line);
-        }
-    } else if (arg->type == EXPR_SUBSCRIPT) {
-        emit_subscript_reference(compiler, &arg->as.subscript, arg_slot, line);
-    } else if (arg->type == EXPR_GET) {
-        emit_property_reference(compiler, &arg->as.get, arg_slot, line);
-    } else {
-        COMPILE_REQUIRED(compiler, arg, arg_slot);
-        int temp_ref = alloc_temp(compiler);
-        emit_instruction(compiler, PACK_ABC(MAKE_REF, temp_ref, arg_slot, 0), line);
-        emit_move(compiler, arg_slot, temp_ref, line);
-    }
-}
-
-static void compile_slot_param_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
-    if (arg->type == EXPR_VARIABLE) {
-        Token* var_name = &arg->as.variable.name;
-        int var_reg = resolve_local(compiler, var_name);
-
-        if (var_reg != -1 && (is_local_ref_or_slot_param(compiler, var_reg) || is_local_holding_reference(compiler, var_reg))) {
-            emit_move(compiler, arg_slot, var_reg, line);
-        } else {
-            emit_variable_reference_typed(compiler, var_name, arg_slot, line, REF_MODE_SLOT);
-        }
-    } else if (arg->type == EXPR_SUBSCRIPT) {
-        emit_subscript_reference_typed(compiler, &arg->as.subscript, arg_slot, line, REF_MODE_SLOT);
-    } else if (arg->type == EXPR_GET) {
-        emit_property_reference_typed(compiler, &arg->as.get, arg_slot, line, REF_MODE_SLOT);
-    } else {
-        COMPILE_REQUIRED(compiler, arg, arg_slot);
-        int temp_ref = alloc_temp(compiler);
-        emit_instruction(compiler, PACK_ABC(MAKE_REF, temp_ref, arg_slot, 0), line);
-        emit_move(compiler, arg_slot, temp_ref, line);
-    }
-}
-
 static void compile_dynamic_call_argument(Compiler* compiler, Expr* arg, int arg_slot, int line) {
-    if (arg->type == EXPR_VARIABLE) {
-        Token* var_name = &arg->as.variable.name;
-        int var_reg = resolve_local(compiler, var_name);
-
-        if (var_reg != -1) {
-            if (is_local_ref_or_slot_param(compiler, var_reg)) {
-                // Already a ref/slot parameter - pass directly
-                emit_move(compiler, arg_slot, var_reg, line);
-            } else {
-                // Local variable - use non-flattening ref
-                emit_instruction(compiler, PACK_ABC(SLOT_MAKE_REF, arg_slot, var_reg, 0), line);
-            }
-        } else if ((var_reg = resolve_upvalue(compiler, var_name)) != -1) {
-            // Upvalue - load it first
-            emit_get_upvalue(compiler, arg_slot, var_reg, line);
-        } else {
-            // Global variable - use non-flattening ref
-            int name_const = resolve_ref_target_name(compiler, var_name);
-            emit_instruction(compiler, PACK_ABx(SLOT_MAKE_GLOBAL_REF, arg_slot, name_const), line);
-        }
-    } else if (arg->type == EXPR_GET) {
-        // Check if this is an enum value (EnumName.VARIANT) before treating it as property access
-        GetExpr* get_expr = &arg->as.get;
-        if (get_expr->object->type == EXPR_VARIABLE) {
-            Token* enum_name = &get_expr->object->as.variable.name;
-            ObjEnumSchema* enum_schema = get_enum_schema(compiler, enum_name);
-
-            if (enum_schema) {
-                // This is an enum value - just compile it as an expression
-                COMPILE_REQUIRED(compiler, arg, arg_slot);
-                return;
-            }
-        }
-
-        // Not an enum - treat as property reference
-        emit_property_reference_typed(compiler, &arg->as.get, arg_slot, line, REF_MODE_SLOT);
-    } else if (arg->type == EXPR_SUBSCRIPT) {
-        emit_subscript_reference_typed(compiler, &arg->as.subscript, arg_slot, line, REF_MODE_SLOT);
-    } else {
-        // Complex expression - evaluate normally
-        COMPILE_REQUIRED(compiler, arg, arg_slot);
-    }
+    COMPILE_REQUIRED(compiler, arg, arg_slot);
 }
 
 static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_count) {
@@ -1294,9 +1045,8 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
         if (arg->type == EXPR_VARIABLE) {
             Token* var_name = &arg->as.variable.name;
             int var_reg = resolve_local(compiler, var_name);
-
-            if (var_reg != -1 && (is_local_ref_param(compiler, var_reg) || is_local_slot_param(compiler, var_reg) || is_local_holding_reference(compiler, var_reg))) {
-                // Pass ref/slot parameter or reference-holding variable directly without dereferencing
+            if (var_reg != -1) {
+                // Pass directly
                 emit_move(compiler, temp_regs[i], var_reg, arg->line);
             } else {
                 compile_expression(compiler, arg, temp_regs[i]);
@@ -1498,40 +1248,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             Token name = expr->as.variable.name;
             int reg = resolve_local(compiler, &name);
             if (reg != -1) {
-                // Check if this is a ref or slot parameter (which should auto-dereference on read)
-                // Both ref and slot parameters dereference ONE level on read
-                bool should_deref = false;
-                for (int i = 0; i < compiler->local_count; i++) {
-                    if (compiler->locals[i].reg == reg &&
-                        (compiler->locals[i].is_ref_param || compiler->locals[i].is_slot_param)) {
-                        should_deref = true;
-                        break;
-                    }
-                }
-
-                if (should_deref) {
-                    // Check if this ref param has a cached deref register
-                    int cache_reg = -1;
-                    for (int i = 0; i < compiler->local_count; i++) {
-                        if (compiler->locals[i].reg == reg && compiler->locals[i].deref_cache_reg >= 0) {
-                            cache_reg = compiler->locals[i].deref_cache_reg;
-                            break;
-                        }
-                    }
-                    if (cache_reg >= 0) {
-                        // Use cached dereferenced value instead of emitting DEREF_GET
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, cache_reg, expr->line);
-                    } else {
-                        // Ref or slot parameter: dereference ONE level to get the aliased value
-                        emit_instruction(compiler, PACK_ABC(DEREF_GET, target_reg, reg, 0), expr->line);
-                    }
-                } else if (reg == target_reg) {
-                    // Already in target register - no move needed!
-                    // This is a common case and eliminates unnecessary MOVE dispatches
-                } else {
-                    // Regular variable or ref object: just move (refs are first-class values)
-                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
-                }
+                EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
                 break;
             }
 
@@ -1613,32 +1330,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 if (target_var_reg != -1) {
                     // Local variable compound assignment: target = target op value
-                    // Check if this is a ref or slot parameter
-                    bool is_ref_or_slot = false;
-                    for (int i = 0; i < compiler->local_count; i++) {
-                        if (compiler->locals[i].reg == target_var_reg &&
-                            (compiler->locals[i].is_ref_param || compiler->locals[i].is_slot_param)) {
-                            is_ref_or_slot = true;
-                            break;
-                        }
-                    }
-
-                    if (is_ref_or_slot) {
-                        // Ref/slot parameter: need to deref, compute, then write through
-                        int temp_reg = alloc_temp(compiler);
-                        emit_instruction(compiler, PACK_ABC(DEREF_GET, temp_reg, target_var_reg, 0), expr->line);
-                        int value_reg = alloc_temp(compiler);
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
-                        emit_instruction(compiler, PACK_ABC(binary_op, temp_reg, temp_reg, value_reg), expr->line);
-                        emit_instruction(compiler, PACK_ABC(DEREF_SET, target_var_reg, temp_reg, 0), expr->line);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, temp_reg, expr->line);
-                    } else {
-                        // Normal variable: direct operation
-                        int value_reg = alloc_temp(compiler);
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
-                        emit_instruction(compiler, PACK_ABC(binary_op, target_var_reg, target_var_reg, value_reg), expr->line);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, target_var_reg, expr->line);
-                    }
+                    int value_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
+                    emit_instruction(compiler, PACK_ABC(binary_op, target_var_reg, target_var_reg, value_reg), expr->line);
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, target_var_reg, expr->line);
                 } else if ((target_var_reg = resolve_upvalue(compiler, &name)) != -1) {
                     // Upvalue compound assignment - need to load, modify, store
                     int temp_reg = alloc_temp(compiler);
@@ -1669,8 +1364,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 bool use_imm = false;
                 int imm_val = 0;
-                if (!expr->as.assign.has_slot_modifier &&
-                    sub_expr->index->type == EXPR_LITERAL &&
+                if (sub_expr->index->type == EXPR_LITERAL &&
                     sub_expr->index->as.literal.literal.type == TOKEN_NUMBER) {
                     double val = parse_number_literal(sub_expr->index->as.literal.literal.start,
                                                       sub_expr->index->as.literal.literal.length);
@@ -1693,8 +1387,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
                     value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                    OpCode set_opcode = expr->as.assign.has_slot_modifier ? SLOT_SET_SUBSCRIPT : SET_SUBSCRIPT;
-                    emit_instruction(compiler, PACK_ABC(set_opcode, list_reg, index_reg, value_reg), expr->line);
+                    emit_instruction(compiler, PACK_ABC(SET_SUBSCRIPT, list_reg, index_reg, value_reg), expr->line);
                 }
 
                 EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
@@ -1708,68 +1401,21 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int reg = resolve_local(compiler, &name);
 
                 if (reg != -1) {
-                    // Check if this is a reference and/or slot parameter
-                    bool is_ref = false;
-                    bool is_slot = false;
-                    for (int i = 0; i < compiler->local_count; i++) {
-                        if (compiler->locals[i].reg == reg) {
-                            if (compiler->locals[i].is_reference) {
-                                is_ref = true;
-                            }
-                            if (compiler->locals[i].is_slot_param) {
-                                is_slot = true;
-                            }
-                            break;
-                        }
-                    }
-
-                    // Slot parameters: ALWAYS use SLOT_DEREF_SET to write to the aliased variable
-                    // SLOT_DEREF_SET will recursively write through if the target contains a reference
-                    // Regular refs with slot modifier: rebind instead of write through
-                    // Regular refs without slot modifier: write through (DEREF_SET) following entire ref chain
-                    if (is_slot && expr->as.assign.has_slot_modifier) {
-                        // Slot parameter WITH 'slot' keyword: always rebind (never write through nested refs)
-                        // This is the explicit rebinding case: slot r = value
-                        int value_reg = alloc_temp(compiler);
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                        emit_instruction(compiler, PACK_ABC(SLOT_DEREF_SET, reg, value_reg, 0), expr->line);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
-                    } else if (is_slot && !expr->as.assign.has_slot_modifier) {
-                        // Slot parameter WITHOUT 'slot' keyword: write through (including nested refs)
-                        // This is the implicit write-through case: r = value
-                        int value_reg = alloc_temp(compiler);
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                        emit_instruction(compiler, PACK_ABC(DEREF_SET, reg, value_reg, 0), expr->line);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
-                    } else if (is_ref && !expr->as.assign.has_slot_modifier) {
-                        // Regular ref without slot modifier: write through the entire reference chain
-                        int value_reg = alloc_temp(compiler);
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                        emit_instruction(compiler, PACK_ABC(DEREF_SET, reg, value_reg, 0), expr->line);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
-                    } else {
-                        // Normal variable or ref with slot modifier: compile value directly into its register
-                        // This rebinds the variable to the new value (no dereferencing)
-                        COMPILE_REQUIRED(compiler, expr->as.assign.value, reg);
-                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
-                    }
+                    // Normal variable: compile value directly into its register
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value, reg);
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, &name)) != -1) {
                     // Assign to an upvalue.
-                    // Use SLOT_SET_UPVALUE if 'slot' modifier is present (explicit rebinding)
-                    // Use SET_UPVALUE otherwise (write through, including nested refs)
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                    OpCode set_op = expr->as.assign.has_slot_modifier ? SLOT_SET_UPVALUE : SET_UPVALUE;
-                    emit_instruction(compiler, PACK_ABx(set_op, value_reg, reg), expr->line);
+                    emit_set_upvalue(compiler, value_reg, reg, expr->line);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
                 } else {
                     // Assign to a global.
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
                     int name_const = identifier_constant(compiler, &name);
-                    // Use SLOT_SET_GLOBAL if has_slot_modifier is true to bypass reference dereferencing
-                    OpCode set_opcode = expr->as.assign.has_slot_modifier ? SLOT_SET_GLOBAL : SET_GLOBAL;
-                    emit_instruction(compiler, PACK_ABx(set_opcode, value_reg, name_const), expr->line);
+                    emit_set_global(compiler, value_reg, name_const, expr->line);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
                 }
             }
@@ -2017,40 +1663,6 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
         case EXPR_UNARY: {
             int saved_top = save_temp_top(compiler);
 
-            if (expr->as.unary.operator.type == TOKEN_REF) {
-                // Handle ref as unary expression
-                // Validate that ref is followed by a valid target (not a literal or other invalid expression)
-                if (expr->as.unary.right->type == EXPR_VARIABLE) {
-                    emit_variable_reference(compiler, &expr->as.unary.right->as.variable.name, target_reg, expr->line);
-                } else if (expr->as.unary.right->type == EXPR_SUBSCRIPT) {
-                    emit_subscript_reference(compiler, &expr->as.unary.right->as.subscript, target_reg, expr->line);
-                } else if (expr->as.unary.right->type == EXPR_GET) {
-                    emit_property_reference(compiler, &expr->as.unary.right->as.get, target_reg, expr->line);
-                } else {
-                    // Provide specific error messages for common mistakes
-                    const char* error_msg;
-                    if (expr->as.unary.right->type == EXPR_LITERAL) {
-                        error_msg = "'ref' cannot be applied to literal values (numbers, strings, booleans, null). Use 'ref' with variables, array elements, or map properties only.";
-                    } else if (expr->as.unary.right->type == EXPR_CALL) {
-                        error_msg = "'ref' cannot be applied directly to function call results. Assign the result to a variable first, then create a reference to that variable.";
-                    } else if (expr->as.unary.right->type == EXPR_BINARY || expr->as.unary.right->type == EXPR_UNARY) {
-                        error_msg = "'ref' cannot be applied to expressions. Assign the expression result to a variable first, then create a reference to that variable.";
-                    } else {
-                        error_msg = "'ref' can only be applied to variables, array elements, or map properties.";
-                    }
-                    compiler_error_and_exit(expr->line, "%s", error_msg);
-                }
-                restore_temp_top_preserve(compiler, saved_top, target_reg);
-                break;
-            } else if (expr->as.unary.operator.type == TOKEN_VAL) {
-                // Handle val as unary expression - deep clone
-                // Use compile_sub_expression to avoid MOVE when operand is a local variable.
-                int right_reg = compile_sub_expression(compiler, expr->as.unary.right);
-                emit_instruction(compiler, PACK_ABC(CLONE_VALUE, target_reg, right_reg, 0), expr->line);
-                restore_temp_top_preserve(compiler, saved_top, target_reg);
-                break;
-            }
-
             // Regular unary operators (-, !, ~)
             // Use compile_sub_expression to avoid MOVE when operand is a local variable.
             int right_reg = compile_sub_expression(compiler, expr->as.unary.right);
@@ -2226,116 +1838,11 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 }
             }
 
-            // Get param_qualifiers for this function (if available from hoisting)
-            uint8_t* param_qualifiers = NULL;
-            bool is_direct_hoisted_call = false;
-            if (callee->type == EXPR_VARIABLE) {
-                Token* name = &callee->as.variable.name;
-
-                // Check local hoisted functions
-                for (int j = 0; j < compiler->local_hoisted_count; j++) {
-                    if (tokens_equal(&compiler->local_hoisted[j].name, name) &&
-                        compiler->local_hoisted[j].arity == arg_count) {
-                        param_qualifiers = compiler->local_hoisted[j].param_qualifiers;
-                        is_direct_hoisted_call = true;
-                        break;
-                    }
-                }
-
-                // Check global hoisted functions if not found locally
-                if (param_qualifiers == NULL) {
-                    for (int j = 0; j < compiler->hoisted_count; j++) {
-                        if (tokens_equal(&compiler->hoisted[j].name, name) &&
-                            compiler->hoisted[j].arity == arg_count) {
-                            param_qualifiers = compiler->hoisted[j].param_qualifiers;
-                            is_direct_hoisted_call = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Check enclosing scopes
-                if (param_qualifiers == NULL && compiler->enclosing) {
-                    Compiler* enc = compiler->enclosing;
-                    while (enc) {
-                        for (int j = 0; j < enc->hoisted_count; j++) {
-                            if (tokens_equal(&enc->hoisted[j].name, name) &&
-                                enc->hoisted[j].arity == arg_count) {
-                                param_qualifiers = enc->hoisted[j].param_qualifiers;
-                                is_direct_hoisted_call = true;
-                                break;
-                            }
-                        }
-                        if (param_qualifiers) break;
-                        enc = enc->enclosing;
-                    }
-                }
-
-                // Check if it's a native function
-                if (param_qualifiers == NULL) {
-                    char* mangled = mangle_name(compiler, name, arg_count);
-                    ObjString* mangled_str = copyString(compiler->vm, mangled, (int)strlen(mangled));
-                    pushTempRoot(compiler->vm, (Obj*)mangled_str);
-                    Value func_val;
-                    if (tableGet(&compiler->vm->globals, mangled_str, &func_val) && IS_NATIVE_FUNCTION(func_val)) {
-                        ObjNativeFunction* native = AS_NATIVE_FUNCTION(func_val);
-                        param_qualifiers = native->param_qualifiers;
-                        is_direct_hoisted_call = true;
-                    }
-                    popTempRoot(compiler->vm);
-                    FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
-                }
-            }
-
-            // For dynamic calls (non-hoisted), we can't know param_qualifiers at compile time.
-            // As a workaround: for variable arguments in dynamic calls, pass them as-is.
-            // The VM will try to create references, but it has limitations.
-            bool needs_runtime_handling = !is_direct_hoisted_call;
-
-            // Compile arguments with ref/val handling
+            // Compile arguments - simple pass-by-value
             for (int i = 0; i < arg_count; i++) {
                 Expr* arg = expr->as.call.args[i];
                 int arg_slot = call_base + 1 + i;
-                ParamQualifier qualifier = param_qualifiers ? (ParamQualifier)param_qualifiers[i] : PARAM_NORMAL;
-
-                if (needs_runtime_handling) {
-                    compile_dynamic_call_argument(compiler, arg, arg_slot, arg->line);
-                } else if (qualifier == PARAM_REF) {
-                    compile_ref_param_argument(compiler, arg, arg_slot, arg->line);
-                } else if (qualifier == PARAM_VAL) {
-                    // For val parameters: evaluate and clone
-                    COMPILE_REQUIRED(compiler, arg, arg_slot);
-                    int temp_clone = alloc_temp(compiler);
-                    emit_instruction(compiler, PACK_ABC(CLONE_VALUE, temp_clone, arg_slot, 0), arg->line);
-                    emit_move(compiler, arg_slot, temp_clone, arg->line);
-                } else if (qualifier == PARAM_CLONE) {
-                    // For clone parameters: evaluate and deep clone
-                    COMPILE_REQUIRED(compiler, arg, arg_slot);
-                    int temp_clone = alloc_temp(compiler);
-                    emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, temp_clone, arg_slot, 0), arg->line);
-                    emit_move(compiler, arg_slot, temp_clone, arg->line);
-                } else if (qualifier == PARAM_SLOT) {
-                    compile_slot_param_argument(compiler, arg, arg_slot, arg->line);
-                } else {
-                    // Normal parameter: compile as usual
-                    // But check if the argument is a ref parameter variable
-                    if (arg->type == EXPR_VARIABLE) {
-                        Token* var_name = &arg->as.variable.name;
-                        int var_reg = resolve_local(compiler, var_name);
-
-                        if (var_reg != -1 && is_local_ref_param(compiler, var_reg)) {
-                            // Ref parameter passed to normal parameter - pass the reference as-is
-                            // (let the VM/callee decide what to do with it)
-                            emit_move(compiler, arg_slot, var_reg, arg->line);
-                        } else {
-                            // Normal variable or upvalue/global
-                            COMPILE_REQUIRED(compiler, arg, arg_slot);
-                        }
-                    } else {
-                        // Complex expression
-                        COMPILE_REQUIRED(compiler, arg, arg_slot);
-                    }
-                }
+                COMPILE_REQUIRED(compiler, arg, arg_slot);
             }
 
             if (compiler->max_register_seen < call_base + arg_count) {
@@ -2739,8 +2246,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     COMPILE_REQUIRED(compiler, set_expr->value, value_reg);
 
                     // Emit direct struct field set
-                    OpCode set_opcode = set_expr->has_slot_modifier ? SLOT_SET_STRUCT_FIELD : SET_STRUCT_FIELD;
-                    emit_instruction(compiler, PACK_ABC(set_opcode, obj_reg, field_index, value_reg), expr->line);
+                    emit_instruction(compiler, PACK_ABC(SET_STRUCT_FIELD, obj_reg, field_index, value_reg), expr->line);
 
                     // The result of an assignment is the assigned value
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
@@ -2765,9 +2271,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             int value_reg = alloc_temp(compiler);
             COMPILE_REQUIRED(compiler, set_expr->value, value_reg);
 
-            // Use SLOT_SET_MAP_PROPERTY if has_slot_modifier is true to bypass reference dereferencing
-            OpCode set_opcode = set_expr->has_slot_modifier ? SLOT_SET_MAP_PROPERTY : SET_MAP_PROPERTY;
-            emit_instruction(compiler, PACK_ABC(set_opcode, obj_reg, key_reg, value_reg), expr->line);
+            emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, value_reg), expr->line);
 
             // The result of an assignment is the assigned value
             EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
@@ -3080,19 +2584,6 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
         }
-        case EXPR_TYPEOF: {
-            int saved_top = save_temp_top(compiler);
-
-            // Compile the operand into a temporary register
-            int operand_reg = alloc_temp(compiler);
-            compile_expression(compiler, expr->as.typeof_expr.operand, operand_reg);
-
-            // Emit TYPEOF instruction which will evaluate the type at runtime
-            emit_instruction(compiler, PACK_ABC(TYPEOF, target_reg, operand_reg, 0), expr->line);
-
-            restore_temp_top_preserve(compiler, saved_top, target_reg);
-            break;
-        }
         case EXPR_SPREAD: {
             // EXPR_SPREAD should not appear in isolation - it should only appear within
             // list/map/struct literals. If we reach here, it's a syntax error.
@@ -3231,154 +2722,50 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 VarDecl* var = &var_stmt->variables[i];
                 if (compiler->scope_depth > 0) { // Local variable
                     declare_variable(compiler, &var->name);
-
-                    if (var->qualifier == VAR_REF) {
-                        // Reference: create a reference object that points to another variable or collection element
-                        if (!var->initializer) {
-                            compiler_error(compiler, stmt->line, "ref variable must have an initializer.");
-                            break;
-                        }
-
-                        int ref_reg = reserve_register(compiler);
-                        emit_reference_from_expr(compiler, var->initializer, ref_reg, stmt->line);
-
-                        // Add the local (it stores a reference object)
-                        add_local_at_reg(compiler, var->name, ref_reg);
-                        compiler->locals[compiler->local_count - 1].is_reference = true;
-                        compiler->locals[compiler->local_count - 1].ref_target_reg = -1;
-
-                    } else if (var->qualifier == VAR_VAL) {
-                        // Value: deep clone the initializer
-                        int value_reg = reserve_register(compiler);
-                        if (var->initializer) {
-                            int temp_reg = compile_sub_expression(compiler, var->initializer);
-                            // Emit CLONE_VALUE instruction
-                            emit_instruction(compiler, PACK_ABC(CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
-                        } else {
-                            int null_const = make_constant(compiler, NULL_VAL);
-                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
-                        }
-                        add_local_at_reg(compiler, var->name, value_reg);
-
-                    } else if (var->qualifier == VAR_CLONE) {
-                        // Clone: deep clone with reference rewriting
-                        int value_reg = reserve_register(compiler);
-                        if (var->initializer) {
-                            int temp_reg = compile_sub_expression(compiler, var->initializer);
-                            // Emit DEEP_CLONE_VALUE instruction
-                            emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
-                        } else {
-                            int null_const = make_constant(compiler, NULL_VAL);
-                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
-                        }
-                        add_local_at_reg(compiler, var->name, value_reg);
-
-                        // Check for struct type
-                        if (var->initializer && var->initializer->type == EXPR_STRUCT_INST) {
-                            ObjStructSchema* struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
-                            if (struct_schema) {
-                                compiler->locals[compiler->local_count - 1].struct_type = struct_schema;
-                            }
-                        }
-
+                    int value_reg = reserve_register(compiler);
+                    if (var->initializer) {
+                        compile_expression(compiler, var->initializer, value_reg);
                     } else {
-                        // Normal: current behavior
-                        int value_reg = reserve_register(compiler);
-                        bool initializer_is_ref = false;
-                        ObjStructSchema* struct_schema = NULL;
+                        int null_const = make_constant(compiler, NULL_VAL);
+                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                    }
+                    add_local_at_reg(compiler, var->name, value_reg);
 
-                        if (var->initializer) {
-                            // Check if initializer is a ref expression
-                            if (var->initializer->type == EXPR_UNARY &&
-                                var->initializer->as.unary.operator.type == TOKEN_REF) {
-                                initializer_is_ref = true;
-                            }
-                            // Also check if initializer is a function call (might return a reference)
-                            else if (var->initializer->type == EXPR_CALL) {
-                                initializer_is_ref = true;
-                            }
-                            // Check if initializer is a struct instantiation
-                            else if (var->initializer->type == EXPR_STRUCT_INST) {
-                                struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
-                            }
-                            compile_expression(compiler, var->initializer, value_reg);
-                        } else {
-                            int null_const = make_constant(compiler, NULL_VAL);
-                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
-                        }
-                        add_local_at_reg(compiler, var->name, value_reg);
-
-                        // If initializer was a ref expression or function call, mark this local as holding a reference
-                        if (initializer_is_ref) {
-                            compiler->locals[compiler->local_count - 1].is_reference = true;
-                        }
-                        // If initializer was a struct, record the struct type
+                    // Check for struct type
+                    if (var->initializer && var->initializer->type == EXPR_STRUCT_INST) {
+                        ObjStructSchema* struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                         if (struct_schema) {
                             compiler->locals[compiler->local_count - 1].struct_type = struct_schema;
                         }
                     }
                 } else { // Global variable
-                    if (var->qualifier == VAR_REF) {
-                        // Global references: create reference object
-                        if (!var->initializer) {
-                            compiler_error(compiler, stmt->line, "ref variable must have an initializer.");
-                            break;
+                    int value_reg = alloc_temp(compiler);
+                    ObjStructSchema* struct_schema = NULL;
+
+                    if (var->initializer) {
+                        // Check if initializer is a struct instantiation
+                        if (var->initializer->type == EXPR_STRUCT_INST) {
+                            struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                         }
-
-                        int ref_reg = alloc_temp(compiler);
-                        emit_reference_from_expr(compiler, var->initializer, ref_reg, stmt->line);
-
-                        // Define the new global with this reference
-                        int name_const = identifier_constant(compiler, &var->name);
-                        int bytecode_pos = compiler->compiling_chunk->count;
-                        emit_instruction(compiler, PACK_ABx(DEFINE_GLOBAL, ref_reg, name_const), stmt->line);
-                        record_global_decl(compiler, var->name, bytecode_pos);
-
+                        compile_expression(compiler, var->initializer, value_reg);
                     } else {
-                        int value_reg = alloc_temp(compiler);
-                        ObjStructSchema* struct_schema = NULL;
+                        int null_const = make_constant(compiler, NULL_VAL);
+                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                    }
 
-                        if (var->qualifier == VAR_VAL && var->initializer) {
-                            // Clone for global val
-                            // Check if initializer is a struct instantiation
-                            if (var->initializer->type == EXPR_STRUCT_INST) {
-                                struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
-                            }
-                            int temp_reg = compile_sub_expression(compiler, var->initializer);
-                            emit_instruction(compiler, PACK_ABC(CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
-                        } else if (var->qualifier == VAR_CLONE && var->initializer) {
-                            // Deep clone for global clone
-                            // Check if initializer is a struct instantiation
-                            if (var->initializer->type == EXPR_STRUCT_INST) {
-                                struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
-                            }
-                            int temp_reg = compile_sub_expression(compiler, var->initializer);
-                            emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, value_reg, temp_reg, 0), stmt->line);
-                        } else if (var->initializer) {
-                            // Check if initializer is a struct instantiation
-                            if (var->initializer->type == EXPR_STRUCT_INST) {
-                                struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
-                            }
-                            compile_expression(compiler, var->initializer, value_reg);
-                        } else {
-                            int null_const = make_constant(compiler, NULL_VAL);
-                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
-                        }
+                    int name_const = identifier_constant(compiler, &var->name);
+                    int bytecode_pos = compiler->compiling_chunk->count;
+                    emit_instruction(compiler, PACK_ABx(DEFINE_GLOBAL, value_reg, name_const), stmt->line);
 
-                        int name_const = identifier_constant(compiler, &var->name);
-                        int bytecode_pos = compiler->compiling_chunk->count;
-                        emit_instruction(compiler, PACK_ABx(DEFINE_GLOBAL, value_reg, name_const), stmt->line);
+                    // Record all global declarations (they auto-initialize to null if no explicit initializer)
+                    record_global_decl(compiler, var->name, bytecode_pos);
 
-                        // Record all global declarations (they auto-initialize to null if no explicit initializer)
-                        record_global_decl(compiler, var->name, bytecode_pos);
-
-                        // If initializer was a struct, record the global type
-                        if (struct_schema) {
-                            ObjString* var_name = copyString(compiler->vm, var->name.start, var->name.length);
-                            pushTempRoot(compiler->vm, (Obj*)var_name);
-                            record_global_type(compiler, var_name, struct_schema);
-                            popTempRoot(compiler->vm);
-                        }
+                    // If initializer was a struct, record the global type
+                    if (struct_schema) {
+                        ObjString* var_name = copyString(compiler->vm, var->name.start, var->name.length);
+                        pushTempRoot(compiler->vm, (Obj*)var_name);
+                        record_global_type(compiler, var_name, struct_schema);
+                        popTempRoot(compiler->vm);
                     }
                 }
             }
@@ -3651,45 +3038,11 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
                         if (var_reg != -1) {
                             // Variable was pre-declared - just compile the initializer
-                            if (var->qualifier == VAR_REF) {
-                                // Reference variable
-                                if (var->initializer) {
-                                    emit_reference_from_expr(compiler, var->initializer, var_reg, s->line);
-                                    // Mark as reference
-                                    for (int k = 0; k < compiler->local_count; k++) {
-                                        if (compiler->locals[k].reg == var_reg) {
-                                            compiler->locals[k].is_reference = true;
-                                            compiler->locals[k].ref_target_reg = -1;
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else if (var->qualifier == VAR_VAL) {
-                                // Val variable - deep clone
-                                if (var->initializer) {
-                                    int temp_reg = compile_sub_expression(compiler, var->initializer);
-                                    emit_instruction(compiler, PACK_ABC(CLONE_VALUE, var_reg, temp_reg, 0), s->line);
-                                }
-                            } else if (var->qualifier == VAR_CLONE) {
-                                // Clone variable - deep clone with ref rewriting
-                                if (var->initializer) {
-                                    int temp_reg = compile_sub_expression(compiler, var->initializer);
-                                    emit_instruction(compiler, PACK_ABC(DEEP_CLONE_VALUE, var_reg, temp_reg, 0), s->line);
-                                }
+                            if (var->initializer) {
+                                compile_expression(compiler, var->initializer, var_reg);
                             } else {
-                                // Normal variable - evaluate initializer
-                                if (var->initializer) {
-                                    compile_expression(compiler, var->initializer, var_reg);
-                                    // Handle special cases for references from function calls
-                                    if (var->initializer->type == EXPR_CALL) {
-                                        for (int k = 0; k < compiler->local_count; k++) {
-                                            if (compiler->locals[k].reg == var_reg) {
-                                                compiler->locals[k].is_reference = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                int null_const = make_constant(compiler, NULL_VAL);
+                                emit_instruction(compiler, PACK_ABx(LOAD_CONST, var_reg, null_const), s->line);
                             }
                             // Mark as initialized
                             for (int k = 0; k < compiler->local_count; k++) {
@@ -3745,21 +3098,10 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     Token name = assign->target->as.variable.name;
                     int reg = resolve_local(compiler, &name);
                     if (reg != -1) {
-                        // Check if this is a reference - if so, skip optimization
-                        bool is_ref = false;
-                        for (int i = 0; i < compiler->local_count; i++) {
-                            if (compiler->locals[i].reg == reg && compiler->locals[i].is_reference) {
-                                is_ref = true;
-                                break;
-                            }
-                        }
-
-                        if (!is_ref) {
-                            // Compile the value directly into the variable's home register.
-                            // We don't need to ask for the result in a new temp register.
-                            compile_expression(compiler, assign->value, reg);
-                            return false; // Optimization complete, statement does not terminate.
-                        }
+                        // Compile the value directly into the variable's home register.
+                        // We don't need to ask for the result in a new temp register.
+                        compile_expression(compiler, assign->value, reg);
+                        return false; // Optimization complete, statement does not terminate.
                     }
                 }
             }
@@ -4030,8 +3372,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 if (stmt->as.return_stmt.value->type == EXPR_VARIABLE) {
                     Token* name = &stmt->as.return_stmt.value->as.variable.name;
                     int var_reg = resolve_local(compiler, name);
-
-                    if (var_reg != -1 && !is_local_ref_param(compiler, var_reg)) {
+                    if (var_reg != -1) {
                         // Normal local variable - return it directly without MOVE
                         emit_instruction(compiler, PACK_ABx(RET, var_reg, 0), stmt->line);
                         return true;
@@ -4364,18 +3705,6 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
         compiler->hoisted[compiler->hoisted_count].name = func_stmt->name;
         compiler->hoisted[compiler->hoisted_count].arity = func_stmt->param_count;
 
-        // Store param_qualifiers for compile-time ref/val handling
-        if (func_stmt->param_count > 0) {
-            compiler->hoisted[compiler->hoisted_count].param_qualifiers =
-                ALLOCATE(compiler->vm, uint8_t, func_stmt->param_count);
-            for (int i = 0; i < func_stmt->param_count; i++) {
-                compiler->hoisted[compiler->hoisted_count].param_qualifiers[i] =
-                    (uint8_t)func_stmt->params[i].qualifier;
-            }
-        } else {
-            compiler->hoisted[compiler->hoisted_count].param_qualifiers = NULL;
-        }
-
         // Initialize upvalue_count to -1 (will be set when function body is compiled)
         compiler->hoisted[compiler->hoisted_count].upvalue_count = -1;
 
@@ -4404,18 +3733,6 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
                 if (c->local_hoisted_count < MAX_LOCALS) {
                     c->local_hoisted[c->local_hoisted_count].name  = fd->name;
                     c->local_hoisted[c->local_hoisted_count].arity = fd->param_count;
-
-                    // Store param_qualifiers for compile-time ref/val handling
-                    if (fd->param_count > 0) {
-                        c->local_hoisted[c->local_hoisted_count].param_qualifiers =
-                            ALLOCATE(c->vm, uint8_t, fd->param_count);
-                        for (int i = 0; i < fd->param_count; i++) {
-                            c->local_hoisted[c->local_hoisted_count].param_qualifiers[i] =
-                                (uint8_t)fd->params[i].qualifier;
-                        }
-                    } else {
-                        c->local_hoisted[c->local_hoisted_count].param_qualifiers = NULL;
-                    }
 
                     // Initialize upvalue_count to -1 (will be set when function body is compiled)
                     c->local_hoisted[c->local_hoisted_count].upvalue_count = -1;
@@ -4538,8 +3855,6 @@ static bool is_name_assigned_in_expr(const Token* name, Expr* expr) {
             }
             return false;
         }
-        case EXPR_TYPEOF:
-            return is_name_assigned_in_expr(name, expr->as.typeof_expr.operand);
         case EXPR_SPREAD:
             return is_name_assigned_in_expr(name, expr->as.spread.expression);
         case EXPR_FUNCTION:
@@ -4620,23 +3935,6 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     function->name = copyString(fn_compiler.vm, stmt->name.start, stmt->name.length);
     function->arity = stmt->param_count;
 
-    // Allocate and store parameter qualifiers, and compute qualifier signature
-    if (stmt->param_count > 0) {
-        function->param_qualifiers = ALLOCATE(fn_compiler.vm, uint8_t, stmt->param_count);
-        bool has_non_normal = false;
-        for (int i = 0; i < stmt->param_count; i++) {
-            function->param_qualifiers[i] = (uint8_t)stmt->params[i].qualifier;
-            if (stmt->params[i].qualifier != PARAM_NORMAL) {
-                has_non_normal = true;
-            }
-        }
-        // Set qualifier signature for call fast-path optimization
-        function->qualifier_sig = has_non_normal ? QUAL_SIG_HAS_QUALIFIERS : QUAL_SIG_ALL_NORMAL;
-    } else {
-        // No parameters - fastest path, nothing to process
-        function->qualifier_sig = QUAL_SIG_ALL_NORMAL_NO_REFS;
-    }
-
     if (stmt->name.length > 9 && memcmp(stmt->name.start, "__module_", 9) == 0) {
         // Case 1: We are compiling a Module Factory.
         // Decode encoded path: "__module_src_slash_math_dot_zym" -> "src/math.zym"
@@ -4665,12 +3963,6 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     local->name.length = stmt->name.length;
     local->depth = fn_compiler.scope_depth;
     local->is_initialized = true;
-    local->is_reference = false;
-    local->is_ref_param = false;
-    local->is_slot_param = false;
-    local->is_captured = false;
-    local->deref_cache_reg = -1;
-    local->ref_target_reg = -1;
     reserve_register(&fn_compiler); // Consumes R0
 
     // Compile parameters, which will now start at R1.
@@ -4678,52 +3970,6 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         declare_variable(&fn_compiler, &stmt->params[i].name);
         int reg = reserve_register(&fn_compiler);
         add_local_at_reg(&fn_compiler, stmt->params[i].name, reg);
-
-        // Mark ref parameters as references in the locals array
-        if (stmt->params[i].qualifier == PARAM_REF) {
-            for (int j = 0; j < fn_compiler.local_count; j++) {
-                if (fn_compiler.locals[j].reg == reg) {
-                    fn_compiler.locals[j].is_reference = true;
-                    fn_compiler.locals[j].is_ref_param = true;  // Ref params auto-dereference on read
-                    fn_compiler.locals[j].ref_target_reg = -1; // Will be set at runtime
-                    break;
-                }
-            }
-        }
-        // Mark slot parameters as references that DON'T auto-dereference on read
-        // Slot params work like ref params but preserve the reference object on read
-        else if (stmt->params[i].qualifier == PARAM_SLOT) {
-            for (int j = 0; j < fn_compiler.local_count; j++) {
-                if (fn_compiler.locals[j].reg == reg) {
-                    fn_compiler.locals[j].is_reference = true;     // Holds a reference object
-                    fn_compiler.locals[j].is_slot_param = true;    // But doesn't auto-dereference on read
-                    fn_compiler.locals[j].ref_target_reg = -1;     // Will be set at runtime
-                    break;
-                }
-            }
-        }
-    }
-
-    // --- DEREF_GET caching for ref params ---
-    // For each ref param that is never directly assigned to in the function body,
-    // emit a single DEREF_GET at function entry and cache the result in a register.
-    // This avoids repeated DEREF_GET instructions on every access in loops.
-    // The cache register is added as a hidden local so it won't be overwritten by temps.
-    for (int i = 0; i < fn_compiler.local_count; i++) {
-        if (fn_compiler.locals[i].is_ref_param) {
-            Token* param_name = &fn_compiler.locals[i].name;
-            // Check if this ref param is ever directly assigned to in the body
-            if (!is_name_assigned_in_stmt(param_name, stmt->body)) {
-                int param_reg = fn_compiler.locals[i].reg;
-                // Use add_local to register the cache as a proper local (protected from temp reuse)
-                // Use a zero-length synthetic name so resolve_local never matches it
-                Token cache_name = { .start = "", .length = 0, .line = stmt->name.line };
-                int cache_reg = add_local(&fn_compiler, cache_name);
-                fn_compiler.locals[fn_compiler.local_count - 1].is_initialized = true;
-                emit_instruction(&fn_compiler, PACK_ABC(DEREF_GET, cache_reg, param_reg, 0), stmt->name.line);
-                fn_compiler.locals[i].deref_cache_reg = cache_reg;
-            }
-        }
     }
 
     // --- Multi-Pass Compilation for the function body ---
@@ -4829,185 +4075,17 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
             for (int j = 0; j < var_stmt->count; j++) {
                 VarDecl* var = &var_stmt->variables[j];
 
-                // For ref variables, we need special handling
-                if (var->qualifier == VAR_REF) {
-                    if (!var->initializer) {
-                        compiler_error(&fn_compiler, s->line, "ref variable must have an initializer.");
-                        continue;
-                    }
-
+                // Normal variable - just evaluate the initializer
+                if (var->initializer) {
                     int var_reg = resolve_local(&fn_compiler, &var->name);
-                    if (var_reg == -1) continue; // Should not happen
+                    if (var_reg != -1) {
+                        compile_expression(&fn_compiler, var->initializer, var_reg);
 
-                    // Check if initializer is a simple variable reference
-                    if (var->initializer->type == EXPR_VARIABLE) {
-                        // Optimize for simple variable reference
-                        Token target_name = var->initializer->as.variable.name;
-                        int target_reg = resolve_local(&fn_compiler, &target_name);
-
-                        if (target_reg != -1) {
-                            // Target is a local variable - flatten reference chains
-                            int ultimate_target = resolve_ref_target(&fn_compiler, target_reg);
-
-                            // If ultimate_target is -1, the target is a local holding a global reference
-                            // In this case, don't flatten at compile time - let runtime handle it
-                            if (ultimate_target == -1) {
-                                ultimate_target = target_reg;
-                            }
-
-                            emit_instruction(&fn_compiler, PACK_ABC(MAKE_REF, var_reg, ultimate_target, 0), s->line);
-
-                            // Mark as reference to local
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_initialized = true;
-                                    fn_compiler.locals[k].is_reference = true;
-                                    // If target is a local holding a global ref, we also store -1 to indicate runtime flattening needed
-                                    fn_compiler.locals[k].ref_target_reg = (ultimate_target == target_reg) ? -1 : ultimate_target;
-                                    break;
-                                }
-                            }
-                        } else if ((target_reg = resolve_upvalue(&fn_compiler, &target_name)) != -1) {
-                            // Target is an upvalue
-                            emit_instruction(&fn_compiler, PACK_ABx(MAKE_UPVALUE_REF, var_reg, target_reg), s->line);
-
-                            // Mark as reference to upvalue
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_reference = true;
-                                    fn_compiler.locals[k].ref_target_reg = -1; // Upvalue refs don't have compile-time target
-                                    break;
-                                }
-                            }
-                        } else {
-                            // Target is not a local or upvalue, must be a global
-                            // Check if this is an overloaded global function
-                            int arity = single_hoisted_arity(&fn_compiler, &target_name);
-                            if (arity == -2) {
-                                fprintf(stderr, "Error at line %d: Cannot create reference to overloaded function '%.*s'. Store the function in a variable first, then create a reference to that variable.\n",
-                                        s->line, target_name.length, target_name.start);
-                                exit(1);
-                            }
-
-                            int target_name_const = resolve_ref_target_name(&fn_compiler, &target_name);
-                            emit_instruction(&fn_compiler, PACK_ABx(MAKE_GLOBAL_REF, var_reg, target_name_const), s->line);
-
-                            // Mark as reference to global
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_reference = true;
-                                    fn_compiler.locals[k].ref_target_reg = -1;
-                                    break;
-                                }
-                            }
-                        }
-                    } else if (var->initializer->type == EXPR_SUBSCRIPT) {
-                        // Reference to array[index] - handle in Pass 2
-                        int var_reg = resolve_local(&fn_compiler, &var->name);
-                        if (var_reg != -1) {
-                            SubscriptExpr* subscript = &var->initializer->as.subscript;
-                            int obj_reg = alloc_temp(&fn_compiler);
-                            int index_reg = alloc_temp(&fn_compiler);
-
-                            compile_expression(&fn_compiler, subscript->object, obj_reg);
-                            compile_expression(&fn_compiler, subscript->index, index_reg);
-
-                            emit_instruction(&fn_compiler, PACK_ABC(MAKE_INDEX_REF, var_reg, obj_reg, index_reg), s->line);
-
-                            // Mark as reference
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_reference = true;
-                                    fn_compiler.locals[k].ref_target_reg = -1;
-                                    break;
-                                }
-                            }
-                        }
-                    } else if (var->initializer->type == EXPR_GET) {
-                        // Reference to obj.property
-                        int var_reg = resolve_local(&fn_compiler, &var->name);
-                        if (var_reg != -1) {
-                            GetExpr* get_expr = &var->initializer->as.get;
-                            int obj_reg = alloc_temp(&fn_compiler);
-                            int key_reg = alloc_temp(&fn_compiler);
-
-                            compile_expression(&fn_compiler, get_expr->object, obj_reg);
-
-                            // Make a string constant for the key
-                            ObjString* key_string = copyString(fn_compiler.vm, get_expr->name.start, get_expr->name.length);
-                            pushTempRoot(fn_compiler.vm, (Obj*)key_string);
-                            int key_const = make_constant(&fn_compiler, OBJ_VAL(key_string));
-                            popTempRoot(fn_compiler.vm);
-                            emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), s->line);
-
-                            emit_instruction(&fn_compiler, PACK_ABC(MAKE_PROPERTY_REF, var_reg, obj_reg, key_reg), s->line);
-
-                            // Mark as reference
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_reference = true;
-                                    fn_compiler.locals[k].ref_target_reg = -1;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        compiler_error(&fn_compiler, s->line, "ref variable initializer must be a variable, subscript, or property.");
-                        continue;
-                    }
-                } else if (var->qualifier == VAR_VAL) {
-                    // Val variable - deep clone the initializer
-                    if (var->initializer) {
-                        int var_reg = resolve_local(&fn_compiler, &var->name);
-                        if (var_reg != -1) {
-                            int temp_reg = compile_sub_expression(&fn_compiler, var->initializer);
-                            emit_instruction(&fn_compiler, PACK_ABC(CLONE_VALUE, var_reg, temp_reg, 0), s->line);
-
-                            // Mark the variable as initialized
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_initialized = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else if (var->qualifier == VAR_CLONE) {
-                    // Clone variable - deep clone with reference rewriting
-                    if (var->initializer) {
-                        int var_reg = resolve_local(&fn_compiler, &var->name);
-                        if (var_reg != -1) {
-                            int temp_reg = compile_sub_expression(&fn_compiler, var->initializer);
-                            emit_instruction(&fn_compiler, PACK_ABC(DEEP_CLONE_VALUE, var_reg, temp_reg, 0), s->line);
-
-                            // Mark the variable as initialized
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_initialized = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Normal variable - just evaluate the initializer
-                    if (var->initializer) {
-                        int var_reg = resolve_local(&fn_compiler, &var->name);
-                        if (var_reg != -1) {
-                            compile_expression(&fn_compiler, var->initializer, var_reg);
-
-                            // Mark the variable as initialized
-                            for (int k = 0; k < fn_compiler.local_count; k++) {
-                                if (fn_compiler.locals[k].reg == var_reg) {
-                                    fn_compiler.locals[k].is_initialized = true;
-
-                                    // If initializer is a function call, it might return a reference
-                                    // Mark the variable as potentially holding a reference for proper assignment semantics
-                                    if (var->initializer->type == EXPR_CALL) {
-                                        fn_compiler.locals[k].is_reference = true;
-                                    }
-                                    break;
-                                }
+                        // Mark the variable as initialized
+                        for (int k = 0; k < fn_compiler.local_count; k++) {
+                            if (fn_compiler.locals[k].reg == var_reg) {
+                                fn_compiler.locals[k].is_initialized = true;
+                                break;
                             }
                         }
                     }

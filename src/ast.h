@@ -50,15 +50,14 @@ typedef enum {
     EXPR_POST_INC,
     EXPR_PRE_DEC,
     EXPR_POST_DEC,
-    EXPR_TYPEOF,
     EXPR_SPREAD
 } ExprType;
 
-typedef struct { Expr* target; Expr* value; bool has_slot_modifier; } AssignExpr;
+typedef struct { Expr* target; Expr* value; } AssignExpr;
 typedef struct { Expr* left; Token operator; Expr* right; } BinaryExpr;
 typedef struct { Expr* callee; Token paren; Expr** args; int arg_count; int arg_capacity; } CallExpr;
 typedef struct { Expr* object; Token name; } GetExpr;
-typedef struct { Expr* object; Token name; Expr* value; bool has_slot_modifier; } SetExpr;
+typedef struct { Expr* object; Token name; Expr* value; } SetExpr;
 typedef struct { Token operator; Expr* right; } UnaryExpr;
 typedef struct { Token literal; } LiteralExpr;
 typedef struct { Expr* expression; } GroupingExpr;
@@ -73,7 +72,6 @@ typedef struct { Expr* target; } PreIncExpr;
 typedef struct { Expr* target; } PostIncExpr;
 typedef struct { Expr* target; } PreDecExpr;
 typedef struct { Expr* target; } PostDecExpr;
-typedef struct { Expr* operand; } TypeofExpr;
 typedef struct { Expr* expression; } SpreadExpr;
 
 struct Expr {
@@ -99,7 +97,6 @@ struct Expr {
         PostIncExpr  post_inc;
         PreDecExpr   pre_dec;
         PostDecExpr  post_dec;
-        TypeofExpr   typeof_expr;
         SpreadExpr   spread;
     } as;
 };
@@ -154,12 +151,7 @@ typedef struct {
 } ForStmt;
 
 typedef enum {
-    PARAM_NORMAL,
-    PARAM_REF,
-    PARAM_VAL,
-    PARAM_SLOT,
-    PARAM_CLONE,
-    PARAM_TYPEOF
+    PARAM_NORMAL
 } ParamQualifier;
 
 struct Param {
@@ -196,10 +188,7 @@ typedef struct {
 } CompilerDirectiveStmt;
 
 typedef enum {
-    VAR_NORMAL,
-    VAR_REF,
-    VAR_VAL,
-    VAR_CLONE
+    VAR_NORMAL
 } VarQualifier;
 
 typedef struct {
@@ -279,11 +268,11 @@ TypeSpecifier* new_simple_type_spec(VM* vm, Token token);
 TypeSpecifier* new_list_type_spec(VM* vm, TypeSpecifier* element_type, Expr* size);
 void free_type_spec(VM* vm, TypeSpecifier* spec);
 
-Expr* new_assign_expr(VM* vm, Expr* target, Expr* value, bool has_slot_modifier);
+Expr* new_assign_expr(VM* vm, Expr* target, Expr* value);
 Expr* new_binary_expr(VM* vm, Expr* left, Token operator, Expr* right);
 Expr* new_call_expr(VM* vm, Expr* callee, Token paren, Expr** args, int arg_count, int arg_capacity);
 Expr* new_get_expr(VM* vm, Expr* object, Token name);
-Expr* new_set_expr(VM* vm, Expr* object, Token name, Expr* value, bool has_slot_modifier);
+Expr* new_set_expr(VM* vm, Expr* object, Token name, Expr* value);
 Expr* new_unary_expr(VM* vm, Token operator, Expr* right);
 Expr* new_literal_expr(VM* vm, Token literal);
 Expr* new_grouping_expr(VM* vm, Expr* expression);
@@ -298,7 +287,6 @@ Expr* new_pre_inc_expr(VM* vm, Expr* target, Token token);
 Expr* new_post_inc_expr(VM* vm, Expr* target, Token token);
 Expr* new_pre_dec_expr(VM* vm, Expr* target, Token token);
 Expr* new_post_dec_expr(VM* vm, Expr* target, Token token);
-Expr* new_typeof_expr(VM* vm, Expr* operand, Token token);
 Expr* new_spread_expr(VM* vm, Expr* expression, Token token);
 Expr* clone_expr(VM* vm, Expr* expr);
 void free_expr(VM* vm, Expr* expr);

@@ -45,11 +45,10 @@ static Expr* new_expr(VM* vm, ExprType type, int line) {
     return expr;
 }
 
-Expr* new_assign_expr(VM* vm, Expr* target, Expr* value, bool has_slot_modifier) {
+Expr* new_assign_expr(VM* vm, Expr* target, Expr* value) {
     Expr* expr = new_expr(vm, EXPR_ASSIGN, target->line);
     expr->as.assign.target = target;
     expr->as.assign.value = value;
-    expr->as.assign.has_slot_modifier = has_slot_modifier;
     return expr;
 }
 
@@ -103,12 +102,11 @@ Expr* new_get_expr(VM* vm, Expr* object, Token name) {
     return expr;
 }
 
-Expr* new_set_expr(VM* vm, Expr* object, Token name, Expr* value, bool has_slot_modifier) {
+Expr* new_set_expr(VM* vm, Expr* object, Token name, Expr* value) {
     Expr* expr = new_expr(vm, EXPR_SET, name.line);
     expr->as.set.object = object;
     expr->as.set.name = name;
     expr->as.set.value = value;
-    expr->as.set.has_slot_modifier = has_slot_modifier;
     return expr;
 }
 
@@ -189,11 +187,6 @@ Expr* new_post_dec_expr(VM* vm, Expr* target, Token token) {
     return expr;
 }
 
-Expr* new_typeof_expr(VM* vm, Expr* operand, Token token) {
-    Expr* expr = new_expr(vm, EXPR_TYPEOF, token.line);
-    expr->as.typeof_expr.operand = operand;
-    return expr;
-}
 
 Expr* new_spread_expr(VM* vm, Expr* expression, Token token) {
     Expr* expr = new_expr(vm, EXPR_SPREAD, token.line);
@@ -233,10 +226,6 @@ Expr* clone_expr(VM* vm, Expr* expr) {
                 expr->as.unary.operator,
                 clone_expr(vm, expr->as.unary.right));
 
-        case EXPR_TYPEOF:
-            return new_typeof_expr(vm,
-                clone_expr(vm, expr->as.typeof_expr.operand),
-                (Token){0});
 
         case EXPR_SPREAD:
             return new_spread_expr(vm,
@@ -332,9 +321,6 @@ void free_expr(VM* vm, Expr* expr) {
             break;
         case EXPR_POST_DEC:
             free_expr(vm, expr->as.post_dec.target);
-            break;
-        case EXPR_TYPEOF:
-            free_expr(vm, expr->as.typeof_expr.operand);
             break;
         case EXPR_SPREAD:
             free_expr(vm, expr->as.spread.expression);

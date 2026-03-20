@@ -153,7 +153,6 @@ static TokenType identifierType(Scanner* scanner) {
             CASE('a', {
                 KW('s', "e", TOKEN_CASE);
             })
-            KW('l', "one", TOKEN_CLONE);
             KW('o', "ntinue", TOKEN_CONTINUE);
         })
         CASE('d', {
@@ -175,22 +174,18 @@ static TokenType identifierType(Scanner* scanner) {
         KW('o', "r", TOKEN_OR);
         CASE('r', {
             CASE('e', {
-                KW('f', "", TOKEN_REF);
                 KW('t', "urn", TOKEN_RETURN);
             })
         })
         CASE('s', {
-            KW('l', "ot", TOKEN_SLOT);
             KW('t', "ruct", TOKEN_STRUCT);
             KW('w', "itch", TOKEN_SWITCH);
         })
         CASE('t', {
             KW('r', "ue", TOKEN_TRUE);
-            KW('y', "peof", TOKEN_TYPEOF);
         })
         CASE('v', {
             CASE('a', {
-                KW('l', "", TOKEN_VAL);
                 KW('r', "", TOKEN_VAR);
             })
         })

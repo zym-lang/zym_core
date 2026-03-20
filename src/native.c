@@ -369,34 +369,8 @@ static const char* parseIdentifier(const char* str, char* out, int max_len) {
 
 static const char* parseQualifier(const char* str, uint8_t* out_qualifier) {
     str = skipWhitespace(str);
-
-    char qualifier[16];
-    const char* start = str;
-    int i = 0;
-    while (*str && isalpha((unsigned char)*str) && i < 15) {
-        qualifier[i++] = *str++;
-    }
-    qualifier[i] = '\0';
-
-    if (strcmp(qualifier, "ref") == 0) {
-        *out_qualifier = PARAM_REF;
-        return str;
-    } else if (strcmp(qualifier, "val") == 0) {
-        *out_qualifier = PARAM_VAL;
-        return str;
-    } else if (strcmp(qualifier, "slot") == 0) {
-        *out_qualifier = PARAM_SLOT;
-        return str;
-    } else if (strcmp(qualifier, "clone") == 0) {
-        *out_qualifier = PARAM_CLONE;
-        return str;
-    } else if (strcmp(qualifier, "typeof") == 0) {
-        *out_qualifier = PARAM_TYPEOF;
-        return str;
-    }
-
     *out_qualifier = PARAM_NORMAL;
-    return start;
+    return str;
 }
 
 bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_name, int* out_arity, uint8_t** out_qualifiers) {
@@ -461,17 +435,7 @@ bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_
     }
 
     *out_arity = arity;
-
-    if (arity > 0) {
-        *out_qualifiers = (uint8_t*)ZYM_ALLOC(alloc, arity * sizeof(uint8_t));
-        if (!*out_qualifiers) {
-            fprintf(stderr, "Native function signature parse error: memory allocation failed\n");
-            return false;
-        }
-        memcpy(*out_qualifiers, temp_qualifiers, arity * sizeof(uint8_t));
-    } else {
-        *out_qualifiers = NULL;
-    }
+    *out_qualifiers = NULL;
 
     return true;
 }
