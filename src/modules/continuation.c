@@ -72,10 +72,6 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
 
     closeUpvalues(vm, &vm->stack[capture_stack_base]);
 
-    for (int i = capture_stack_base; i < capture_stack_top; i++) {
-        protectLocalRefsInValue(vm, vm->stack[i], &vm->stack[capture_stack_base]);
-    }
-
     ObjContinuation* cont = newContinuation(vm);
     pushTempRoot(vm, (Obj*)cont);
 

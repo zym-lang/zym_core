@@ -471,8 +471,7 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
     ObjNativeFunction* native = newNativeFunction(vm, name_obj, arity, func_ptr, dispatcher);
     pushTempRoot(vm, (Obj*)native);
 
-    if (arity > 0 && qualifiers) {
-        memcpy(native->param_qualifiers, qualifiers, arity * sizeof(uint8_t));
+    if (qualifiers) {
         ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
     }
 

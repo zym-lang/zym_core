@@ -78,8 +78,6 @@ ObjFunction* newFunction(VM* vm) {
     function->max_regs = 1;
     function->name = NULL;
     function->module_name = NULL;
-    function->param_qualifiers = NULL;
-    function->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
     function->chunk = NULL;
 
     pushTempRoot(vm, (Obj*)function);
@@ -98,18 +96,6 @@ ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* f
     native->arity = arity;
     native->func_ptr = func_ptr;
     native->dispatcher = dispatcher;
-    native->param_qualifiers = NULL;
-    native->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
-
-    if (arity > 0) {
-        pushTempRoot(vm, (Obj*)native);
-        native->param_qualifiers = ALLOCATE(vm, uint8_t, arity);
-        for (int i = 0; i < arity; i++) {
-            native->param_qualifiers[i] = 0;
-        }
-        popTempRoot(vm);
-    }
-
     return native;
 }
 
@@ -128,18 +114,6 @@ ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* fun
     closure->func_ptr = func_ptr;
     closure->dispatcher = dispatcher;
     closure->context = context;
-    closure->param_qualifiers = NULL;
-    closure->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
-
-    if (arity > 0) {
-        pushTempRoot(vm, (Obj*)closure);
-        closure->param_qualifiers = ALLOCATE(vm, uint8_t, arity);
-        for (int i = 0; i < arity; i++) {
-            closure->param_qualifiers[i] = 0;
-        }
-        popTempRoot(vm);
-    }
-
     return closure;
 }
 

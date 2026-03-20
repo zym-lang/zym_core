@@ -646,18 +646,12 @@ void freeObject(VM* vm, Obj* object) {
                 }
                 FREE(vm, Chunk, function->chunk);
             }
-            if (function->param_qualifiers && function->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, function->param_qualifiers, function->arity);
-            }
             FREE(vm, ObjFunction, object);
             break;
         }
 
         case OBJ_NATIVE_FUNCTION: {
             ObjNativeFunction* native = (ObjNativeFunction*)object;
-            if (native->param_qualifiers && native->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, native->param_qualifiers, native->arity);
-            }
             FREE(vm, ObjNativeFunction, object);
             break;
         }
@@ -673,9 +667,6 @@ void freeObject(VM* vm, Obj* object) {
 
         case OBJ_NATIVE_CLOSURE: {
             ObjNativeClosure* closure = (ObjNativeClosure*)object;
-            if (closure->param_qualifiers && closure->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, closure->param_qualifiers, closure->arity);
-            }
             FREE(vm, ObjNativeClosure, object);
             break;
         }

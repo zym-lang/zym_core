@@ -78,13 +78,6 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
                 writeBytes(vm, out, fn->module_name->chars, (size_t)modNameLen);
             }
 
-            if (fn->arity > 0 && fn->param_qualifiers != NULL) {
-                writeBytes(vm, out, fn->param_qualifiers, sizeof(uint8_t) * fn->arity);
-            }
-            
-            // Write qualifier_sig for call fast-path optimization
-            writeBytes(vm, out, &fn->qualifier_sig, sizeof(uint8_t));
-
             OutputBuffer nested;
             initOutputBuffer(&nested);
             serializeChunk(vm, fn->chunk, config, &nested);
@@ -263,16 +256,6 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 } else {
                     fn->module_name = NULL;
                 }
-
-                if (fn->arity > 0) {
-                    fn->param_qualifiers = ALLOCATE(vm, uint8_t, fn->arity);
-                    READ_BYTES_OR_FAIL(fn->param_qualifiers, sizeof(uint8_t) * fn->arity);
-                } else {
-                    fn->param_qualifiers = NULL;
-                }
-                
-                // Read qualifier_sig for call fast-path optimization
-                READ_BYTES_OR_FAIL(&fn->qualifier_sig, sizeof(uint8_t));
 
                 int32_t nestedSize = 0;
                 READ_BYTES_OR_FAIL(&nestedSize, sizeof(int32_t));

@@ -293,8 +293,7 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
     popTempRoot(vm);
     popTempRoot(vm);
 
-    if (arity > 0 && qualifiers) {
-        memcpy(closure->param_qualifiers, qualifiers, arity * sizeof(uint8_t));
+    if (qualifiers) {
         ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
     }
 

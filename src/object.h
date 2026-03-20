@@ -91,13 +91,6 @@ typedef struct ObjString {
     uint32_t hash;
 } ObjString;
 
-// Qualifier signature for fast-path call optimization
-typedef enum {
-    QUAL_SIG_ALL_NORMAL_NO_REFS = 0,  // Fastest: skip all qualifier processing
-    QUAL_SIG_ALL_NORMAL = 1,           // Fast: only check for references to deref
-    QUAL_SIG_HAS_QUALIFIERS = 2        // Slow: full qualifier processing needed
-} QualifierSignature;
-
 typedef struct ObjFunction {
     Obj obj;
     int arity;
@@ -107,8 +100,6 @@ typedef struct ObjFunction {
     ObjString* module_name;
     Upvalue upvalues[MAX_LOCALS];
     int upvalue_count;
-    uint8_t* param_qualifiers;
-    uint8_t qualifier_sig;  // QualifierSignature for call fast-path
 } ObjFunction;
 
 typedef Value (*NativeDispatcher)(VM* vm, Value* args, void* func_ptr);
@@ -117,8 +108,6 @@ typedef struct ObjNativeFunction {
     Obj obj;
     ObjString* name;
     int arity;
-    uint8_t* param_qualifiers;
-    uint8_t qualifier_sig;  // QualifierSignature for call fast-path
     void* func_ptr;
     NativeDispatcher dispatcher;
 } ObjNativeFunction;
@@ -135,8 +124,6 @@ typedef struct {
     Obj obj;
     ObjString* name;
     int arity;
-    uint8_t* param_qualifiers;
-    uint8_t qualifier_sig;  // QualifierSignature for call fast-path
     void* func_ptr;
     NativeDispatcher dispatcher;
     Value context;
