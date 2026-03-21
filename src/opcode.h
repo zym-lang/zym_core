@@ -125,13 +125,11 @@ typedef enum {
     GET_GLOBAL_CACHED,  // Optimized GET_GLOBAL using direct slot indexing
     SET_GLOBAL,
     SET_GLOBAL_CACHED,  // Optimized SET_GLOBAL using direct slot indexing
-    SLOT_SET_GLOBAL,    // Like SET_GLOBAL but bypasses reference dereferencing (for slot keyword)
 
     // Closure Opcodes
     CLOSURE,
     GET_UPVALUE,
     SET_UPVALUE,
-    SLOT_SET_UPVALUE, // Like SET_UPVALUE but bypasses reference dereferencing (for slot parameters)
     CLOSE_UPVALUE,
     CLOSE_FRAME_UPVALUES,  // Close all upvalues for current frame (used before TAIL_CALL)
 
@@ -143,7 +141,6 @@ typedef enum {
     GET_SUBSCRIPT_I,     // Ra = container[Rb][imm8] - immediate index, optimized for lists
     SET_SUBSCRIPT,
     SET_SUBSCRIPT_I,     // container[Ra][imm8] = Rc - immediate index variant
-    SLOT_SET_SUBSCRIPT,  // Like SET_SUBSCRIPT but bypasses reference dereferencing (for slot keyword)
 
     // Map Opcodes
     NEW_MAP,
@@ -151,7 +148,6 @@ typedef enum {
     MAP_SPREAD,          // Spread map into another map (Ra = target map, Rb = source to spread)
     GET_MAP_PROPERTY,
     SET_MAP_PROPERTY,
-    SLOT_SET_MAP_PROPERTY,  // Like SET_MAP_PROPERTY but bypasses reference dereferencing (for slot keyword)
 
     // Dispatcher Opcodes (for overloaded function returns)
     NEW_DISPATCHER,
@@ -163,7 +159,6 @@ typedef enum {
     STRUCT_SPREAD,         // Spread struct fields into another struct (Ra = target struct, Rb = source to spread)
     GET_STRUCT_FIELD,      // Ra = struct[Rb].field[C] where C is field index
     SET_STRUCT_FIELD,      // struct[Ra].field[B] = Rc
-    SLOT_SET_STRUCT_FIELD, // Like SET_STRUCT_FIELD but for slot modifier
 
     // Increment/Decrement Opcodes
     PRE_INC,       // Ra = ++stack[Rb] (increment then return new value)

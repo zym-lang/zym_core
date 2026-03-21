@@ -634,7 +634,6 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(GET_GLOBAL_CACHED),
         JUMP_ENTRY(SET_GLOBAL),
         JUMP_ENTRY(SET_GLOBAL_CACHED),
-        JUMP_ENTRY(SLOT_SET_GLOBAL),
         JUMP_ENTRY(CLOSURE),
         JUMP_ENTRY(GET_UPVALUE),
         JUMP_ENTRY(SET_UPVALUE),
@@ -647,20 +646,17 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(GET_SUBSCRIPT_I),
         JUMP_ENTRY(SET_SUBSCRIPT),
         JUMP_ENTRY(SET_SUBSCRIPT_I),
-        JUMP_ENTRY(SLOT_SET_SUBSCRIPT),
         JUMP_ENTRY(NEW_MAP),
         JUMP_ENTRY(MAP_SET),
         JUMP_ENTRY(MAP_SPREAD),
         JUMP_ENTRY(GET_MAP_PROPERTY),
         JUMP_ENTRY(SET_MAP_PROPERTY),
-        JUMP_ENTRY(SLOT_SET_MAP_PROPERTY),
         JUMP_ENTRY(NEW_DISPATCHER),
         JUMP_ENTRY(ADD_OVERLOAD),
         JUMP_ENTRY(NEW_STRUCT),
         JUMP_ENTRY(STRUCT_SPREAD),
         JUMP_ENTRY(GET_STRUCT_FIELD),
         JUMP_ENTRY(SET_STRUCT_FIELD),
-        JUMP_ENTRY(SLOT_SET_STRUCT_FIELD),
         JUMP_ENTRY(PRE_INC),
         JUMP_ENTRY(POST_INC),
         JUMP_ENTRY(PRE_DEC),
@@ -1824,33 +1820,6 @@ static InterpretResult run(VM* vm) {
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t slot_index = REG_Bx(instr);
         vm->globalSlots.values[slot_index] = vm->stack[src_reg];
-        DISPATCH();
-    }
-    OP(SLOT_SET_GLOBAL) {
-        // SLOT_SET_GLOBAL: directly replace the global variable value, bypassing reference dereferencing
-        // This is used for the `slot` keyword which rebinds variables instead of writing through references
-        uint32_t instr = vm->ip[-1];
-        int src_reg = CUR_BASE() + REG_A(instr);
-        uint16_t name_const_idx = REG_Bx(instr);
-        ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
-
-        // Check if global exists
-        Value slot_index_val;
-        if (!tableGet(&vm->globals, name, &slot_index_val)) {
-            runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // Check if this is a slot index (number) or direct value (e.g., native function)
-        if (IS_DOUBLE(slot_index_val)) {
-            // Slot-based global: directly replace the value in the slot (bypassing reference logic)
-            uint16_t slot_index = (uint16_t)AS_DOUBLE(slot_index_val);
-            vm->globalSlots.values[slot_index] = vm->stack[src_reg];
-        } else {
-            // Direct value (e.g., native function) - can't rebind, this is an error
-            runtimeError(vm, "Cannot rebind native function '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
-        }
         DISPATCH();
     }
     OP(JUMP_IF_FALSE) {
@@ -3304,62 +3273,6 @@ static InterpretResult run(VM* vm) {
         runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
         return INTERPRET_RUNTIME_ERROR;
     }
-    OP(SLOT_SET_SUBSCRIPT) {
-        // SLOT_SET_SUBSCRIPT: directly replace the element value, bypassing reference dereferencing
-        // This is used for the `slot` keyword which rebinds elements instead of writing through references
-        uint32_t instr = vm->ip[-1];
-        int a = CUR_BASE() + REG_A(instr); // Object register (list or map)
-        int b = CUR_BASE() + REG_B(instr); // Index/Key register
-        int c = CUR_BASE() + REG_C(instr); // Value register
-        Value obj_val = vm->stack[a];
-        Value key_val = vm->stack[b];
-        Value value_val = vm->stack[c];
-
-        // Dereference container if it's a reference
-
-        // Handle maps
-        if (IS_MAP(obj_val)) {
-            ObjMap* map = AS_MAP(obj_val);
-            ObjString* key_str = keyToString(vm, key_val);
-            if (!key_str) {
-                runtimeError(vm, ERR_MAP_KEYS_TYPE);
-                return INTERPRET_RUNTIME_ERROR;
-            }
-
-            // Direct assignment without checking for references
-            if (IS_NULL(value_val)) {
-                tableDelete(map->table, key_str);
-            } else {
-                tableSet(vm, map->table, key_str, value_val);
-            }
-            DISPATCH();
-        }
-
-        // Handle lists
-        if (!IS_LIST(obj_val)) {
-            runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-        ObjList* list = AS_LIST(obj_val);
-        if (!IS_DOUBLE(key_val)) {
-            runtimeError(vm, ERR_LIST_INDEX_TYPE);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-        double index_double = AS_DOUBLE(key_val);
-        int index = (int)index_double;
-        if (index != index_double) {
-            runtimeError(vm, "List index must be an integer.");
-            return INTERPRET_RUNTIME_ERROR;
-        }
-        if (index < 0 || index >= list->items.count) {
-            runtimeError(vm, "List index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // Direct assignment to list element without checking for references
-        list->items.values[index] = value_val;
-        DISPATCH();
-    }
     OP(GET_MAP_PROPERTY) {
         uint32_t instr = vm->ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
@@ -3454,38 +3367,6 @@ static InterpretResult run(VM* vm) {
         ObjMap* map = AS_MAP(container_val);
 
         // Normal set/delete
-        if (IS_NULL(value_val)) {
-            tableDelete(map->table, key_str);
-        } else {
-            tableSet(vm, map->table, key_str, value_val);
-        }
-        DISPATCH();
-    }
-    OP(SLOT_SET_MAP_PROPERTY) {
-        // SLOT_SET_MAP_PROPERTY: directly replace the property value, bypassing reference dereferencing
-        // This is used for the `slot` keyword which rebinds properties instead of writing through references
-        uint32_t instr = vm->ip[-1];
-        int a = CUR_BASE() + REG_A(instr); // Map register
-        int b = CUR_BASE() + REG_B(instr); // Key register (must be a string)
-        int c = CUR_BASE() + REG_C(instr); // Value register
-        Value map_val = vm->stack[a];
-        Value key_val = vm->stack[b];
-        Value value_val = vm->stack[c];
-
-        if (!IS_MAP(map_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        if (!IS_STRING(key_val)) {
-            runtimeError(vm, "Map property key must be a string.");
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjMap* map = AS_MAP(map_val);
-        ObjString* key_str = AS_STRING(key_val);
-
-        // Direct assignment without checking for references
         if (IS_NULL(value_val)) {
             tableDelete(map->table, key_str);
         } else {
@@ -3640,32 +3521,6 @@ static InterpretResult run(VM* vm) {
             return INTERPRET_RUNTIME_ERROR;
         }
 
-        instance->fields[b] = new_value;
-        DISPATCH();
-    }
-    OP(SLOT_SET_STRUCT_FIELD) {
-        uint32_t instr = vm->ip[-1];
-        int a = CUR_BASE() + REG_A(instr); // Struct instance register
-        int b = REG_B(instr);               // Field index
-        int c = CUR_BASE() + REG_C(instr); // Value register
-
-        Value struct_val = vm->stack[a];
-        Value new_value = vm->stack[c];
-
-        // Dereference container if it's a reference
-
-        if (!IS_STRUCT_INSTANCE(struct_val)) {
-            runtimeError(vm, "SLOT_SET_STRUCT_FIELD requires a struct instance.");
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjStructInstance* instance = AS_STRUCT_INSTANCE(struct_val);
-        if (b < 0 || b >= instance->schema->field_count) {
-            runtimeError(vm, "Struct field index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // Direct assignment, bypassing references (slot semantics)
         instance->fields[b] = new_value;
         DISPATCH();
     }
