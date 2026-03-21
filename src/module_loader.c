@@ -625,7 +625,8 @@ static void stack_push(ImportStack* stack, const char* module) {
 
 static void stack_pop(ImportStack* stack) {
     if (stack->count > 0) {
-        ZYM_FREE_STR(stack->alloc, stack->modules[--stack->count]);
+        stack->count--;
+        ZYM_FREE_STR(stack->alloc, stack->modules[stack->count]);
     }
 }
 
