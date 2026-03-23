@@ -959,8 +959,6 @@ static char* transform_imports(ZymAllocator* alloc, const char* source, const ch
 
                 ZYM_FREE(alloc, symbol, symbol_len + 1);
             }
-
-            p++;
         } else {
             p++;
         }
