@@ -87,7 +87,6 @@ static Stmt* parse_goto_statement(Parser* parser);
 static Stmt* parse_switch_statement(Parser* parser);
 static Stmt* parse_return_statement(Parser* parser);
 static Stmt* function(Parser* parser, const char* kind);
-static TypeSpecifier* parse_type_specifier(Parser* parser);
 
 static const ParseRule rules[] = {
     [TOKEN_LEFT_PAREN]    = {grouping,     call,      PREC_CALL},
@@ -331,7 +330,7 @@ static Expr* grouping(Parser* parser, bool can_assign) {
                 body = new_block_stmt(parser->vm, statements, 1, 1, paren);
             }
 
-            return new_function_expr(parser->vm, NULL, 0, 0, body, NULL, paren);
+            return new_function_expr(parser->vm, NULL, 0, 0, body, paren);
         }
         error_at_current(parser, "Expect expression.");
         return NULL;
@@ -348,14 +347,6 @@ static Expr* grouping(Parser* parser, bool can_assign) {
             if (parser->current.type == TOKEN_IDENTIFIER) {
                 advance(parser);
                 lookahead_depth++;
-                if (parser->current.type == TOKEN_COLON) {
-                    advance(parser);
-                    while (parser->current.type == TOKEN_IDENTIFIER ||
-                           parser->current.type == TOKEN_LEFT_BRACKET ||
-                           parser->current.type == TOKEN_RIGHT_BRACKET) {
-                        advance(parser);
-                    }
-                }
             } else if (parser->current.type == TOKEN_COMMA) {
                 advance(parser);
             }
@@ -392,11 +383,6 @@ static Expr* grouping(Parser* parser, bool can_assign) {
 
             advance(parser);
             params[param_count].name = parser->previous;
-            params[param_count].type = NULL;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            }
 
             param_count++;
         } while (match(parser, TOKEN_COMMA));
@@ -419,7 +405,7 @@ static Expr* grouping(Parser* parser, bool can_assign) {
                     body = new_block_stmt(parser->vm, statements, 1, 1, paren);
                 }
 
-                return new_function_expr(parser->vm, params, param_count, param_capacity, body, NULL, paren);
+                return new_function_expr(parser->vm, params, param_count, param_capacity, body, paren);
             }
         }
 
@@ -793,53 +779,14 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            } else {
-                params[param_count].type = NULL;
-            }
             param_count++;
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
 
-    TypeSpecifier* return_type = NULL;
-    if (match(parser, TOKEN_ARROW)) {
-        return_type = parse_type_specifier(parser);
-    }
-
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
-    return new_function_expr(parser->vm, params, param_count, param_capacity, body, return_type, func_token);
-}
-static TypeSpecifier* parse_type_specifier(Parser* parser) {
-    if (match(parser, TOKEN_LEFT_BRACKET)) {
-        TypeSpecifier* element_type = NULL;
-        Expr* size = NULL;
-
-        if (match(parser, TOKEN_RIGHT_BRACKET)) {
-            return new_list_type_spec(parser->vm, NULL, NULL);
-        }
-
-        element_type = parse_type_specifier(parser);
-
-        if (match(parser, TOKEN_SEMICOLON)) {
-            size = parse_expression(parser);
-        }
-
-        consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' after list type specifier.");
-        TypeSpecifier* list_type = new_list_type_spec(parser->vm, element_type, size);
-
-        while (match(parser, TOKEN_LEFT_BRACKET)) {
-            consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' for nested list type.");
-            list_type = new_list_type_spec(parser->vm, list_type, NULL);
-        }
-        return list_type;
-    }
-
-    consume(parser, TOKEN_IDENTIFIER, "Expect type name.");
-    return new_simple_type_spec(parser->vm, parser->previous);
+    return new_function_expr(parser->vm, params, param_count, param_capacity, body, func_token);
 }
 static Stmt* parse_var_declaration(Parser* parser) {
     Token keyword = parser->previous;
@@ -857,18 +804,12 @@ static Stmt* parse_var_declaration(Parser* parser) {
         consume(parser, TOKEN_IDENTIFIER, "Expect variable name.");
         Token name = parser->previous;
 
-        TypeSpecifier* type = NULL;
-        if (match(parser, TOKEN_COLON)) {
-            type = parse_type_specifier(parser);
-        }
-
         Expr* initializer = NULL;
         if (match(parser, TOKEN_EQUAL)) {
             initializer = parse_expression(parser);
         }
 
         variables[count].name = name;
-        variables[count].type = type;
         variables[count].initializer = initializer;
         count++;
     } while (match(parser, TOKEN_COMMA));
@@ -909,21 +850,10 @@ static Stmt* function(Parser* parser, const char* kind) {
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            } else {
-                params[param_count].type = NULL;
-            }
             param_count++;
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
-
-    TypeSpecifier* return_type = NULL;
-    if (match(parser, TOKEN_ARROW)) {
-        return_type = parse_type_specifier(parser);
-    }
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
@@ -931,7 +861,7 @@ static Stmt* function(Parser* parser, const char* kind) {
     parser->current_module_name = saved_module_name;
     parser->module_name_length = saved_module_name_length;
 
-    return new_func_decl_stmt(parser->vm, name, params, param_count, param_capacity, body, return_type);
+    return new_func_decl_stmt(parser->vm, name, params, param_count, param_capacity, body);
 }
 
 static Stmt* parse_compiler_directive(Parser* parser) {

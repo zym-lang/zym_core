@@ -2299,7 +2299,6 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             temp_stmt.param_count = func_expr->param_count;
             temp_stmt.param_capacity = func_expr->param_capacity;
             temp_stmt.body = func_expr->body;
-            temp_stmt.return_type = func_expr->return_type;
             temp_stmt.function = NULL;  // Initialize function field to NULL
 
             // Compile the function body

@@ -270,7 +270,6 @@ Token scanToken(Scanner* scanner) {
             return makeToken(scanner, TOKEN_DOT);
         case '@': return makeToken(scanner, TOKEN_AT);
         case '-':
-            if (match(scanner, '>')) return makeToken(scanner, TOKEN_ARROW);
             if (match(scanner, '=')) return makeToken(scanner, TOKEN_MINUS_EQUAL);
             if (match(scanner, '-')) return makeToken(scanner, TOKEN_MINUS_MINUS);
             return makeToken(scanner, TOKEN_MINUS);

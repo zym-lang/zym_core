@@ -5,37 +5,6 @@
 #include "./memory.h"
 #include "./vm.h"
 
-/* Type specifiers */
-
-TypeSpecifier* new_simple_type_spec(VM* vm, Token token) {
-    TypeSpecifier* spec = ALLOCATE(vm, TypeSpecifier, 1);
-    spec->kind = TYPE_SIMPLE;
-    spec->as.simple = token;
-    return spec;
-}
-
-TypeSpecifier* new_list_type_spec(VM* vm, TypeSpecifier* element_type, Expr* size) {
-    TypeSpecifier* spec = ALLOCATE(vm, TypeSpecifier, 1);
-    spec->kind = TYPE_LIST;
-    spec->as.list.element_type = element_type;
-    spec->as.list.size = size;
-    return spec;
-}
-
-void free_type_spec(VM* vm, TypeSpecifier* spec) {
-    if (spec == NULL) return;
-    switch (spec->kind) {
-        case TYPE_SIMPLE:
-            break;
-        case TYPE_LIST:
-            free_type_spec(vm, spec->as.list.element_type);
-            free_expr(vm, spec->as.list.size);
-            break;
-    }
-    FREE(vm, TypeSpecifier, spec);
-}
-
-
 /* Expressions */
 
 static Expr* new_expr(VM* vm, ExprType type, int line) {
@@ -135,13 +104,12 @@ Expr* new_map_expr(VM* vm, Expr** keys, Expr** values, int count, int capacity, 
     return expr;
 }
 
-Expr* new_function_expr(VM* vm, Param* params, int param_count, int param_capacity, Stmt* body, TypeSpecifier* return_type, Token token) {
+Expr* new_function_expr(VM* vm, Param* params, int param_count, int param_capacity, Stmt* body, Token token) {
     Expr* expr = new_expr(vm, EXPR_FUNCTION, token.line);
     expr->as.function.params = params;
     expr->as.function.param_count = param_count;
     expr->as.function.param_capacity = param_capacity;
     expr->as.function.body = body;
-    expr->as.function.return_type = return_type;
     return expr;
 }
 
@@ -291,12 +259,8 @@ void free_expr(VM* vm, Expr* expr) {
             FREE_ARRAY(vm, Expr*, expr->as.map.values, expr->as.map.capacity);
             break;
         case EXPR_FUNCTION:
-            for (int i = 0; i < expr->as.function.param_count; i++) {
-                free_type_spec(vm, expr->as.function.params[i].type);
-            }
             FREE_ARRAY(vm, Param, expr->as.function.params, expr->as.function.param_capacity);
             free_stmt(vm, expr->as.function.body);
-            free_type_spec(vm, expr->as.function.return_type);
             break;
         case EXPR_STRUCT_INST:
             for (int i = 0; i < expr->as.struct_inst.field_count; i++) {
@@ -411,14 +375,13 @@ Stmt* new_continue_stmt(VM* vm, Token keyword) {
     return stmt;
 }
 
-Stmt* new_func_decl_stmt(VM* vm, Token name, Param* params, int param_count, int param_capacity, Stmt* body, TypeSpecifier* return_type) {
+Stmt* new_func_decl_stmt(VM* vm, Token name, Param* params, int param_count, int param_capacity, Stmt* body) {
     Stmt* stmt = new_stmt(vm, STMT_FUNC_DECLARATION, name.line);
     stmt->as.func_declaration.name = name;
     stmt->as.func_declaration.params = params;
     stmt->as.func_declaration.param_count = param_count;
     stmt->as.func_declaration.param_capacity = param_capacity;
     stmt->as.func_declaration.body = body;
-    stmt->as.func_declaration.return_type = return_type;
     return stmt;
 }
 
@@ -481,7 +444,6 @@ void free_stmt(VM* vm, Stmt* stmt) {
             break;
         case STMT_VAR_DECLARATION:
             for (int i = 0; i < stmt->as.var_declaration.count; i++) {
-                free_type_spec(vm, stmt->as.var_declaration.variables[i].type);
                 free_expr(vm, stmt->as.var_declaration.variables[i].initializer);
             }
             FREE_ARRAY(vm, VarDecl, stmt->as.var_declaration.variables, stmt->as.var_declaration.capacity);
@@ -520,11 +482,7 @@ void free_stmt(VM* vm, Stmt* stmt) {
         case STMT_CONTINUE:
             break;
         case STMT_FUNC_DECLARATION: {
-            for (int i = 0; i < stmt->as.func_declaration.param_count; i++) {
-                free_type_spec(vm, stmt->as.func_declaration.params[i].type);
-            }
             FREE_ARRAY(vm, Param, stmt->as.func_declaration.params, stmt->as.func_declaration.param_capacity);
-            free_type_spec(vm, stmt->as.func_declaration.return_type);
             free_stmt(vm, stmt->as.func_declaration.body);
             break;
         }

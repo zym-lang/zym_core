@@ -9,26 +9,7 @@ typedef struct VM VM;
 typedef struct ObjFunction ObjFunction;
 typedef struct Expr Expr;
 typedef struct Stmt Stmt;
-typedef struct TypeSpecifier TypeSpecifier;
 typedef struct Param Param;
-
-typedef enum {
-    TYPE_SIMPLE,
-    TYPE_LIST
-} TypeKind;
-
-typedef struct {
-    TypeSpecifier* element_type;
-    Expr* size;
-} ListTypeSpec;
-
-struct TypeSpecifier {
-    TypeKind kind;
-    union {
-        Token simple;
-        ListTypeSpec list;
-    } as;
-};
 
 typedef enum {
     EXPR_ASSIGN,
@@ -65,7 +46,7 @@ typedef struct { Token name; } VariableExpr;
 typedef struct { Expr** elements; int count; int capacity; } ListExpr;
 typedef struct { Expr* object; Token bracket; Expr* index; } SubscriptExpr;
 typedef struct { Expr** keys; Expr** values; int count; int capacity; } MapExpr;
-typedef struct { Param* params; int param_count; int param_capacity; Stmt* body; TypeSpecifier* return_type; } FunctionExpr;
+typedef struct { Param* params; int param_count; int param_capacity; Stmt* body; } FunctionExpr;
 typedef struct { Token struct_name; Token* field_names; Expr** field_values; int field_count; int field_capacity; } StructInstExpr;
 typedef struct { Expr* condition; Expr* then_expr; Expr* else_expr; } TernaryExpr;
 typedef struct { Expr* target; } PreIncExpr;
@@ -152,7 +133,6 @@ typedef struct {
 
 struct Param {
     Token name;
-    TypeSpecifier* type;
 };
 
 typedef struct {
@@ -161,7 +141,6 @@ typedef struct {
     int param_count;
     int param_capacity;
     Stmt* body;
-    TypeSpecifier* return_type;
     ObjFunction* function;
 } FuncDeclStmt;
 
@@ -184,7 +163,6 @@ typedef struct {
 
 typedef struct {
     Token name;
-    TypeSpecifier* type;
     Expr* initializer;
 } VarDecl;
 
@@ -254,9 +232,6 @@ struct Stmt {
     } as;
 };
 
-TypeSpecifier* new_simple_type_spec(VM* vm, Token token);
-TypeSpecifier* new_list_type_spec(VM* vm, TypeSpecifier* element_type, Expr* size);
-void free_type_spec(VM* vm, TypeSpecifier* spec);
 
 Expr* new_assign_expr(VM* vm, Expr* target, Expr* value);
 Expr* new_binary_expr(VM* vm, Expr* left, Token operator, Expr* right);
@@ -270,7 +245,7 @@ Expr* new_variable_expr(VM* vm, Token name);
 Expr* new_list_expr(VM* vm, Expr** elements, int count, int capacity, Token bracket);
 Expr* new_subscript_expr(VM* vm, Expr* object, Token bracket, Expr* index);
 Expr* new_map_expr(VM* vm, Expr** keys, Expr** values, int count, int capacity, Token brace);
-Expr* new_function_expr(VM* vm, Param* params, int param_count, int param_capacity, Stmt* body, TypeSpecifier* return_type, Token token);
+Expr* new_function_expr(VM* vm, Param* params, int param_count, int param_capacity, Stmt* body, Token token);
 Expr* new_struct_inst_expr(VM* vm, Token struct_name, Token* field_names, Expr** field_values, int field_count, int field_capacity, Token brace);
 Expr* new_ternary_expr(VM* vm, Expr* condition, Expr* then_expr, Expr* else_expr);
 Expr* new_pre_inc_expr(VM* vm, Expr* target, Token token);
@@ -291,7 +266,7 @@ Stmt* new_for_stmt(VM* vm, Stmt* initializer, Expr* condition, Expr* increment, 
 Stmt* new_break_stmt(VM* vm, Token keyword);
 Stmt* new_continue_stmt(VM* vm, Token keyword);
 Stmt* new_print_stmt(VM* vm, Expr* expression, Token keyword);
-Stmt* new_func_decl_stmt(VM* vm, Token name, Param* params, int param_count, int param_capacity, Stmt* body, TypeSpecifier* return_type);
+Stmt* new_func_decl_stmt(VM* vm, Token name, Param* params, int param_count, int param_capacity, Stmt* body);
 Stmt* new_return_stmt(VM* vm, Token keyword, Expr* value);
 Stmt* new_struct_decl_stmt(VM* vm, Token name, Token* fields, int field_count, int field_capacity, Token keyword);
 Stmt* new_enum_decl_stmt(VM* vm, Token name, Token* variants, int variant_count, int variant_capacity, Token keyword);
