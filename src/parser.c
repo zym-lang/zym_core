@@ -940,6 +940,7 @@ static Stmt* parse_statement(Parser* parser) {
     }
 
     Expr* expr = parse_expression(parser);
+    if (expr == NULL) return NULL;
     consume_end_of_statement(parser, "Expect ';' after expression.");
     return new_expression_stmt(parser->vm, expr);
 }
@@ -1118,6 +1119,7 @@ static Stmt* parse_for_statement(Parser* parser) {
         initializer = parse_var_declaration(parser);
     } else {
         Expr* expr = parse_expression(parser);
+        if (expr == NULL) return NULL;
         consume(parser, TOKEN_SEMICOLON, "Expect ';' after loop initializer.");
         initializer = new_expression_stmt(parser->vm, expr);
     }
@@ -1145,7 +1147,7 @@ static Stmt* parse_goto_statement(Parser* parser) {
     Token keyword = parser->previous;
     if (!check(parser, TOKEN_IDENTIFIER)) {
         error_at_current(parser, "Expect label name after 'goto'.");
-        return new_expression_stmt(parser->vm, NULL);
+        return NULL;
     }
     Token target = parser->current;
     advance(parser);
