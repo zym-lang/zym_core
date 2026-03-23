@@ -333,8 +333,6 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case CALL_SELF:     return callInstruction("CALL_SELF", instruction, offset);
         case TAIL_CALL:     return callInstruction("TAIL_CALL", instruction, offset);
         case TAIL_CALL_SELF: return callInstruction("TAIL_CALL_SELF", instruction, offset);
-        case SMART_TAIL_CALL: return callInstruction("SMART_TAIL_CALL", instruction, offset);
-        case SMART_TAIL_CALL_SELF: return callInstruction("SMART_TAIL_CALL_SELF", instruction, offset);
         case CLOSURE:       return constantInstruction("CLOSURE", chunk, instruction, offset);
         case GET_UPVALUE:   return upvalueInstruction("GET_UPVALUE", instruction, offset);
         case SET_UPVALUE:   return upvalueInstruction("SET_UPVALUE", instruction, offset);

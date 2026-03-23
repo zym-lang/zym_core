@@ -296,7 +296,7 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             callee_slot = frame_base + result_reg;
@@ -389,7 +389,7 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             int absolute_slot = frame_base + result_reg;
@@ -433,7 +433,7 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             int result_slot = frame_base + result_reg;
@@ -472,7 +472,7 @@ static ZymValue cont_resume(ZymVM* vm, ZymValue context, ZymValue continuation, 
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             resume_result_slot = frame_base + result_reg;
@@ -560,7 +560,7 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             int result_slot = frame_base + result_reg;
@@ -613,7 +613,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             int absolute_slot = frame_base + result_reg;
@@ -655,7 +655,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             callee_slot = frame_base + result_reg;

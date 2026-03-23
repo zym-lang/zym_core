@@ -128,7 +128,7 @@ static ZymValue preempt_withDisabled(ZymVM* vm, ZymValue context, ZymValue fn) {
         int opcode = prev_instr & 0xFF;
 
         if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF || opcode == SMART_TAIL_CALL || opcode == SMART_TAIL_CALL_SELF) {
+            opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
             int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
             callee_slot = frame_base + result_reg;

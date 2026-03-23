@@ -984,25 +984,18 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
 
     // Determine if this tail call can be verified safe at compile-time
     bool compile_time_safe = false;
-    bool use_smart_fallback = false;
 
-    // Try to verify safety at compile-time (for SAFE and SMART modes)
-    if (compiler->tco_mode == TCO_SAFE || compiler->tco_mode == TCO_SMART) {
+    // Try to verify safety at compile-time (for SAFE mode)
+    if (compiler->tco_mode == TCO_SAFE) {
         // Can only verify safety for variable calls (not arr[0], obj.method, etc.)
         if (callee->type == EXPR_VARIABLE) {
             Token* name = &callee->as.variable.name;
             compile_time_safe = is_tco_compile_time_safe(compiler, name, arg_count);
         }
 
-        // If not compile-time safe, decide what to do based on mode
+        // SAFE mode: Can't verify at compile-time, so don't optimize
         if (!compile_time_safe) {
-            if (compiler->tco_mode == TCO_SAFE) {
-                // SAFE mode: Can't verify at compile-time, so don't optimize
-                return false;
-            } else {
-                // SMART mode: Can't verify at compile-time, use runtime check
-                use_smart_fallback = true;
-            }
+            return false;
         }
     }
     // TCO_AGGRESSIVE: Optimize any call expression
@@ -1066,25 +1059,11 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     }
     ZYM_FREE(&compiler->vm->allocator, temp_regs, sizeof(int) * arg_count);
 
-    // Emit appropriate tail call instruction
-    if (use_smart_fallback) {
-        // Smart mode fallback: couldn't verify at compile-time, use runtime check
-        if (is_self_call) {
-            emit_instruction(compiler, PACK_ABx(SMART_TAIL_CALL_SELF, call_base, arg_count), line);
-        } else {
-            emit_instruction(compiler, PACK_ABx(SMART_TAIL_CALL, call_base, arg_count), line);
-        }
-        // IMPORTANT: After SMART_TAIL_CALL, if it falls back to normal call,
-        // execution continues to the next instruction. We need to return the result.
-        // The result will be in call_base (R0), so emit a RET for that register.
-        emit_instruction(compiler, PACK_ABx(RET, call_base, 0), line);
+    // Emit tail call instruction
+    if (is_self_call) {
+        emit_instruction(compiler, PACK_ABx(TAIL_CALL_SELF, call_base, arg_count), line);
     } else {
-        // Compile-time verified safe OR aggressive mode: direct tail call
-        if (is_self_call) {
-            emit_instruction(compiler, PACK_ABx(TAIL_CALL_SELF, call_base, arg_count), line);
-        } else {
-            emit_instruction(compiler, PACK_ABx(TAIL_CALL, call_base, arg_count), line);
-        }
+        emit_instruction(compiler, PACK_ABx(TAIL_CALL, call_base, arg_count), line);
     }
 
     return true;
@@ -2705,8 +2684,6 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 Token arg = dir->argument;
                 if (arg.length == 10 && memcmp(arg.start, "aggressive", 10) == 0) {
                     compiler->tco_mode = TCO_AGGRESSIVE;
-                } else if (arg.length == 5 && memcmp(arg.start, "smart", 5) == 0) {
-                    compiler->tco_mode = TCO_SMART;
                 } else if (arg.length == 4 && memcmp(arg.start, "safe", 4) == 0) {
                     compiler->tco_mode = TCO_SAFE;
                 } else if (arg.length == 3 && memcmp(arg.start, "off", 3) == 0) {
@@ -4192,8 +4169,6 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
                 Token arg = dir->argument;
                 if (arg.length == 10 && memcmp(arg.start, "aggressive", 10) == 0) {
                     compiler.tco_mode = TCO_AGGRESSIVE;
-                } else if (arg.length == 5 && memcmp(arg.start, "smart", 5) == 0) {
-                    compiler.tco_mode = TCO_SMART;
                 } else if (arg.length == 4 && memcmp(arg.start, "safe", 4) == 0) {
                     compiler.tco_mode = TCO_SAFE;
                 } else if (arg.length == 3 && memcmp(arg.start, "off", 3) == 0) {

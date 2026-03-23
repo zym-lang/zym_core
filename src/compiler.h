@@ -19,7 +19,6 @@ typedef struct ObjEnumSchema ObjEnumSchema;
 typedef enum {
     TCO_OFF,        // No tail call optimization
     TCO_SAFE,       // Only optimize pure self-recursion (no captured upvalues)
-    TCO_SMART,      // Runtime check: TCO if callee has no upvalues
     TCO_AGGRESSIVE  // Optimize any return <call-expr> in tail position
 } TcoMode;
 

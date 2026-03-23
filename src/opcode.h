@@ -90,8 +90,6 @@ typedef enum {
     CALL_SELF,              // Call current function (recursive call optimization)
     TAIL_CALL,
     TAIL_CALL_SELF,         // Tail call to current function (recursive TCO)
-    SMART_TAIL_CALL,        // Tail call with runtime upvalue check
-    SMART_TAIL_CALL_SELF,   // Smart tail call to current function
     RET,
 
     // Branch-Compare Opcodes (compare and jump if true)
