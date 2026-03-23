@@ -150,14 +150,9 @@ typedef struct {
     Stmt* body;
 } ForStmt;
 
-typedef enum {
-    PARAM_NORMAL
-} ParamQualifier;
-
 struct Param {
     Token name;
     TypeSpecifier* type;
-    ParamQualifier qualifier;
 };
 
 typedef struct {
@@ -187,15 +182,10 @@ typedef struct {
     Token argument;
 } CompilerDirectiveStmt;
 
-typedef enum {
-    VAR_NORMAL
-} VarQualifier;
-
 typedef struct {
     Token name;
     TypeSpecifier* type;
     Expr* initializer;
-    VarQualifier qualifier;
 } VarDecl;
 
 typedef struct {

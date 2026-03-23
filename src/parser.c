@@ -393,7 +393,6 @@ static Expr* grouping(Parser* parser, bool can_assign) {
             advance(parser);
             params[param_count].name = parser->previous;
             params[param_count].type = NULL;
-            params[param_count].qualifier = PARAM_NORMAL;
 
             if (match(parser, TOKEN_COLON)) {
                 params[param_count].type = parse_type_specifier(parser);
@@ -791,12 +790,9 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
                 param_capacity = GROW_CAPACITY(old_capacity);
                 params = GROW_ARRAY(parser->vm, Param, params, old_capacity, param_capacity);
             }
-            ParamQualifier qualifier = PARAM_NORMAL;
-
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-            params[param_count].qualifier = qualifier;
 
             if (match(parser, TOKEN_COLON)) {
                 params[param_count].type = parse_type_specifier(parser);
@@ -867,7 +863,6 @@ static Stmt* parse_var_declaration(Parser* parser) {
         }
 
         Expr* initializer = NULL;
-        VarQualifier qualifier = VAR_NORMAL;
         if (match(parser, TOKEN_EQUAL)) {
             initializer = parse_expression(parser);
         }
@@ -875,7 +870,6 @@ static Stmt* parse_var_declaration(Parser* parser) {
         variables[count].name = name;
         variables[count].type = type;
         variables[count].initializer = initializer;
-        variables[count].qualifier = qualifier;
         count++;
     } while (match(parser, TOKEN_COMMA));
 
@@ -912,12 +906,9 @@ static Stmt* function(Parser* parser, const char* kind) {
                 params = GROW_ARRAY(parser->vm, Param, params, old_capacity, param_capacity);
             }
 
-            ParamQualifier qualifier = PARAM_NORMAL;
-
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-            params[param_count].qualifier = qualifier;
 
             if (match(parser, TOKEN_COLON)) {
                 params[param_count].type = parse_type_specifier(parser);
