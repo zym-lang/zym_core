@@ -2,7 +2,7 @@
 #include <stdlib.h>
 
 #include "preemption.h"
-#include "../zym.h"
+#include "zym/zym.h"
 #include "../gc.h"
 #include "../object.h"
 #include "../table.h"

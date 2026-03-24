@@ -136,7 +136,7 @@ static void compiler_error(Compiler* compiler, int line, const char* format, ...
             snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
         }
 
-        compiler->vm->error_callback(compiler->vm, 1, file, line, full_buf, compiler->vm->error_user_data);
+        compiler->vm->error_callback(compiler->vm, ZYM_STATUS_COMPILE_ERROR, file, line, full_buf, compiler->vm->error_user_data);
     } else {
         if (compiler->current_module_name) {
             fprintf(stderr, "[%.*s] line %d: ",
@@ -4257,7 +4257,7 @@ cleanup_on_error:
     // Report compilation status
     if (!success) {
         if (vm->error_callback) {
-            vm->error_callback(vm, 1, NULL, -1, "Compilation failed with errors.", vm->error_user_data);
+            vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, NULL, -1, "Compilation failed with errors.", vm->error_user_data);
         } else {
             fprintf(stderr, "\nCompilation failed with errors.\n");
         }

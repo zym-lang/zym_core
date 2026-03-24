@@ -19,7 +19,7 @@
 #include "./gc.h"
 #include "./memory.h"
 
-#include "./zym.h"
+#include "zym/zym.h"
 
 // =============================================================================
 // VM LIFECYCLE
@@ -53,7 +53,7 @@ const ZymAllocator* zym_getAllocator(ZymVM* vm)
 // ERROR CALLBACK
 // =============================================================================
 
-void zym_setErrorCallback(ZymVM* vm, ErrorCallback callback, void* user_data)
+void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data)
 {
     if (vm == NULL) return;
     vm->error_callback = callback;

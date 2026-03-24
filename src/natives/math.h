@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // Math functions - Basic arithmetic
 ZymValue nativeMath_abs(ZymVM* vm, ZymValue value);

@@ -5,7 +5,7 @@
 #include "continuation.h"
 #include "../memory.h"
 #include "../gc.h"
-#include "../zym.h"
+#include "zym/zym.h"
 #include "../table.h"
 #include "../opcode.h"
 

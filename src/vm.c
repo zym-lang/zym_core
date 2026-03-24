@@ -13,7 +13,7 @@
 #include "./ast.h"
 #include "./gc.h"
 #include "./native.h"
-#include "./zym.h"
+#include "zym/zym.h"
 #include "./modules/continuation.h"
 #include "./modules/core_modules.h"
 
@@ -242,7 +242,7 @@ void runtimeError(VM* vm, const char* format, ...) {
             pos += snprintf(full_buf + pos, sizeof(full_buf) - pos, " (called from %.*s)\n", caller_len, caller_name);
         }
 
-        vm->error_callback(vm, 2, err_file, err_line, full_buf, vm->error_user_data);
+        vm->error_callback(vm, ZYM_STATUS_RUNTIME_ERROR, err_file, err_line, full_buf, vm->error_user_data);
     } else {
         // Default: write to stderr (original behavior)
         fprintf(stderr, "%s\n", msg_buf);

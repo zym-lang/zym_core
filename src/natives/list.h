@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // List manipulation native functions
 ZymValue nativeList_push(ZymVM* vm, ZymValue list, ZymValue value);

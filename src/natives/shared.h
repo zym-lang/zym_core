@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // Shared functions (work with both lists and strings)
 ZymValue nativeShared_length(ZymVM* vm, ZymValue value);

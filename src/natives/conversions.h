@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // Conversion functions
 ZymValue nativeConversions_num(ZymVM* vm, ZymValue value);

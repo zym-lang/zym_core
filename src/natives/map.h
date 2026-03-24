@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // Map manipulation native functions
 ZymValue nativeMap_size(ZymVM* vm, ZymValue map);

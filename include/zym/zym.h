@@ -10,6 +10,7 @@
 // =============================================================================
 
 #include "../../src/allocator.h"
+#include "../../src/config.h"
 
 // =============================================================================
 // CORE TYPES
@@ -19,17 +20,6 @@ typedef struct VM ZymVM;
 typedef struct Chunk ZymChunk;
 typedef struct LineMap ZymLineMap;
 typedef uint64_t ZymValue;
-
-typedef struct CompilerConfig {
-    bool include_line_info;
-} ZymCompilerConfig;
-
-typedef enum {
-    ZYM_STATUS_OK,
-    ZYM_STATUS_COMPILE_ERROR,
-    ZYM_STATUS_RUNTIME_ERROR,
-    ZYM_STATUS_YIELD
-} ZymStatus;
 
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
 #define ZYM_ERROR ((ZymValue)0x7ff8000000000005ULL)

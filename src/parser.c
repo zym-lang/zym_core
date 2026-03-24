@@ -173,7 +173,7 @@ static void error_at_current(Parser* parser, const char* message) {
         if (parser->current_module_name) {
             file = parser->current_module_name;
         }
-        parser->vm->error_callback(parser->vm, 1, file, line, buf, parser->vm->error_user_data);
+        parser->vm->error_callback(parser->vm, ZYM_STATUS_COMPILE_ERROR, file, line, buf, parser->vm->error_user_data);
     } else {
         if (parser->current_module_name) {
             char* decoded = decodeModulePath(&parser->vm->allocator, parser->current_module_name, parser->module_name_length);
@@ -1290,7 +1290,7 @@ AstResult parse(VM* vm, const char* source, const LineMap* line_map, const char*
 
     if (parser.had_error) {
         if (vm->error_callback) {
-            vm->error_callback(vm, 1, NULL, -1, "Compilation aborted due to parse errors.", vm->error_user_data);
+            vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, NULL, -1, "Compilation aborted due to parse errors.", vm->error_user_data);
         } else {
             fprintf(stderr, "\nCompilation aborted due to parse errors.\n");
         }

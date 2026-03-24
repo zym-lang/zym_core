@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // Error handling native functions
 ZymValue nativeError_error(ZymVM* vm, ZymValue message);

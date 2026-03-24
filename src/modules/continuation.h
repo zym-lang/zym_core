@@ -3,7 +3,7 @@
 #include "../vm.h"
 #include "../object.h"
 #include "../value.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 bool pushPrompt(VM* vm, ObjPromptTag* tag);
 void popPrompt(VM* vm);

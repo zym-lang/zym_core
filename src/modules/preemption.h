@@ -2,7 +2,7 @@
 
 #include "../vm.h"
 #include "../value.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 void preemptionEnable(VM* vm);
 void preemptionDisable(VM* vm);

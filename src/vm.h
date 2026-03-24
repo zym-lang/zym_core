@@ -66,8 +66,8 @@ typedef struct {
 } WithPromptContext;
 
 // Error callback: if set, error messages are routed here instead of stderr.
-// type: 1 = compile error, 2 = runtime error (matches ZymStatus values)
-typedef void (*ErrorCallback)(struct VM* vm, int type, const char* file,
+// type: ZYM_STATUS_COMPILE_ERROR or ZYM_STATUS_RUNTIME_ERROR
+typedef void (*ErrorCallback)(struct VM* vm, ZymStatus type, const char* file,
                               int line, const char* message, void* user_data);
 
 typedef struct VM {

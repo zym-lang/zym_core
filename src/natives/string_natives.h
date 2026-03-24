@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../vm.h"
-#include "../zym.h"
+#include "zym/zym.h"
 
 // String manipulation native functions
 ZymValue nativeString_charAt(ZymVM* vm, ZymValue str, ZymValue indexVal);
