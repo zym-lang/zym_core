@@ -180,6 +180,7 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         dst->stack_base = restore_base + original_offset;
     }
     vm->frame_count += cont->frame_count;
+    vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
 
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
@@ -356,6 +357,7 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
 
+    vm->cur_base = callee_slot;
     vm->chunk = function->chunk;
     vm->ip = function->chunk->code;
 

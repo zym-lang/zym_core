@@ -367,7 +367,7 @@ int disassembleInstruction(Chunk* chunk, int offset) {
             uint8_t b = REG_B(instruction);
             uint32_t ci = chunk->code[offset + 1];
             ObjString* key = AS_STRING(chunk->constants.values[ci]);
-            printf("%-16s R%d, R%d, @%d(\"%.*s\")\n", "GET_MAP_PROP_L", a, b, ci, key->length, key->chars);
+            printf("%-16s R%d, R%d, @%lu(\"%.*s\")\n", "GET_MAP_PROP_L", a, b, ci, key->length, key->chars);
             return offset + 2;
         }
         case SET_MAP_PROPERTY_L: {
@@ -375,7 +375,7 @@ int disassembleInstruction(Chunk* chunk, int offset) {
             uint8_t c = REG_C(instruction);
             uint32_t ci = chunk->code[offset + 1];
             ObjString* key = AS_STRING(chunk->constants.values[ci]);
-            printf("%-16s R%d, @%d(\"%.*s\"), R%d\n", "SET_MAP_PROP_L", a, ci, key->length, key->chars, c);
+            printf("%-16s R%d, @%lu(\"%.*s\"), R%d\n", "SET_MAP_PROP_L", a, ci, key->length, key->chars, c);
             return offset + 2;
         }
         case GET_STRUCT_FIELD_IC: {

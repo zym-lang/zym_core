@@ -177,6 +177,7 @@ static ZymValue preempt_withDisabled(ZymVM* vm, ZymValue context, ZymValue fn) {
     frame->caller_chunk = vm->chunk;
     frame->flags = FRAME_FLAG_DISABLE_PREEMPT;
 
+    vm->cur_base = callee_slot;
     vm->chunk = function->chunk;
     vm->ip = function->chunk->code;
 

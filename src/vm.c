@@ -43,6 +43,7 @@ void initVM(VM* vm) {
     vm->chunk = NULL;
     vm->ip = NULL;
     vm->frame_count = 0;
+    vm->cur_base = 0;
 
     vm->objects = NULL;
     vm->bytes_allocated = 0;
@@ -400,6 +401,7 @@ void unwindFrames(VM* vm, int new_frame_count) {
             vm->preemption_disable_depth--;
         }
     }
+    vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
 
     while (vm->with_prompt_depth > 0 &&
            vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
@@ -533,6 +535,7 @@ static bool pushPreemptFrame(VM* vm) {
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_PREEMPT;
 
+    vm->cur_base = callee_slot;
     vm->chunk = function->chunk;
     vm->ip = function->chunk->code;
 
@@ -680,7 +683,7 @@ static InterpretResult run(VM* vm) {
     } \
     goto *dispatch_table[OPCODE(*vm->ip++)]; \
 } while(0)
-#define CUR_BASE() (vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base)
+#define CUR_BASE() (vm->cur_base)
 #define BINARY_OP(op) \
     do { \
         uint32_t instr = vm->ip[-1]; \
@@ -2412,6 +2415,7 @@ static InterpretResult run(VM* vm) {
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
 
+        vm->cur_base = callee_slot;
         // Enter callee
         vm->chunk = function->chunk;
         vm->ip = function->chunk->code;
@@ -2459,6 +2463,7 @@ static InterpretResult run(VM* vm) {
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
 
+        vm->cur_base = callee_slot;
         vm->ip = function->chunk->code;
         DISPATCH();
     }
@@ -2516,6 +2521,7 @@ static InterpretResult run(VM* vm) {
             CallFrame* frame = &vm->frames[vm->frame_count - 1];
             closeUpvalues(vm, &vm->stack[frame->stack_base]);
             vm->frame_count--;
+            vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
 
             if (vm->with_prompt_depth > 0) {
                 WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
@@ -2641,6 +2647,7 @@ static InterpretResult run(VM* vm) {
 
         // Now pop the callee frame
         vm->frame_count--;
+        vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
 
         if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
             vm->preemption_disable_depth--;
@@ -3680,8 +3687,10 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     frame->ip           = vm->api_trampoline.code;
     frame->caller_chunk = &vm->api_trampoline;
 
+    vm->cur_base = frame_base;
     uint32_t* saved_ip = vm->ip;
     Chunk* saved_chunk = vm->chunk;
+    int saved_cur_base = vm->cur_base;
 
     // Enter the callee
     vm->chunk = function->chunk;
@@ -3691,6 +3700,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     vm->ip    = saved_ip;
     vm->chunk = saved_chunk;
+    vm->cur_base = saved_cur_base;
 
     // Result is placed in stack[frame_base] by OP(RET); expose that at API top.
     vm->api_stack_top = frame_base;

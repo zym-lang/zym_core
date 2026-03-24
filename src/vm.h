@@ -85,6 +85,7 @@ typedef struct VM {
 
     CallFrame frames[FRAMES_MAX];
     int frame_count;
+    int cur_base;
 
     Obj* objects;
     ObjUpvalue* open_upvalues;
