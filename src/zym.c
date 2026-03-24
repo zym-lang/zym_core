@@ -895,12 +895,7 @@ ZymValue zym_structGet(ZymVM* vm, ZymValue structVal, const char* fieldName) {
     ObjStructInstance* inst = AS_STRUCT_INSTANCE(structVal);
     ObjString* fieldStr = copyString(vm, fieldName, (int)strlen(fieldName));
 
-    Value indexVal;
-    if (!tableGet(inst->schema->field_to_index, fieldStr, &indexVal)) {
-        return ZYM_ERROR;
-    }
-
-    int index = (int)AS_DOUBLE(indexVal);
+    int index = find_field_index(inst->schema, fieldStr);
     if (index < 0 || index >= inst->field_count) return ZYM_ERROR;
 
     return inst->fields[index];
@@ -911,12 +906,7 @@ bool zym_structSet(ZymVM* vm, ZymValue structVal, const char* fieldName, ZymValu
     ObjStructInstance* inst = AS_STRUCT_INSTANCE(structVal);
     ObjString* fieldStr = copyString(vm, fieldName, (int)strlen(fieldName));
 
-    Value indexVal;
-    if (!tableGet(inst->schema->field_to_index, fieldStr, &indexVal)) {
-        return false;
-    }
-
-    int index = (int)AS_DOUBLE(indexVal);
+    int index = find_field_index(inst->schema, fieldStr);
     if (index < 0 || index >= inst->field_count) return false;
 
     inst->fields[index] = val;

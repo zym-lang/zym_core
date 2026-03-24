@@ -469,13 +469,6 @@ static void blackenObject(VM* vm, Obj* object) {
                     }
                 }
             }
-            if (schema->field_to_index) {
-                #ifdef GC_DEBUG_FULL
-                printf("  Marking field_to_index table: %p\n", (void*)schema->field_to_index);
-                fflush(stdout);
-                #endif
-                markTable(vm, schema->field_to_index);
-            }
             break;
         }
 
@@ -674,10 +667,6 @@ void freeObject(VM* vm, Obj* object) {
             ObjStructSchema* schema = (ObjStructSchema*)object;
             if (schema->field_names) {
                 FREE_ARRAY(vm, ObjString*, schema->field_names, schema->field_count);
-            }
-            if (schema->field_to_index) {
-                freeTable(vm, schema->field_to_index);
-                FREE(vm, Table, schema->field_to_index);
             }
             FREE(vm, ObjStructSchema, object);
             break;

@@ -170,18 +170,7 @@ ObjStructSchema* newStructSchema(VM* vm, ObjString* name, ObjString** field_name
     schema->name = name;
     schema->field_count = field_count;
     schema->field_names = field_names;
-    schema->field_to_index = NULL;
 
-    pushTempRoot(vm, (Obj*)schema);
-
-    schema->field_to_index = ALLOCATE(vm, Table, 1);
-    initTable(schema->field_to_index);
-
-    for (int i = 0; i < field_count; i++) {
-        tableSet(vm, schema->field_to_index, field_names[i], DOUBLE_VAL((double)i));
-    }
-
-    popTempRoot(vm);
     return schema;
 }
 

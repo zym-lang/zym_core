@@ -161,8 +161,17 @@ typedef struct ObjStructSchema {
     ObjString* name;
     int field_count;
     ObjString** field_names;
-    Table* field_to_index;
 } ObjStructSchema;
+
+// Fast field index lookup using interned string pointer comparison.
+// For typical struct sizes (2-10 fields), a linear scan of pointer
+// comparisons is faster than a hash table lookup.
+static inline int find_field_index(ObjStructSchema* schema, ObjString* name) {
+    for (int i = 0; i < schema->field_count; i++) {
+        if (schema->field_names[i] == name) return i;
+    }
+    return -1;
+}
 
 typedef struct ObjStructInstance {
     Obj obj;

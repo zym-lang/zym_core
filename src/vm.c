@@ -3070,10 +3070,9 @@ static InterpretResult run(VM* vm) {
         if (IS_STRUCT_INSTANCE(container_val)) {
             ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
 
-            // Look up field by name
-            Value index_val;
-            if (tableGet(instance->schema->field_to_index, key_str, &index_val)) {
-                int field_index = (int)AS_DOUBLE(index_val);
+            // Fast field lookup using pointer comparison on interned strings
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
                 vm->stack[a] = instance->fields[field_index];
             } else {
                 runtimeError(vm, "Struct '%s' has no field '%s'.",
@@ -3120,11 +3119,9 @@ static InterpretResult run(VM* vm) {
         if (IS_STRUCT_INSTANCE(container_val)) {
             ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
 
-            // Look up field by name
-            Value index_val;
-            if (tableGet(instance->schema->field_to_index, key_str, &index_val)) {
-                int field_index = (int)AS_DOUBLE(index_val);
-
+            // Fast field lookup using pointer comparison on interned strings
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
                 instance->fields[field_index] = value_val;
             } else {
                 runtimeError(vm, "Struct '%s' has no field '%s'.",

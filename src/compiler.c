@@ -2137,13 +2137,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             // If we know the struct type at compile time, emit direct field access
             if (schema) {
-                // Look up field index
-                Value index_val;
                 ObjString* field_name = copyString(compiler->vm, get_expr->name.start, get_expr->name.length);
                 pushTempRoot(compiler->vm, (Obj*)field_name);
-                if (tableGet(schema->field_to_index, field_name, &index_val)) {
-                    int field_index = (int)AS_DOUBLE(index_val);
-
+                int field_index = find_field_index(schema, field_name);
+                if (field_index >= 0) {
                     // If we already have obj_reg from local lookup, use it
                     if (obj_reg == -1) {
                         obj_reg = alloc_temp(compiler);
@@ -2152,6 +2149,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                     // Emit direct struct field access
                     emit_instruction(compiler, PACK_ABC(GET_STRUCT_FIELD, target_reg, obj_reg, field_index), expr->line);
+                    popTempRoot(compiler->vm);
                     restore_temp_top_preserve(compiler, saved_top, target_reg);
                     break;
                 }
@@ -2208,13 +2206,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             // If we know the struct type at compile time, emit direct field access
             if (schema) {
-                // Look up field index
-                Value index_val;
                 ObjString* field_name = copyString(compiler->vm, set_expr->name.start, set_expr->name.length);
                 pushTempRoot(compiler->vm, (Obj*)field_name);
-                if (tableGet(schema->field_to_index, field_name, &index_val)) {
-                    int field_index = (int)AS_DOUBLE(index_val);
-
+                int field_index = find_field_index(schema, field_name);
+                if (field_index >= 0) {
                     // If we already have obj_reg from local lookup, use it
                     if (obj_reg == -1) {
                         obj_reg = alloc_temp(compiler);
@@ -2230,6 +2225,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // The result of an assignment is the assigned value
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
 
+                    popTempRoot(compiler->vm);
                     restore_temp_top_preserve(compiler, saved_top, target_reg);
                     break;
                 }
