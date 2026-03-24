@@ -175,21 +175,20 @@ ObjStructSchema* newStructSchema(VM* vm, ObjString* name, ObjString** field_name
 }
 
 ObjStructInstance* newStructInstance(VM* vm, ObjStructSchema* schema) {
-    ObjStructInstance* instance = ALLOCATE_OBJ(vm, ObjStructInstance, OBJ_STRUCT_INSTANCE);
+    // Single allocation: instance header + fields array in one contiguous block.
+    // Eliminates a second heap allocation and improves cache locality.
+    size_t size = sizeof(ObjStructInstance) + sizeof(Value) * schema->field_count;
+    ObjStructInstance* instance = (ObjStructInstance*)allocateObject(vm, size, OBJ_STRUCT_INSTANCE);
 
     instance->schema = schema;
     instance->field_count = schema->field_count;
-    instance->fields = NULL;
-
-    pushTempRoot(vm, (Obj*)instance);
-
-    instance->fields = ALLOCATE(vm, Value, schema->field_count);
+    // Fields are stored immediately after the struct header
+    instance->fields = (Value*)(instance + 1);
 
     for (int i = 0; i < schema->field_count; i++) {
         instance->fields[i] = NULL_VAL;
     }
 
-    popTempRoot(vm);
     return instance;
 }
 

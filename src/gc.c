@@ -674,10 +674,9 @@ void freeObject(VM* vm, Obj* object) {
 
         case OBJ_STRUCT_INSTANCE: {
             ObjStructInstance* instance = (ObjStructInstance*)object;
-            if (instance->fields && instance->field_count > 0) {
-                FREE_ARRAY(vm, Value, instance->fields, instance->field_count);
-            }
-            FREE(vm, ObjStructInstance, object);
+            // Single allocation: instance + fields are one contiguous block
+            size_t size = sizeof(ObjStructInstance) + sizeof(Value) * instance->field_count;
+            reallocate(vm, object, size, 0);
             break;
         }
 
