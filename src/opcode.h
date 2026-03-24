@@ -144,8 +144,12 @@ typedef enum {
     NEW_MAP,
     MAP_SET,
     MAP_SPREAD,          // Spread map into another map (Ra = target map, Rb = source to spread)
-    GET_MAP_PROPERTY,
-    SET_MAP_PROPERTY,
+    //GET_MAP_PROPERTY,
+    //SET_MAP_PROPERTY,
+    GET_MAP_PROPERTY_L,  // Ra = container[Rb].key_ptr64 - key string inlined in trailing 2 words
+    SET_MAP_PROPERTY_L,  // container[Ra].key_ptr64 = Rc - key string inlined in trailing 2 words
+    GET_STRUCT_FIELD_IC, // IC: Ra = struct[Rb].field[C], key_ptr64 as guard in trailing 2 words
+    SET_STRUCT_FIELD_IC, // IC: struct[Ra].field[B] = Rc, key_ptr64 as guard in trailing 2 words
 
     // Dispatcher Opcodes (for overloaded function returns)
     NEW_DISPATCHER,

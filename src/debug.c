@@ -360,8 +360,38 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case NEW_MAP:       return reg_instruction_a("NEW_MAP", instruction, offset);
         case MAP_SET:       return reg_instruction_abc("MAP_SET", instruction, offset);
         case MAP_SPREAD:    return reg2_instruction("MAP_SPREAD", chunk, offset);
-        case GET_MAP_PROPERTY: return reg_instruction_abc("GET_MAP_PROPERTY", instruction, offset);
-        case SET_MAP_PROPERTY: return reg_instruction_abc("SET_MAP_PROPERTY", instruction, offset);
+        //case GET_MAP_PROPERTY: return reg_instruction_abc("GET_MAP_PROPERTY", instruction, offset);
+        //case SET_MAP_PROPERTY: return reg_instruction_abc("SET_MAP_PROPERTY", instruction, offset);
+        case GET_MAP_PROPERTY_L: {
+            uint8_t a = REG_A(instruction);
+            uint8_t b = REG_B(instruction);
+            uint32_t ci = chunk->code[offset + 1];
+            ObjString* key = AS_STRING(chunk->constants.values[ci]);
+            printf("%-16s R%d, R%d, @%d(\"%.*s\")\n", "GET_MAP_PROP_L", a, b, ci, key->length, key->chars);
+            return offset + 2;
+        }
+        case SET_MAP_PROPERTY_L: {
+            uint8_t a = REG_A(instruction);
+            uint8_t c = REG_C(instruction);
+            uint32_t ci = chunk->code[offset + 1];
+            ObjString* key = AS_STRING(chunk->constants.values[ci]);
+            printf("%-16s R%d, @%d(\"%.*s\"), R%d\n", "SET_MAP_PROP_L", a, ci, key->length, key->chars, c);
+            return offset + 2;
+        }
+        case GET_STRUCT_FIELD_IC: {
+            uint8_t a = REG_A(instruction);
+            uint8_t b = REG_B(instruction);
+            uint8_t c = REG_C(instruction);
+            printf("%-16s R%d, R%d, field[%d]\n", "GET_FIELD_IC", a, b, c);
+            return offset + 2;
+        }
+        case SET_STRUCT_FIELD_IC: {
+            uint8_t a = REG_A(instruction);
+            uint8_t b = REG_B(instruction);
+            uint8_t c = REG_C(instruction);
+            printf("%-16s R%d, field[%d], R%d\n", "SET_FIELD_IC", a, b, c);
+            return offset + 2;
+        }
         case NEW_DISPATCHER: return reg_instruction_a("NEW_DISPATCHER", instruction, offset);
         case ADD_OVERLOAD:   return reg2_instruction("ADD_OVERLOAD", chunk, offset);
         case NEW_STRUCT: return constantInstruction("NEW_STRUCT", chunk, instruction, offset);

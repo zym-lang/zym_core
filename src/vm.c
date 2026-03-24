@@ -647,8 +647,12 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(NEW_MAP),
         JUMP_ENTRY(MAP_SET),
         JUMP_ENTRY(MAP_SPREAD),
-        JUMP_ENTRY(GET_MAP_PROPERTY),
-        JUMP_ENTRY(SET_MAP_PROPERTY),
+        //JUMP_ENTRY(GET_MAP_PROPERTY),
+        //JUMP_ENTRY(SET_MAP_PROPERTY),
+        JUMP_ENTRY(GET_MAP_PROPERTY_L),
+        JUMP_ENTRY(SET_MAP_PROPERTY_L),
+        JUMP_ENTRY(GET_STRUCT_FIELD_IC),
+        JUMP_ENTRY(SET_STRUCT_FIELD_IC),
         JUMP_ENTRY(NEW_DISPATCHER),
         JUMP_ENTRY(ADD_OVERLOAD),
         JUMP_ENTRY(NEW_STRUCT),
@@ -3049,7 +3053,7 @@ static InterpretResult run(VM* vm) {
         runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
         return INTERPRET_RUNTIME_ERROR;
     }
-    OP(GET_MAP_PROPERTY) {
+    /*OP(GET_MAP_PROPERTY) {
         uint32_t instr = vm->ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
         int b = CUR_BASE() + REG_B(instr); // Container register (map or struct)
@@ -3096,8 +3100,8 @@ static InterpretResult run(VM* vm) {
             vm->stack[a] = NULL_VAL;
         }
         DISPATCH();
-    }
-    OP(SET_MAP_PROPERTY) {
+    }*/
+    /*OP(SET_MAP_PROPERTY) {
         uint32_t instr = vm->ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Container register (map or struct)
         int b = CUR_BASE() + REG_B(instr); // Key register (must be a string)
@@ -3140,6 +3144,194 @@ static InterpretResult run(VM* vm) {
         ObjMap* map = AS_MAP(container_val);
 
         // Normal set/delete
+        if (IS_NULL(value_val)) {
+            tableDelete(map->table, key_str);
+        } else {
+            tableSet(vm, map->table, key_str, value_val);
+        }
+        DISPATCH();
+    }*/
+    OP(GET_MAP_PROPERTY_L) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int b = CUR_BASE() + REG_B(instr);
+
+        // Read key string from constant pool via trailing index word
+        uint32_t const_idx = *vm->ip++;
+        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+
+        Value container_val = vm->stack[b];
+
+        // Handle struct instances
+        if (IS_STRUCT_INSTANCE(container_val)) {
+            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
+                vm->stack[a] = instance->fields[field_index];
+
+                // Self-patch: bake field_index into C, switch to IC opcode
+                vm->ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
+                DISPATCH();
+            }
+            runtimeError(vm, "Struct '%s' has no field '%s'.",
+                         instance->schema->name->chars, key_str->chars);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        // Handle maps
+        if (!IS_MAP(container_val)) {
+            runtimeError(vm, ERR_ONLY_MAPS);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        ObjMap* map = AS_MAP(container_val);
+        Value result;
+        if (tableGet(map->table, key_str, &result)) {
+            vm->stack[a] = result;
+        } else {
+            vm->stack[a] = NULL_VAL;
+        }
+        DISPATCH();
+    }
+    OP(SET_MAP_PROPERTY_L) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int c = CUR_BASE() + REG_C(instr);
+
+        // Read key string from constant pool via trailing index word
+        uint32_t const_idx = *vm->ip++;
+        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+
+        Value container_val = vm->stack[a];
+        Value value_val = vm->stack[c];
+
+        // Handle struct instances
+        if (IS_STRUCT_INSTANCE(container_val)) {
+            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
+                instance->fields[field_index] = value_val;
+
+                // Self-patch: bake field_index into B, switch to IC opcode
+                vm->ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
+                DISPATCH();
+            }
+            runtimeError(vm, "Struct '%s' has no field '%s'.",
+                         instance->schema->name->chars, key_str->chars);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        // Handle maps
+        if (!IS_MAP(container_val)) {
+            runtimeError(vm, ERR_ONLY_MAPS);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        ObjMap* map = AS_MAP(container_val);
+        if (IS_NULL(value_val)) {
+            tableDelete(map->table, key_str);
+        } else {
+            tableSet(vm, map->table, key_str, value_val);
+        }
+        DISPATCH();
+    }
+    OP(GET_STRUCT_FIELD_IC) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int b = CUR_BASE() + REG_B(instr);
+        int cached_field = REG_C(instr);
+
+        // Read key from constant pool via trailing index word
+        uint32_t const_idx = *vm->ip++;
+        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+
+        Value container_val = vm->stack[b];
+
+        if (IS_STRUCT_INSTANCE(container_val)) {
+            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
+
+            // IC hit: verify cached field index maps to the expected field name
+            if (cached_field < instance->field_count &&
+                instance->schema->field_names[cached_field] == key_str) {
+                vm->stack[a] = instance->fields[cached_field];
+                DISPATCH();
+            }
+
+            // IC miss: full lookup, re-cache
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
+                vm->ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
+                vm->stack[a] = instance->fields[field_index];
+                DISPATCH();
+            }
+            runtimeError(vm, "Struct '%s' has no field '%s'.",
+                         instance->schema->name->chars, key_str->chars);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        // Not a struct: revert to _L and handle as map
+        vm->ip[-2] = (uint32_t)(GET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16);
+
+        // Handle maps inline (avoid re-dispatch overhead)
+        if (!IS_MAP(container_val)) {
+            runtimeError(vm, ERR_ONLY_MAPS);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        ObjMap* map = AS_MAP(container_val);
+        Value result;
+        if (tableGet(map->table, key_str, &result)) {
+            vm->stack[a] = result;
+        } else {
+            vm->stack[a] = NULL_VAL;
+        }
+        DISPATCH();
+    }
+    OP(SET_STRUCT_FIELD_IC) {
+        uint32_t instr = vm->ip[-1];
+        int a = CUR_BASE() + REG_A(instr);
+        int cached_field = REG_B(instr);
+        int c = CUR_BASE() + REG_C(instr);
+
+        // Read key from constant pool via trailing index word
+        uint32_t const_idx = *vm->ip++;
+        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+
+        Value container_val = vm->stack[a];
+        Value value_val = vm->stack[c];
+
+        if (IS_STRUCT_INSTANCE(container_val)) {
+            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
+
+            // IC hit: verify cached field index maps to the expected field name
+            if (cached_field < instance->field_count &&
+                instance->schema->field_names[cached_field] == key_str) {
+                instance->fields[cached_field] = value_val;
+                DISPATCH();
+            }
+
+            // IC miss: full lookup, re-cache
+            int field_index = find_field_index(instance->schema, key_str);
+            if (field_index >= 0) {
+                vm->ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
+                instance->fields[field_index] = value_val;
+                DISPATCH();
+            }
+            runtimeError(vm, "Struct '%s' has no field '%s'.",
+                         instance->schema->name->chars, key_str->chars);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        // Not a struct: revert to _L and handle as map
+        vm->ip[-2] = (uint32_t)(SET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_C(instr) << 24);
+
+        // Handle maps inline
+        if (!IS_MAP(container_val)) {
+            runtimeError(vm, ERR_ONLY_MAPS);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+
+        ObjMap* map = AS_MAP(container_val);
         if (IS_NULL(value_val)) {
             tableDelete(map->table, key_str);
         } else {

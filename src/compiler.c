@@ -2162,12 +2162,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 COMPILE_REQUIRED(compiler, get_expr->object, obj_reg);
             }
 
-            // Convert the identifier to a string constant
+            // Inline key constant index in trailing word (saves LOAD_CONST + register)
             int key_const = identifier_constant(compiler, &get_expr->name);
-            int key_reg = alloc_temp(compiler);
-            emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
-
-            emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY, target_reg, obj_reg, key_reg), expr->line);
+            emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY_L, target_reg, obj_reg, 0), expr->line);
+            writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
         }
@@ -2238,15 +2236,14 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 COMPILE_REQUIRED(compiler, set_expr->object, obj_reg);
             }
 
-            // Convert the identifier to a string constant
+            // Inline key constant index in trailing word (saves LOAD_CONST + register)
             int key_const = identifier_constant(compiler, &set_expr->name);
-            int key_reg = alloc_temp(compiler);
-            emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
 
             int value_reg = alloc_temp(compiler);
             COMPILE_REQUIRED(compiler, set_expr->value, value_reg);
 
-            emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, value_reg), expr->line);
+            emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, value_reg), expr->line);
+            writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
 
             // The result of an assignment is the assigned value
             EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
@@ -2335,18 +2332,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int obj_reg = alloc_temp(compiler);
                 COMPILE_REQUIRED(compiler, get->object, obj_reg);
                 int key_const = identifier_constant(compiler, &get->name);
-                int key_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY, val_reg, obj_reg, key_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY_L, val_reg, obj_reg, 0), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
 
                 // Increment in place
                 emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, val_reg, 0), expr->line);
 
                 // Set back
-                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, target_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
                 compiler_error_and_exit(expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
             }
@@ -2404,18 +2401,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int obj_reg = alloc_temp(compiler);
                 COMPILE_REQUIRED(compiler, get->object, obj_reg);
                 int key_const = identifier_constant(compiler, &get->name);
-                int key_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY, val_reg, obj_reg, key_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY_L, val_reg, obj_reg, 0), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
 
                 // Post-increment: returns old value, increments val_reg
                 emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, val_reg, 0), expr->line);
 
                 // Set incremented value back
-                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, val_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
                 compiler_error_and_exit(expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
             }
@@ -2471,18 +2468,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int obj_reg = alloc_temp(compiler);
                 compile_expression(compiler, get->object, obj_reg);
                 int key_const = identifier_constant(compiler, &get->name);
-                int key_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY, val_reg, obj_reg, key_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY_L, val_reg, obj_reg, 0), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
 
                 // Decrement in place
                 emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, val_reg, 0), expr->line);
 
                 // Set back
-                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, target_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
                 compiler_error_and_exit(expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
             }
@@ -2540,18 +2537,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int obj_reg = alloc_temp(compiler);
                 compile_expression(compiler, get->object, obj_reg);
                 int key_const = identifier_constant(compiler, &get->name);
-                int key_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABx(LOAD_CONST, key_reg, key_const), expr->line);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY, val_reg, obj_reg, key_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(GET_MAP_PROPERTY_L, val_reg, obj_reg, 0), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
 
                 // Post-decrement: returns old value, decrements val_reg
                 emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, val_reg, 0), expr->line);
 
                 // Set decremented value back
-                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY, obj_reg, key_reg, val_reg), expr->line);
+                emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
+                writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
                 compiler_error_and_exit(expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
             }
