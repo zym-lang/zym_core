@@ -888,14 +888,14 @@ static InterpretResult run(VM* vm) {
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
         Value va = vm->stack[a];
 
-
-        bool result = false;
-        if (IS_DOUBLE(va)) {
-            result = (AS_DOUBLE(va) == (double)imm);
-        } else if (IS_BOOL(va)) {
-            result = (AS_BOOL(va) == (imm != 0));
-        } else if (IS_NULL(va)) {
-            result = (imm == 0);
+        Value imm_val = DOUBLE_VAL((double)imm);
+        bool result = (va == imm_val);
+        if (!result) {
+            if (imm == 0) {
+                result = (va == 0) || (va == NULL_VAL) || (va == FALSE_VAL);
+            } else if (IS_BOOL(va)) {
+                result = (AS_BOOL(va) == (imm != 0));
+            }
         }
 
         vm->stack[a] = BOOL_VAL(result);
@@ -910,7 +910,7 @@ static InterpretResult run(VM* vm) {
 
 
         bool result = false;
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             result = (AS_DOUBLE(va) > (double)imm);
         }
 
@@ -926,7 +926,7 @@ static InterpretResult run(VM* vm) {
 
 
         bool result = false;
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             result = (AS_DOUBLE(va) < (double)imm);
         }
 
@@ -940,14 +940,14 @@ static InterpretResult run(VM* vm) {
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
         Value va = vm->stack[a];
 
-
-        bool result = true;
-        if (IS_DOUBLE(va)) {
-            result = (AS_DOUBLE(va) != (double)imm);
-        } else if (IS_BOOL(va)) {
-            result = (AS_BOOL(va) != (imm != 0));
-        } else if (IS_NULL(va)) {
-            result = (imm != 0);
+        Value imm_val = DOUBLE_VAL((double)imm);
+        bool result = (va != imm_val);
+        if (result) {
+            if (imm == 0) {
+                result = (va != 0) && (va != NULL_VAL) && (va != FALSE_VAL);
+            } else if (IS_BOOL(va)) {
+                result = (AS_BOOL(va) != (imm != 0));
+            }
         }
 
         vm->stack[a] = BOOL_VAL(result);
@@ -962,7 +962,7 @@ static InterpretResult run(VM* vm) {
 
 
         bool result = false;
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             result = (AS_DOUBLE(va) <= (double)imm);
         }
 
@@ -978,7 +978,7 @@ static InterpretResult run(VM* vm) {
 
 
         bool result = false;
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             result = (AS_DOUBLE(va) >= (double)imm);
         }
 
@@ -993,19 +993,20 @@ static InterpretResult run(VM* vm) {
         int b = CUR_BASE() + REG_B(instr);
         uint32_t low = *vm->ip++;
         uint32_t high = *vm->ip++;
-        uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
-        double literal;
-        memcpy(&literal, &bits, sizeof(double));
+        Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
 
         Value vb = vm->stack[b];
 
-        bool result = false;
-        if (IS_DOUBLE(vb)) {
-            result = (AS_DOUBLE(vb) == literal);
-        } else if (IS_BOOL(vb)) {
-            result = (AS_BOOL(vb) == (literal != 0.0));
-        } else if (IS_NULL(vb)) {
-            result = (literal == 0.0);
+        bool result = (vb == literal_val);
+        if (!result) {
+            if (literal_val == 0) {
+                result = (vb == 0) || (vb == NULL_VAL) || (vb == FALSE_VAL);
+            } else if (IS_DOUBLE(vb) && IS_DOUBLE(literal_val)) {
+                result = (AS_DOUBLE(vb) == AS_DOUBLE(literal_val));
+            } else if (IS_BOOL(vb)) {
+                double literal; memcpy(&literal, &literal_val, sizeof(double));
+                result = (AS_BOOL(vb) == (literal != 0.0));
+            }
         }
 
         vm->stack[a] = BOOL_VAL(result);
@@ -1024,7 +1025,7 @@ static InterpretResult run(VM* vm) {
         Value vb = vm->stack[b];
 
         bool result = false;
-        if (IS_DOUBLE(vb)) {
+        if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) > literal);
         }
 
@@ -1044,7 +1045,7 @@ static InterpretResult run(VM* vm) {
         Value vb = vm->stack[b];
 
         bool result = false;
-        if (IS_DOUBLE(vb)) {
+        if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) < literal);
         }
 
@@ -1057,19 +1058,20 @@ static InterpretResult run(VM* vm) {
         int b = CUR_BASE() + REG_B(instr);
         uint32_t low = *vm->ip++;
         uint32_t high = *vm->ip++;
-        uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
-        double literal;
-        memcpy(&literal, &bits, sizeof(double));
+        Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
 
         Value vb = vm->stack[b];
 
-        bool result = true;
-        if (IS_DOUBLE(vb)) {
-            result = (AS_DOUBLE(vb) != literal);
-        } else if (IS_BOOL(vb)) {
-            result = (AS_BOOL(vb) != (literal != 0.0));
-        } else if (IS_NULL(vb)) {
-            result = (literal != 0.0);
+        bool result = (vb != literal_val);
+        if (result) {
+            if (literal_val == 0) {
+                result = (vb != 0) && (vb != NULL_VAL) && (vb != FALSE_VAL);
+            } else if (IS_DOUBLE(vb) && IS_DOUBLE(literal_val)) {
+                result = (AS_DOUBLE(vb) != AS_DOUBLE(literal_val));
+            } else if (IS_BOOL(vb)) {
+                double literal; memcpy(&literal, &literal_val, sizeof(double));
+                result = (AS_BOOL(vb) != (literal != 0.0));
+            }
         }
 
         vm->stack[a] = BOOL_VAL(result);
@@ -1088,7 +1090,7 @@ static InterpretResult run(VM* vm) {
         Value vb = vm->stack[b];
 
         bool result = false;
-        if (IS_DOUBLE(vb)) {
+        if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) <= literal);
         }
 
@@ -1108,7 +1110,7 @@ static InterpretResult run(VM* vm) {
         Value vb = vm->stack[b];
 
         bool result = false;
-        if (IS_DOUBLE(vb)) {
+        if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) >= literal);
         }
 
@@ -1876,8 +1878,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
         Value vb = vm->stack[b];
 
-
-        if (value_equals(va, vb)) {
+        if (va == vb || (IS_DOUBLE(va) && IS_DOUBLE(vb) && AS_DOUBLE(va) == AS_DOUBLE(vb))) {
             vm->ip += off;
         }
         DISPATCH();
@@ -1890,8 +1891,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
         Value vb = vm->stack[b];
 
-
-        if (!value_equals(va, vb)) {
+        if (va != vb && !(IS_DOUBLE(va) && IS_DOUBLE(vb) && AS_DOUBLE(va) == AS_DOUBLE(vb))) {
             vm->ip += off;
         }
         DISPATCH();
@@ -1983,14 +1983,14 @@ static InterpretResult run(VM* vm) {
         off = sign_extend_16(off);
         Value va = vm->stack[a];
 
-
-        bool matches = false;
-        if (IS_DOUBLE(va)) {
-            matches = (AS_DOUBLE(va) == (double)imm);
-        } else if (IS_BOOL(va)) {
-            matches = (AS_BOOL(va) == (imm != 0));
-        } else if (IS_NULL(va)) {
-            matches = (imm == 0);
+        Value imm_val = DOUBLE_VAL((double)imm);
+        bool matches = (va == imm_val);
+        if (!matches) {
+            if (imm == 0) {
+                matches = (va == 0) || (va == NULL_VAL) || (va == FALSE_VAL);
+            } else if (IS_BOOL(va)) {
+                matches = (AS_BOOL(va) == (imm != 0));
+            }
         }
 
         if (matches) {
@@ -2007,14 +2007,14 @@ static InterpretResult run(VM* vm) {
         off = sign_extend_16(off);
         Value va = vm->stack[a];
 
-
-        bool matches = true;
-        if (IS_DOUBLE(va)) {
-            matches = (AS_DOUBLE(va) != (double)imm);
-        } else if (IS_BOOL(va)) {
-            matches = (AS_BOOL(va) != (imm != 0));
-        } else if (IS_NULL(va)) {
-            matches = (imm != 0);
+        Value imm_val = DOUBLE_VAL((double)imm);
+        bool matches = (va != imm_val);
+        if (matches) {
+            if (imm == 0) {
+                matches = (va != 0) && (va != NULL_VAL) && (va != FALSE_VAL);
+            } else if (IS_BOOL(va)) {
+                matches = (AS_BOOL(va) != (imm != 0));
+            }
         }
 
         if (matches) {
@@ -2032,7 +2032,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) < (double)imm) {
                 vm->ip += off;
             }
@@ -2052,7 +2052,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) <= (double)imm) {
                 vm->ip += off;
             }
@@ -2072,7 +2072,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) > (double)imm) {
                 vm->ip += off;
             }
@@ -2092,7 +2092,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) >= (double)imm) {
                 vm->ip += off;
             }
@@ -2109,21 +2109,21 @@ static InterpretResult run(VM* vm) {
         int a = CUR_BASE() + REG_A(instr);
         uint32_t low = *vm->ip++;
         uint32_t high = *vm->ip++;
-        uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
-        double literal;
-        memcpy(&literal, &bits, sizeof(double));
+        Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
         int32_t off = *vm->ip++;
         off = sign_extend_16(off);
         Value va = vm->stack[a];
 
-
-        bool matches = false;
-        if (IS_DOUBLE(va)) {
-            matches = (AS_DOUBLE(va) == literal);
-        } else if (IS_BOOL(va)) {
-            matches = (AS_BOOL(va) == (literal != 0.0));
-        } else if (IS_NULL(va)) {
-            matches = (literal == 0.0);
+        bool matches = (va == literal_val);
+        if (!matches) {
+            if (literal_val == 0) {
+                matches = (va == 0) || (va == NULL_VAL) || (va == FALSE_VAL);
+            } else if (IS_DOUBLE(va) && IS_DOUBLE(literal_val)) {
+                matches = (AS_DOUBLE(va) == AS_DOUBLE(literal_val));
+            } else if (IS_BOOL(va)) {
+                double literal; memcpy(&literal, &literal_val, sizeof(double));
+                matches = (AS_BOOL(va) == (literal != 0.0));
+            }
         }
 
         if (matches) {
@@ -2136,21 +2136,21 @@ static InterpretResult run(VM* vm) {
         int a = CUR_BASE() + REG_A(instr);
         uint32_t low = *vm->ip++;
         uint32_t high = *vm->ip++;
-        uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
-        double literal;
-        memcpy(&literal, &bits, sizeof(double));
+        Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
         int32_t off = *vm->ip++;
         off = sign_extend_16(off);
         Value va = vm->stack[a];
 
-
-        bool matches = true;
-        if (IS_DOUBLE(va)) {
-            matches = (AS_DOUBLE(va) != literal);
-        } else if (IS_BOOL(va)) {
-            matches = (AS_BOOL(va) != (literal != 0.0));
-        } else if (IS_NULL(va)) {
-            matches = (literal != 0.0);
+        bool matches = (va != literal_val);
+        if (matches) {
+            if (literal_val == 0) {
+                matches = (va != 0) && (va != NULL_VAL) && (va != FALSE_VAL);
+            } else if (IS_DOUBLE(va) && IS_DOUBLE(literal_val)) {
+                matches = (AS_DOUBLE(va) != AS_DOUBLE(literal_val));
+            } else if (IS_BOOL(va)) {
+                double literal; memcpy(&literal, &literal_val, sizeof(double));
+                matches = (AS_BOOL(va) != (literal != 0.0));
+            }
         }
 
         if (matches) {
@@ -2171,7 +2171,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) < literal) {
                 vm->ip += off;
             }
@@ -2194,7 +2194,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) <= literal) {
                 vm->ip += off;
             }
@@ -2217,7 +2217,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) > literal) {
                 vm->ip += off;
             }
@@ -2240,7 +2240,7 @@ static InterpretResult run(VM* vm) {
         Value va = vm->stack[a];
 
 
-        if (IS_DOUBLE(va)) {
+        if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) >= literal) {
                 vm->ip += off;
             }
