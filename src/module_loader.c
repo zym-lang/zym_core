@@ -625,7 +625,8 @@ static void stack_push(ImportStack* stack, const char* module) {
 
 static void stack_pop(ImportStack* stack) {
     if (stack->count > 0) {
-        ZYM_FREE_STR(stack->alloc, stack->modules[--stack->count]);
+        stack->count--;
+        ZYM_FREE_STR(stack->alloc, stack->modules[stack->count]);
     }
 }
 
@@ -958,8 +959,6 @@ static char* transform_imports(ZymAllocator* alloc, const char* source, const ch
 
                 ZYM_FREE(alloc, symbol, symbol_len + 1);
             }
-
-            p++;
         } else {
             p++;
         }

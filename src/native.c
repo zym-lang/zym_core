@@ -367,40 +367,8 @@ static const char* parseIdentifier(const char* str, char* out, int max_len) {
     return str;
 }
 
-static const char* parseQualifier(const char* str, uint8_t* out_qualifier) {
-    str = skipWhitespace(str);
-
-    char qualifier[16];
-    const char* start = str;
-    int i = 0;
-    while (*str && isalpha((unsigned char)*str) && i < 15) {
-        qualifier[i++] = *str++;
-    }
-    qualifier[i] = '\0';
-
-    if (strcmp(qualifier, "ref") == 0) {
-        *out_qualifier = PARAM_REF;
-        return str;
-    } else if (strcmp(qualifier, "val") == 0) {
-        *out_qualifier = PARAM_VAL;
-        return str;
-    } else if (strcmp(qualifier, "slot") == 0) {
-        *out_qualifier = PARAM_SLOT;
-        return str;
-    } else if (strcmp(qualifier, "clone") == 0) {
-        *out_qualifier = PARAM_CLONE;
-        return str;
-    } else if (strcmp(qualifier, "typeof") == 0) {
-        *out_qualifier = PARAM_TYPEOF;
-        return str;
-    }
-
-    *out_qualifier = PARAM_NORMAL;
-    return start;
-}
-
-bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_name, int* out_arity, uint8_t** out_qualifiers) {
-    if (!signature || !out_name || !out_arity || !out_qualifiers) {
+bool parseNativeSignature(const char* signature, char* out_name, int* out_arity) {
+    if (!signature || !out_name || !out_arity) {
         return false;
     }
 
@@ -418,8 +386,6 @@ bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_
     ptr++;
 
     int arity = 0;
-    uint8_t temp_qualifiers[MAX_NATIVE_ARITY];
-    memset(temp_qualifiers, 0, sizeof(temp_qualifiers));
 
     ptr = skipWhitespace(ptr);
     if (*ptr != ')') {
@@ -428,10 +394,6 @@ bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_
                 fprintf(stderr, "Native function signature parse error: too many parameters (max %d)\n", MAX_NATIVE_ARITY);
                 return false;
             }
-
-            uint8_t qualifier = PARAM_NORMAL;
-            ptr = parseQualifier(ptr, &qualifier);
-            temp_qualifiers[arity] = qualifier;
 
             char param_name[256];
             ptr = skipWhitespace(ptr);
@@ -462,39 +424,25 @@ bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_
 
     *out_arity = arity;
 
-    if (arity > 0) {
-        *out_qualifiers = (uint8_t*)ZYM_ALLOC(alloc, arity * sizeof(uint8_t));
-        if (!*out_qualifiers) {
-            fprintf(stderr, "Native function signature parse error: memory allocation failed\n");
-            return false;
-        }
-        memcpy(*out_qualifiers, temp_qualifiers, arity * sizeof(uint8_t));
-    } else {
-        *out_qualifiers = NULL;
-    }
-
     return true;
 }
 
 bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
     char func_name[256];
     int arity;
-    uint8_t* qualifiers = NULL;
 
-    if (!parseNativeSignature(&vm->allocator, signature, func_name, &arity, &qualifiers)) {
+    if (!parseNativeSignature(signature, func_name, &arity)) {
         return false;
     }
 
     if (arity > MAX_NATIVE_ARITY) {
         fprintf(stderr, "Native function '%s' has too many parameters (max %d)\n", func_name, MAX_NATIVE_ARITY);
-        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return false;
     }
 
     NativeDispatcher dispatcher = getNativeDispatcher(arity);
     if (!dispatcher) {
         fprintf(stderr, "No dispatcher available for arity %d\n", arity);
-        if (qualifiers) ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
         return false;
     }
 
@@ -506,11 +454,6 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
 
     ObjNativeFunction* native = newNativeFunction(vm, name_obj, arity, func_ptr, dispatcher);
     pushTempRoot(vm, (Obj*)native);
-
-    if (arity > 0 && qualifiers) {
-        memcpy(native->param_qualifiers, qualifiers, arity * sizeof(uint8_t));
-        ZYM_FREE(&vm->allocator, qualifiers, arity * sizeof(uint8_t));
-    }
 
     tableSet(vm, &vm->globals, name_obj, OBJ_VAL(native));
     popTempRoot(vm);

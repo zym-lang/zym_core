@@ -407,16 +407,6 @@ static void blackenObject(VM* vm, Obj* object) {
             break;
         }
 
-        case OBJ_NATIVE_REFERENCE: {
-            ObjNativeReference* native_ref = (ObjNativeReference*)object;
-            #ifdef GC_DEBUG_FULL
-            printf("  Blackening native reference: context=%p\n",
-                   (void*)AS_OBJ(native_ref->context));
-            fflush(stdout);
-            #endif
-            markValue(vm, native_ref->context);
-            break;
-        }
 
         case OBJ_CLOSURE: {
             ObjClosure* closure = (ObjClosure*)object;
@@ -449,36 +439,6 @@ static void blackenObject(VM* vm, Obj* object) {
             break;
         }
 
-        case OBJ_REFERENCE: {
-            ObjReference* ref = (ObjReference*)object;
-
-            switch (ref->ref_type) {
-                case REF_LOCAL:
-                    if (ref->as.local.location != NULL) {
-                        markValue(vm, *ref->as.local.location);
-                    }
-                    break;
-
-                case REF_GLOBAL:
-                    markObject(vm, (Obj*)ref->as.global.global_name);
-                    break;
-
-                case REF_INDEX:
-                    markValue(vm, ref->as.index.container);
-                    markValue(vm, ref->as.index.index);
-                    break;
-
-                case REF_PROPERTY:
-                    markValue(vm, ref->as.property.container);
-                    markValue(vm, ref->as.property.key);
-                    break;
-
-                case REF_UPVALUE:
-                    markObject(vm, (Obj*)ref->as.upvalue.upvalue);
-                    break;
-            }
-            break;
-        }
 
         case OBJ_DISPATCHER: {
             ObjDispatcher* dispatcher = (ObjDispatcher*)object;
@@ -646,18 +606,12 @@ void freeObject(VM* vm, Obj* object) {
                 }
                 FREE(vm, Chunk, function->chunk);
             }
-            if (function->param_qualifiers && function->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, function->param_qualifiers, function->arity);
-            }
             FREE(vm, ObjFunction, object);
             break;
         }
 
         case OBJ_NATIVE_FUNCTION: {
             ObjNativeFunction* native = (ObjNativeFunction*)object;
-            if (native->param_qualifiers && native->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, native->param_qualifiers, native->arity);
-            }
             FREE(vm, ObjNativeFunction, object);
             break;
         }
@@ -673,17 +627,10 @@ void freeObject(VM* vm, Obj* object) {
 
         case OBJ_NATIVE_CLOSURE: {
             ObjNativeClosure* closure = (ObjNativeClosure*)object;
-            if (closure->param_qualifiers && closure->arity > 0) {
-                FREE_ARRAY(vm, uint8_t, closure->param_qualifiers, closure->arity);
-            }
             FREE(vm, ObjNativeClosure, object);
             break;
         }
 
-        case OBJ_NATIVE_REFERENCE: {
-            FREE(vm, ObjNativeReference, object);
-            break;
-        }
 
         case OBJ_CLOSURE: {
             ObjClosure* closure = (ObjClosure*)object;
@@ -717,9 +664,6 @@ void freeObject(VM* vm, Obj* object) {
             break;
         }
 
-        case OBJ_REFERENCE:
-            FREE(vm, ObjReference, object);
-            break;
 
         case OBJ_DISPATCHER: {
             FREE(vm, ObjDispatcher, object);

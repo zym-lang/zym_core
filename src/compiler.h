@@ -19,7 +19,6 @@ typedef struct ObjEnumSchema ObjEnumSchema;
 typedef enum {
     TCO_OFF,        // No tail call optimization
     TCO_SAFE,       // Only optimize pure self-recursion (no captured upvalues)
-    TCO_SMART,      // Runtime check: TCO if callee has no upvalues
     TCO_AGGRESSIVE  // Optimize any return <call-expr> in tail position
 } TcoMode;
 
@@ -29,12 +28,7 @@ typedef struct {
     int depth;
     int reg;
     bool is_initialized;
-    bool is_reference;      // true if this local holds a reference (either param or object)
-    bool is_ref_param;      // true if this is a ref parameter (auto-dereference on read)
-    bool is_slot_param;     // true if this is a slot parameter (direct variable binding)
     bool is_captured;       // true if this local is captured by an inner closure as an upvalue
-    int deref_cache_reg;    // if >= 0, a register holding the cached dereferenced value for ref params
-    int ref_target_reg;     // if is_reference is true, which register does it reference?
     ObjStructSchema* struct_type; // if this local holds a struct instance, this is its schema (NULL otherwise)
 } Local;
 
@@ -47,7 +41,6 @@ typedef struct {
 typedef struct {
     Token name;
     int arity;
-    uint8_t* param_qualifiers;  // Array of ParamQualifier values, dynamically allocated
     int upvalue_count;
 } HoistedFn;
 

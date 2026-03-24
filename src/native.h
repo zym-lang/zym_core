@@ -62,7 +62,7 @@ typedef Value (*ZymNativeClosure24)(VM* vm, Value context, Value a, Value b, Val
 typedef Value (*ZymNativeClosure25)(VM* vm, Value context, Value a, Value b, Value c, Value d, Value e, Value f, Value g, Value h, Value i, Value j, Value k, Value l, Value m, Value n, Value o, Value p, Value q, Value r, Value s, Value t, Value u, Value v, Value w, Value x, Value y);
 typedef Value (*ZymNativeClosure26)(VM* vm, Value context, Value a, Value b, Value c, Value d, Value e, Value f, Value g, Value h, Value i, Value j, Value k, Value l, Value m, Value n, Value o, Value p, Value q, Value r, Value s, Value t, Value u, Value v, Value w, Value x, Value y, Value z);
 
-bool parseNativeSignature(ZymAllocator* alloc, const char* signature, char* out_name, int* out_arity, uint8_t** out_qualifiers);
+bool parseNativeSignature(const char* signature, char* out_name, int* out_arity);
 NativeDispatcher getNativeDispatcher(int arity);
 NativeDispatcher getNativeClosureDispatcher(int arity);
 bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr);

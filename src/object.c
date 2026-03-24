@@ -78,8 +78,6 @@ ObjFunction* newFunction(VM* vm) {
     function->max_regs = 1;
     function->name = NULL;
     function->module_name = NULL;
-    function->param_qualifiers = NULL;
-    function->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
     function->chunk = NULL;
 
     pushTempRoot(vm, (Obj*)function);
@@ -98,18 +96,6 @@ ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* f
     native->arity = arity;
     native->func_ptr = func_ptr;
     native->dispatcher = dispatcher;
-    native->param_qualifiers = NULL;
-    native->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
-
-    if (arity > 0) {
-        pushTempRoot(vm, (Obj*)native);
-        native->param_qualifiers = ALLOCATE(vm, uint8_t, arity);
-        for (int i = 0; i < arity; i++) {
-            native->param_qualifiers[i] = 0;
-        }
-        popTempRoot(vm);
-    }
-
     return native;
 }
 
@@ -128,29 +114,9 @@ ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* fun
     closure->func_ptr = func_ptr;
     closure->dispatcher = dispatcher;
     closure->context = context;
-    closure->param_qualifiers = NULL;
-    closure->qualifier_sig = QUAL_SIG_ALL_NORMAL;  // Default: check for refs to deref
-
-    if (arity > 0) {
-        pushTempRoot(vm, (Obj*)closure);
-        closure->param_qualifiers = ALLOCATE(vm, uint8_t, arity);
-        for (int i = 0; i < arity; i++) {
-            closure->param_qualifiers[i] = 0;
-        }
-        popTempRoot(vm);
-    }
-
     return closure;
 }
 
-ObjNativeReference* newNativeReference(VM* vm, Value context, size_t value_offset, NativeRefGetHook get_hook, NativeRefSetHook set_hook) {
-    ObjNativeReference* ref = ALLOCATE_OBJ(vm, ObjNativeReference, OBJ_NATIVE_REFERENCE);
-    ref->context = context;
-    ref->value_offset = value_offset;
-    ref->get_hook = get_hook;
-    ref->set_hook = set_hook;
-    return ref;
-}
 
 ObjClosure* newClosure(VM* vm, ObjFunction* function) {
     ObjUpvalue** upvalues = NULL;
@@ -197,49 +163,6 @@ ObjDispatcher* newDispatcher(VM* vm) {
     return dispatcher;
 }
 
-ObjReference* newReference(VM* vm, Value* location) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_LOCAL;
-    ref->as.local.location = location;
-    return ref;
-}
-
-ObjReference* newStackSlotReference(VM* vm, int slot_index) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_LOCAL;
-    ref->as.local.location = &vm->stack[slot_index];
-    return ref;
-}
-
-ObjReference* newGlobalReference(VM* vm, ObjString* global_name) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_GLOBAL;
-    ref->as.global.global_name = global_name;
-    return ref;
-}
-
-ObjReference* newIndexReference(VM* vm, Value container, Value index) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_INDEX;
-    ref->as.index.container = container;
-    ref->as.index.index = index;
-    return ref;
-}
-
-ObjReference* newPropertyReference(VM* vm, Value container, Value key) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_PROPERTY;
-    ref->as.property.container = container;
-    ref->as.property.key = key;
-    return ref;
-}
-
-ObjReference* newUpvalueReference(VM* vm, ObjUpvalue* upvalue) {
-    ObjReference* ref = ALLOCATE_OBJ(vm, ObjReference, OBJ_REFERENCE);
-    ref->ref_type = REF_UPVALUE;
-    ref->as.upvalue.upvalue = upvalue;
-    return ref;
-}
 
 ObjStructSchema* newStructSchema(VM* vm, ObjString* name, ObjString** field_names, int field_count) {
     ObjStructSchema* schema = ALLOCATE_OBJ(vm, ObjStructSchema, OBJ_STRUCT_SCHEMA);
@@ -368,33 +291,6 @@ void printObject(Value value) {
             const char* state_str = cont->state == CONT_VALID ? "valid" :
                                     cont->state == CONT_CONSUMED ? "consumed" : "invalid";
             printf("<continuation %s, %d frames>", state_str, cont->frame_count);
-            break;
-        }
-        case OBJ_REFERENCE: {
-            ObjReference* ref = AS_REFERENCE(value);
-            printf("<ref -> ");
-            switch (ref->ref_type) {
-                case REF_LOCAL:
-                    printValue(NULL, *ref->as.local.location);
-                    break;
-                case REF_GLOBAL:
-                    printf("global '%.*s'", ref->as.global.global_name->length, ref->as.global.global_name->chars);
-                    break;
-                case REF_INDEX:
-                    printf("array[");
-                    printValue(NULL, ref->as.index.index);
-                    printf("]");
-                    break;
-                case REF_PROPERTY:
-                    printf("map.");
-                    printValue(NULL, ref->as.property.key);
-                    break;
-                case REF_UPVALUE:
-                    printf("upvalue ");
-                    printValue(NULL, *ref->as.upvalue.upvalue->location);
-                    break;
-            }
-            printf(">");
             break;
         }
         default:

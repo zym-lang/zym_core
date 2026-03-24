@@ -73,12 +73,10 @@ static Expr* list_literal(Parser* parser, bool can_assign);
 static Expr* subscript(Parser* parser, Expr* left);
 static Expr* map_literal(Parser* parser, bool can_assign);
 static Expr* function_expression(Parser* parser, bool can_assign);
-static Expr* slot_assignment(Parser* parser, bool can_assign);
 static Expr* pre_increment(Parser* parser, bool can_assign);
 static Expr* pre_decrement(Parser* parser, bool can_assign);
 static Expr* post_increment(Parser* parser, Expr* left);
 static Expr* post_decrement(Parser* parser, Expr* left);
-static Expr* typeof_expression(Parser* parser, bool can_assign);
 static Stmt* parse_block(Parser* parser);
 static Stmt* parse_if_statement(Parser* parser);
 static Stmt* parse_while_statement(Parser* parser);
@@ -89,7 +87,6 @@ static Stmt* parse_goto_statement(Parser* parser);
 static Stmt* parse_switch_statement(Parser* parser);
 static Stmt* parse_return_statement(Parser* parser);
 static Stmt* function(Parser* parser, const char* kind);
-static TypeSpecifier* parse_type_specifier(Parser* parser);
 
 static const ParseRule rules[] = {
     [TOKEN_LEFT_PAREN]    = {grouping,     call,      PREC_CALL},
@@ -118,13 +115,8 @@ static const ParseRule rules[] = {
     [TOKEN_NULL]          = {literal,      NULL,      PREC_NONE},
     [TOKEN_LEFT_BRACE]    = {map_literal,  NULL,      PREC_NONE},
     [TOKEN_FUNC]          = {function_expression, NULL, PREC_NONE},
-    [TOKEN_REF]           = {unary,        NULL,      PREC_NONE},
-    [TOKEN_SLOT]          = {slot_assignment, NULL,   PREC_NONE},
-    [TOKEN_VAL]           = {unary,        NULL,      PREC_NONE},
-    [TOKEN_CLONE]         = {unary,        NULL,      PREC_NONE},
     [TOKEN_PLUS_PLUS]     = {pre_increment, post_increment, PREC_CALL},
     [TOKEN_MINUS_MINUS]   = {pre_decrement, post_decrement, PREC_CALL},
-    [TOKEN_TYPEOF]        = {typeof_expression, NULL, PREC_NONE},
     [TOKEN_BINARY_AND]             = {NULL,         binary,    PREC_BINARY_AND},
     [TOKEN_BINARY_OR]              = {NULL,         binary,    PREC_BINARY_OR},
     [TOKEN_BINARY_XOR]             = {NULL,         binary,    PREC_BINARY_XOR},
@@ -338,7 +330,7 @@ static Expr* grouping(Parser* parser, bool can_assign) {
                 body = new_block_stmt(parser->vm, statements, 1, 1, paren);
             }
 
-            return new_function_expr(parser->vm, NULL, 0, 0, body, NULL, paren);
+            return new_function_expr(parser->vm, NULL, 0, 0, body, paren);
         }
         error_at_current(parser, "Expect expression.");
         return NULL;
@@ -355,14 +347,6 @@ static Expr* grouping(Parser* parser, bool can_assign) {
             if (parser->current.type == TOKEN_IDENTIFIER) {
                 advance(parser);
                 lookahead_depth++;
-                if (parser->current.type == TOKEN_COLON) {
-                    advance(parser);
-                    while (parser->current.type == TOKEN_IDENTIFIER ||
-                           parser->current.type == TOKEN_LEFT_BRACKET ||
-                           parser->current.type == TOKEN_RIGHT_BRACKET) {
-                        advance(parser);
-                    }
-                }
             } else if (parser->current.type == TOKEN_COMMA) {
                 advance(parser);
             }
@@ -399,12 +383,6 @@ static Expr* grouping(Parser* parser, bool can_assign) {
 
             advance(parser);
             params[param_count].name = parser->previous;
-            params[param_count].type = NULL;
-            params[param_count].qualifier = PARAM_NORMAL;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            }
 
             param_count++;
         } while (match(parser, TOKEN_COMMA));
@@ -427,7 +405,7 @@ static Expr* grouping(Parser* parser, bool can_assign) {
                     body = new_block_stmt(parser->vm, statements, 1, 1, paren);
                 }
 
-                return new_function_expr(parser->vm, params, param_count, param_capacity, body, NULL, paren);
+                return new_function_expr(parser->vm, params, param_count, param_capacity, body, paren);
             }
         }
 
@@ -536,7 +514,7 @@ static Expr* variable(Parser* parser, bool can_assign) {
     if (can_assign && match(parser, TOKEN_EQUAL)) {
         Expr* value = parse_expression(parser);
         Expr* target = new_variable_expr(parser->vm, name);
-        return new_assign_expr(parser->vm, target, value, false);
+        return new_assign_expr(parser->vm, target, value);
     }
     if (can_assign && is_compound_assign_op(parser)) {
         Token operator = parser->previous;
@@ -544,7 +522,7 @@ static Expr* variable(Parser* parser, bool can_assign) {
         Expr* target = new_variable_expr(parser->vm, name);
         Expr* get_expr = new_variable_expr(parser->vm, name);
         Expr* binary_expr = new_binary_expr(parser->vm, get_expr, operator, value);
-        return new_assign_expr(parser->vm, target, binary_expr, false);
+        return new_assign_expr(parser->vm, target, binary_expr);
     }
     return new_variable_expr(parser->vm, name);
 }
@@ -577,10 +555,6 @@ static Expr* call(Parser* parser, Expr* callee) {
             if (arg_count >= 255) {
                 error_at_current(parser, "Can't have more than 255 arguments.");
             }
-            if (parser->current.type == TOKEN_REF || parser->current.type == TOKEN_VAL) {
-                error_at_current(parser, "Cannot explicitly use 'ref' or 'val' in function call arguments.");
-                advance(parser);
-            }
             if (arg_count + 1 > arg_cap) {
                 int old_cap = arg_cap;
                 arg_cap = GROW_CAPACITY(old_cap);
@@ -610,11 +584,6 @@ static Expr* dot(Parser* parser, Expr* left) {
             case TOKEN_CONTINUE:
             case TOKEN_STRUCT:
             case TOKEN_ENUM:
-            case TOKEN_REF:
-            case TOKEN_VAL:
-            case TOKEN_CLONE:
-            case TOKEN_SLOT:
-            case TOKEN_TYPEOF:
             case TOKEN_NULL:
             case TOKEN_TRUE:
             case TOKEN_FALSE:
@@ -640,57 +609,16 @@ static Expr* dot(Parser* parser, Expr* left) {
 
     if (match(parser, TOKEN_EQUAL)) {
         Expr* value = parse_expression(parser);
-        return new_set_expr(parser->vm, left, name, value, false);
+        return new_set_expr(parser->vm, left, name, value);
     }
     if (is_compound_assign_op(parser)) {
         Token operator = parser->previous;
         Expr* value = parse_precedence(parser, PREC_TERNARY);
         Expr* get_expr = new_get_expr(parser->vm, clone_expr(parser->vm, left), name);
         Expr* binary_expr = new_binary_expr(parser->vm, get_expr, operator, value);
-        return new_set_expr(parser->vm, left, name, binary_expr, false);
+        return new_set_expr(parser->vm, left, name, binary_expr);
     }
     return new_get_expr(parser->vm, left, name);
-}
-
-static Expr* slot_assignment(Parser* parser, bool can_assign) {
-    advance(parser);
-    Token name = parser->previous;
-
-    Expr* target = new_variable_expr(parser->vm, name);
-    Expr* last_object = NULL;
-    Token last_property_name;
-    bool ends_with_property = false;
-    while (true) {
-        if (match(parser, TOKEN_DOT)) {
-            consume(parser, TOKEN_IDENTIFIER, "Expect property name after '.'.");
-            Token property = parser->previous;
-            last_object = target;
-            last_property_name = property;
-            ends_with_property = true;
-            target = new_get_expr(parser->vm, target, property);
-        } else if (match(parser, TOKEN_LEFT_BRACKET)) {
-            Expr* index = parse_expression(parser);
-            consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' after subscript index.");
-            Token bracket = parser->previous;
-            ends_with_property = false;
-            target = new_subscript_expr(parser->vm, target, bracket, index);
-        } else {
-            break;
-        }
-    }
-
-    if (!match(parser, TOKEN_EQUAL)) {
-        error_at_current(parser, "Expect '=' after 'slot' target.");
-        return target;
-    }
-
-    Expr* value = parse_expression(parser);
-
-    if (ends_with_property) {
-        return new_set_expr(parser->vm, last_object, last_property_name, value, true);
-    } else {
-        return new_assign_expr(parser->vm, target, value, true);
-    }
 }
 
 static Expr* pre_increment(Parser* parser, bool can_assign) {
@@ -713,12 +641,6 @@ static Expr* post_increment(Parser* parser, Expr* left) {
 static Expr* post_decrement(Parser* parser, Expr* left) {
     Token operator = parser->previous;
     return new_post_dec_expr(parser->vm, left, operator);
-}
-
-static Expr* typeof_expression(Parser* parser, bool can_assign) {
-    Token operator = parser->previous;
-    Expr* operand = parse_precedence(parser, PREC_UNARY);
-    return new_typeof_expr(parser->vm, operand, operator);
 }
 
 static Expr* list_literal(Parser* parser, bool can_assign) {
@@ -757,7 +679,7 @@ static Expr* subscript(Parser* parser, Expr* left) {
     if (match(parser, TOKEN_EQUAL)) {
         Expr* value = parse_expression(parser);
         Expr* target = new_subscript_expr(parser->vm, left, bracket, index);
-        return new_assign_expr(parser->vm, target, value, false);
+        return new_assign_expr(parser->vm, target, value);
     }
     if (is_compound_assign_op(parser)) {
         Token operator = parser->previous;
@@ -765,7 +687,7 @@ static Expr* subscript(Parser* parser, Expr* left) {
         Expr* get_expr = new_subscript_expr(parser->vm, clone_expr(parser->vm, left), bracket, clone_expr(parser->vm, index));
         Expr* binary_expr = new_binary_expr(parser->vm, get_expr, operator, value);
         Expr* target = new_subscript_expr(parser->vm, left, bracket, index);
-        return new_assign_expr(parser->vm, target, binary_expr, false);
+        return new_assign_expr(parser->vm, target, binary_expr);
     }
     return new_subscript_expr(parser->vm, left, bracket, index);
 }
@@ -854,70 +776,17 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
                 param_capacity = GROW_CAPACITY(old_capacity);
                 params = GROW_ARRAY(parser->vm, Param, params, old_capacity, param_capacity);
             }
-            ParamQualifier qualifier = PARAM_NORMAL;
-            if (match(parser, TOKEN_REF)) {
-                qualifier = PARAM_REF;
-            } else if (match(parser, TOKEN_VAL)) {
-                qualifier = PARAM_VAL;
-            } else if (match(parser, TOKEN_CLONE)) {
-                qualifier = PARAM_CLONE;
-            } else if (match(parser, TOKEN_SLOT)) {
-                qualifier = PARAM_SLOT;
-            } else if (match(parser, TOKEN_TYPEOF)) {
-                qualifier = PARAM_TYPEOF;
-            }
-
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-            params[param_count].qualifier = qualifier;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            } else {
-                params[param_count].type = NULL;
-            }
             param_count++;
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
 
-    TypeSpecifier* return_type = NULL;
-    if (match(parser, TOKEN_ARROW)) {
-        return_type = parse_type_specifier(parser);
-    }
-
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
-    return new_function_expr(parser->vm, params, param_count, param_capacity, body, return_type, func_token);
-}
-static TypeSpecifier* parse_type_specifier(Parser* parser) {
-    if (match(parser, TOKEN_LEFT_BRACKET)) {
-        TypeSpecifier* element_type = NULL;
-        Expr* size = NULL;
-
-        if (match(parser, TOKEN_RIGHT_BRACKET)) {
-            return new_list_type_spec(parser->vm, NULL, NULL);
-        }
-
-        element_type = parse_type_specifier(parser);
-
-        if (match(parser, TOKEN_SEMICOLON)) {
-            size = parse_expression(parser);
-        }
-
-        consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' after list type specifier.");
-        TypeSpecifier* list_type = new_list_type_spec(parser->vm, element_type, size);
-
-        while (match(parser, TOKEN_LEFT_BRACKET)) {
-            consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' for nested list type.");
-            list_type = new_list_type_spec(parser->vm, list_type, NULL);
-        }
-        return list_type;
-    }
-
-    consume(parser, TOKEN_IDENTIFIER, "Expect type name.");
-    return new_simple_type_spec(parser->vm, parser->previous);
+    return new_function_expr(parser->vm, params, param_count, param_capacity, body, func_token);
 }
 static Stmt* parse_var_declaration(Parser* parser) {
     Token keyword = parser->previous;
@@ -935,28 +804,13 @@ static Stmt* parse_var_declaration(Parser* parser) {
         consume(parser, TOKEN_IDENTIFIER, "Expect variable name.");
         Token name = parser->previous;
 
-        TypeSpecifier* type = NULL;
-        if (match(parser, TOKEN_COLON)) {
-            type = parse_type_specifier(parser);
-        }
-
         Expr* initializer = NULL;
-        VarQualifier qualifier = VAR_NORMAL;
         if (match(parser, TOKEN_EQUAL)) {
-            if (match(parser, TOKEN_REF)) {
-                qualifier = VAR_REF;
-            } else if (match(parser, TOKEN_VAL)) {
-                qualifier = VAR_VAL;
-            } else if (match(parser, TOKEN_CLONE)) {
-                qualifier = VAR_CLONE;
-            }
             initializer = parse_expression(parser);
         }
 
         variables[count].name = name;
-        variables[count].type = type;
         variables[count].initializer = initializer;
-        variables[count].qualifier = qualifier;
         count++;
     } while (match(parser, TOKEN_COMMA));
 
@@ -993,38 +847,13 @@ static Stmt* function(Parser* parser, const char* kind) {
                 params = GROW_ARRAY(parser->vm, Param, params, old_capacity, param_capacity);
             }
 
-            ParamQualifier qualifier = PARAM_NORMAL;
-            if (match(parser, TOKEN_REF)) {
-                qualifier = PARAM_REF;
-            } else if (match(parser, TOKEN_VAL)) {
-                qualifier = PARAM_VAL;
-            } else if (match(parser, TOKEN_CLONE)) {
-                qualifier = PARAM_CLONE;
-            } else if (match(parser, TOKEN_SLOT)) {
-                qualifier = PARAM_SLOT;
-            } else if (match(parser, TOKEN_TYPEOF)) {
-                qualifier = PARAM_TYPEOF;
-            }
-
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
-            params[param_count].qualifier = qualifier;
-
-            if (match(parser, TOKEN_COLON)) {
-                params[param_count].type = parse_type_specifier(parser);
-            } else {
-                params[param_count].type = NULL;
-            }
             param_count++;
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
-
-    TypeSpecifier* return_type = NULL;
-    if (match(parser, TOKEN_ARROW)) {
-        return_type = parse_type_specifier(parser);
-    }
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
@@ -1032,7 +861,7 @@ static Stmt* function(Parser* parser, const char* kind) {
     parser->current_module_name = saved_module_name;
     parser->module_name_length = saved_module_name_length;
 
-    return new_func_decl_stmt(parser->vm, name, params, param_count, param_capacity, body, return_type);
+    return new_func_decl_stmt(parser->vm, name, params, param_count, param_capacity, body);
 }
 
 static Stmt* parse_compiler_directive(Parser* parser) {
@@ -1111,6 +940,7 @@ static Stmt* parse_statement(Parser* parser) {
     }
 
     Expr* expr = parse_expression(parser);
+    if (expr == NULL) return NULL;
     consume_end_of_statement(parser, "Expect ';' after expression.");
     return new_expression_stmt(parser->vm, expr);
 }
@@ -1289,6 +1119,7 @@ static Stmt* parse_for_statement(Parser* parser) {
         initializer = parse_var_declaration(parser);
     } else {
         Expr* expr = parse_expression(parser);
+        if (expr == NULL) return NULL;
         consume(parser, TOKEN_SEMICOLON, "Expect ';' after loop initializer.");
         initializer = new_expression_stmt(parser->vm, expr);
     }
@@ -1316,7 +1147,7 @@ static Stmt* parse_goto_statement(Parser* parser) {
     Token keyword = parser->previous;
     if (!check(parser, TOKEN_IDENTIFIER)) {
         error_at_current(parser, "Expect label name after 'goto'.");
-        return new_expression_stmt(parser->vm, NULL);
+        return NULL;
     }
     Token target = parser->current;
     advance(parser);
