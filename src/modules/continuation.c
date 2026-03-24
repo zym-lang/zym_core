@@ -181,6 +181,7 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
     }
     vm->frame_count += cont->frame_count;
     vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+    vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
 
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
@@ -349,6 +350,7 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
 
     vm->with_prompt_stack[vm->with_prompt_depth].frame_boundary = vm->frame_count;
     vm->with_prompt_depth++;
+    vm->active_boundaries++;
 
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure = closure;
@@ -357,6 +359,7 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
 
+    vm->current_frame = frame;
     vm->cur_base = callee_slot;
     vm->chunk = function->chunk;
     vm->ip = function->chunk->code;
@@ -427,6 +430,7 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
     while (vm->resume_depth > 0 &&
            vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
         ResumeContext* ctx = &vm->resume_stack[--vm->resume_depth];
+        vm->active_boundaries--;
         vm->stack[ctx->result_slot] = OBJ_VAL(cont);
     }
 
@@ -493,9 +497,11 @@ static ZymValue cont_resume(ZymVM* vm, ZymValue context, ZymValue continuation, 
     vm->resume_stack[vm->resume_depth].frame_boundary = frames_before;
     vm->resume_stack[vm->resume_depth].result_slot = resume_result_slot;
     vm->resume_depth++;
+    vm->active_boundaries++;
 
     if (!resumeContinuation(vm, cont, value)) {
         vm->resume_depth--;
+        vm->active_boundaries--;
         return ZYM_ERROR;
     }
 
@@ -554,6 +560,7 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     while (vm->resume_depth > 0 &&
            vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
         ResumeContext* ctx = &vm->resume_stack[--vm->resume_depth];
+        vm->active_boundaries--;
         vm->stack[ctx->result_slot] = abort_value;
     }
 
@@ -715,6 +722,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
 
+    vm->current_frame = frame;
     vm->chunk = handler_fn->chunk;
     vm->ip = handler_fn->chunk->code;
 

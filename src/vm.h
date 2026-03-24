@@ -86,6 +86,8 @@ typedef struct VM {
     CallFrame frames[FRAMES_MAX];
     int frame_count;
     int cur_base;
+    int active_boundaries;
+    CallFrame* current_frame;
 
     Obj* objects;
     ObjUpvalue* open_upvalues;
@@ -125,6 +127,9 @@ typedef struct VM {
 
     WithPromptContext with_prompt_stack[MAX_WITH_PROMPT_DEPTH];
     int with_prompt_depth;
+
+    // Cached: active_boundaries = with_prompt_depth + resume_depth
+    // Used for a single fast check in RET/TAIL_CALL instead of two separate checks
 
     // Error callback (NULL = default fprintf to stderr)
     ErrorCallback error_callback;
