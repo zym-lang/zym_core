@@ -138,9 +138,6 @@ typedef enum {
 } InterpretResult;
 
 static inline Chunk* currentChunk(VM* vm) {
-    if (vm->frame_count > 0) {
-        return vm->frames[vm->frame_count - 1].closure->function->chunk;
-    }
     return vm->chunk;
 }
 
