@@ -2268,6 +2268,61 @@ static InterpretResult run(VM* vm) {
             vm->stack[callee_slot] = callee;
         }
 
+        // Handle closures first (most common call target)
+        if (IS_CLOSURE(callee)) {
+            ObjClosure*  closure  = AS_CLOSURE(callee);
+            ObjFunction* function = closure->function;
+
+            #ifdef DEBUG_CALL
+            printf("[VM CALL] CUR_BASE=%d, REG_A=%d, callee_slot=%d, arg_count=%u\n",
+                   CUR_BASE(), REG_A(instr), callee_slot, arg_count);
+            printf("[VM CALL] Function: %.*s, arity=%d\n",
+                   function->name ? function->name->length : 6,
+                   function->name ? function->name->chars : "<anon>",
+                   function->arity);
+            for (int i = 1; i <= arg_count; i++) {
+                printf("[VM CALL]   Arg %d at stack[%d]: ", i, callee_slot + i);
+                printValue(vm->stack[callee_slot + i]);
+                printf("\n");
+            }
+            #endif
+
+            if (arg_count != function->arity) {
+                runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            if (vm->frame_count == FRAMES_MAX) {
+                runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // Calculate required stack size and grow if needed
+            int needed_top = callee_slot + function->max_regs;
+            if (!growStackForCall(vm, needed_top, NULL)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // Update stack_top to track highest used slot
+            if (needed_top > vm->stack_top) {
+                vm->stack_top = needed_top;
+            }
+
+            // Push frame
+            CallFrame* frame = &vm->frames[vm->frame_count++];
+            frame->closure      = closure;
+            frame->ip           = vm->ip;
+            frame->stack_base   = callee_slot;
+            frame->caller_chunk = vm->chunk;
+            frame->flags        = 0;
+
+            vm->cur_base = callee_slot;
+            // Enter callee
+            vm->chunk = function->chunk;
+            vm->ip = function->chunk->code;
+            DISPATCH();
+        }
+
         // Handle native functions
         if (IS_NATIVE_FUNCTION(callee)) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
@@ -2364,62 +2419,8 @@ static InterpretResult run(VM* vm) {
             DISPATCH();
         }
 
-        if (!IS_CLOSURE(callee)) {
-            runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjClosure*  closure  = AS_CLOSURE(callee);
-        ObjFunction* function = closure->function;
-
-        #ifdef DEBUG_CALL
-        printf("[VM CALL] CUR_BASE=%d, REG_A=%d, callee_slot=%d, arg_count=%u\n",
-               CUR_BASE(), REG_A(instr), callee_slot, arg_count);
-        printf("[VM CALL] Function: %.*s, arity=%d\n",
-               function->name ? function->name->length : 6,
-               function->name ? function->name->chars : "<anon>",
-               function->arity);
-        for (int i = 1; i <= arg_count; i++) {
-            printf("[VM CALL]   Arg %d at stack[%d]: ", i, callee_slot + i);
-            printValue(vm->stack[callee_slot + i]);
-            printf("\n");
-        }
-        #endif
-
-        if (arg_count != function->arity) {
-            runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        if (vm->frame_count == FRAMES_MAX) {
-            runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // Calculate required stack size and grow if needed
-        int needed_top = callee_slot + function->max_regs;
-        if (!growStackForCall(vm, needed_top, NULL)) {
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // Update stack_top to track highest used slot
-        if (needed_top > vm->stack_top) {
-            vm->stack_top = needed_top;
-        }
-
-        // Push frame
-        CallFrame* frame = &vm->frames[vm->frame_count++];
-        frame->closure      = closure;
-        frame->ip           = vm->ip;
-        frame->stack_base   = callee_slot;
-        frame->caller_chunk = vm->chunk;
-        frame->flags        = 0;
-
-        vm->cur_base = callee_slot;
-        // Enter callee
-        vm->chunk = function->chunk;
-        vm->ip = function->chunk->code;
-        DISPATCH();
+        runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
+        return INTERPRET_RUNTIME_ERROR;
     }
     OP(CALL_SELF) {
         uint32_t instr = vm->ip[-1];
@@ -2487,6 +2488,49 @@ static InterpretResult run(VM* vm) {
             vm->stack[callee_slot] = callee;
         }
 
+        // Handle closures first (most common tail call target)
+        if (IS_CLOSURE(callee)) {
+            ObjClosure*  closure  = AS_CLOSURE(callee);
+            ObjFunction* function = closure->function;
+
+            if (arg_count != function->arity) {
+                runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
+            CallFrame* current_frame = &vm->frames[vm->frame_count - 1];
+            int frame_base = current_frame->stack_base;
+            int needed_top = frame_base + function->max_regs;
+
+            // Grow stack if needed
+            if (!growStackForCall(vm, needed_top, NULL)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            if (needed_top > vm->stack_top) {
+                vm->stack_top = needed_top;
+            }
+
+            // Upvalues have already been closed by CLOSE_FRAME_UPVALUES instruction
+            // Move args to the frame base
+            for (int i = 0; i < arg_count; i++) {
+                vm->stack[frame_base + 1 + i] = vm->stack[callee_slot + 1 + i];
+            }
+
+            // Put the new callee in R0 of this frame
+            vm->stack[frame_base] = callee;
+
+            // Update the frame to point at the new closure
+            current_frame->closure = closure;
+
+            // Jump into the new function
+            vm->chunk = function->chunk;
+            vm->ip    = function->chunk->code;
+
+            DISPATCH();
+        }
+
         // Handle native functions in tail position: call directly and return result
         if (IS_NATIVE_FUNCTION(callee)) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
@@ -2549,50 +2593,8 @@ static InterpretResult run(VM* vm) {
             DISPATCH();
         }
 
-        if (!IS_CLOSURE(callee)) {
-            runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjClosure*  closure  = AS_CLOSURE(callee);
-        ObjFunction* function = closure->function;
-
-        if (arg_count != function->arity) {
-            runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
-        CallFrame* current_frame = &vm->frames[vm->frame_count - 1];
-        int frame_base = current_frame->stack_base;
-        int needed_top = frame_base + function->max_regs;
-
-        // Grow stack if needed
-        if (!growStackForCall(vm, needed_top, NULL)) {
-            return INTERPRET_RUNTIME_ERROR;
-        }
-
-        if (needed_top > vm->stack_top) {
-            vm->stack_top = needed_top;
-        }
-
-        // Upvalues have already been closed by CLOSE_FRAME_UPVALUES instruction
-        // Move args to the frame base
-        for (int i = 0; i < arg_count; i++) {
-            vm->stack[frame_base + 1 + i] = vm->stack[callee_slot + 1 + i];
-        }
-
-        // Put the new callee in R0 of this frame
-        vm->stack[frame_base] = callee;
-
-        // Update the frame to point at the new closure
-        current_frame->closure = closure;
-
-        // Jump into the new function
-        vm->chunk = function->chunk;
-        vm->ip    = function->chunk->code;
-
-        DISPATCH();
+        runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
+        return INTERPRET_RUNTIME_ERROR;
     }
     OP(TAIL_CALL_SELF) {
         uint32_t instr = vm->ip[-1];
