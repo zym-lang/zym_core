@@ -83,6 +83,7 @@ ZymLineMap* zym_newLineMap(ZymVM* vm);
 void zym_freeLineMap(ZymVM* vm, ZymLineMap* map);
 
 ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource);
+void zym_freeProcessedSource(ZymVM* vm, const char* processedSource);
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config);
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);

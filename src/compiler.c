@@ -4098,6 +4098,11 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
     free_owned_names(&fn_compiler);
 
+    // Clean up break jumps array
+    if (fn_compiler.break_jumps) {
+        FREE_ARRAY(fn_compiler.vm, int, fn_compiler.break_jumps, fn_compiler.break_capacity);
+    }
+
     // Clean up pending gotos array
     if (fn_compiler.pending_gotos) {
         FREE_ARRAY(fn_compiler.vm, PendingGoto, fn_compiler.pending_gotos, fn_compiler.pending_goto_capacity);
@@ -4228,6 +4233,19 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
     }
 
 cleanup_on_error:
+    // Clean up owned names
+    free_owned_names(&compiler);
+
+    // Clean up global types array
+    if (compiler.global_types) {
+        FREE_ARRAY(vm, GlobalType, compiler.global_types, compiler.global_type_capacity);
+    }
+
+    // Clean up break jumps array
+    if (compiler.break_jumps) {
+        FREE_ARRAY(vm, int, compiler.break_jumps, compiler.break_capacity);
+    }
+
     // Clean up pending gotos array
     if (compiler.pending_gotos) {
         FREE_ARRAY(vm, PendingGoto, compiler.pending_gotos, compiler.pending_goto_capacity);

@@ -119,6 +119,12 @@ ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const c
     return ZYM_STATUS_OK;
 }
 
+void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
+{
+    if (processedSource == NULL) return;
+    ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
+}
+
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config)
 {
     if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
