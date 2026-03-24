@@ -1123,7 +1123,7 @@ static InterpretResult run(VM* vm) {
         Value v = vm->stack[b];
 
 
-        bool is_falsey = IS_NULL(v) || (IS_BOOL(v) && !AS_BOOL(v)) || (IS_DOUBLE(v) && AS_DOUBLE(v) == 0.0);
+        bool is_falsey = (v == 0) || (v == NULL_VAL) || (v == FALSE_VAL);
         vm->stack[a] = BOOL_VAL(is_falsey);
         DISPATCH();
     }
@@ -1840,9 +1840,8 @@ static InterpretResult run(VM* vm) {
 
         Value condition = vm->stack[a];
 
-
-        // falsey = null, false, or 0
-        if (IS_NULL(condition) || (IS_BOOL(condition) && !AS_BOOL(condition)) || (IS_DOUBLE(condition) && AS_DOUBLE(condition) == 0.0)) {
+        // falsey = null (0x7FF8000000000001), false (0x7FF8000000000002), or 0.0 (0x0000000000000000)
+        if (condition == 0 || condition == NULL_VAL || condition == FALSE_VAL) {
             vm->ip += off;
         }
         DISPATCH();
@@ -1855,8 +1854,7 @@ static InterpretResult run(VM* vm) {
 
         Value condition = vm->stack[a];
 
-
-        if (!(IS_NULL(condition) || (IS_BOOL(condition) && !AS_BOOL(condition)) || (IS_DOUBLE(condition) && AS_DOUBLE(condition) == 0.0))) {
+        if (condition != 0 && condition != NULL_VAL && condition != FALSE_VAL) {
             vm->ip += off;
         }
         DISPATCH();
