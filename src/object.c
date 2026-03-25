@@ -145,14 +145,7 @@ ObjList* newList(VM* vm) {
 
 ObjMap* newMap(VM* vm) {
     ObjMap* map = ALLOCATE_OBJ(vm, ObjMap, OBJ_MAP);
-    map->table = NULL;
-
-    pushTempRoot(vm, (Obj*)map);
-
-    map->table = ALLOCATE(vm, Table, 1);
-    initTable(map->table);
-
-    popTempRoot(vm);
+    initTable(&map->table);
     return map;
 }
 

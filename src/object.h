@@ -6,7 +6,16 @@
 
 typedef struct VM VM;
 typedef struct ObjFunction ObjFunction;
-typedef struct Table Table;
+typedef struct {
+    ObjString* key;
+    Value value;
+} Entry;
+
+typedef struct Table {
+    int count;
+    int capacity;
+    Entry* entries;
+} Table;
 typedef struct ObjPromptTag ObjPromptTag;
 typedef struct ObjContinuation ObjContinuation;
 typedef struct CallFrame CallFrame;
@@ -146,7 +155,7 @@ typedef struct {
 
 typedef struct {
     Obj obj;
-    struct Table* table;
+    Table table;
 } ObjMap;
 
 #define MAX_OVERLOADS 16

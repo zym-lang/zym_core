@@ -6,17 +6,6 @@
 
 typedef struct VM VM;
 
-typedef struct {
-    ObjString* key;
-    Value value;
-} Entry;
-
-typedef struct Table {
-    int count;
-    int capacity;
-    Entry* entries;
-} Table;
-
 void initTable(Table* table);
 void freeTable(VM* vm, Table* table);
 bool tableGet(Table* table, ObjString* key, Value* value);

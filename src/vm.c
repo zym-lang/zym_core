@@ -2871,7 +2871,7 @@ static InterpretResult run(VM* vm) {
 
         // Set the key-value pair (or skip if value is null)
         if (!IS_NULL(value_val)) {
-            tableSet(vm, map->table, key_str, value_val);
+            tableSet(vm, &map->table, key_str, value_val);
         }
         DISPATCH();
     }
@@ -2892,10 +2892,10 @@ static InterpretResult run(VM* vm) {
         ObjMap* target = AS_MAP(target_val);
         ObjMap* source = AS_MAP(source_val);
         // Copy all key-value pairs from source to target
-        for (int i = 0; i < source->table->capacity; i++) {
-            Entry* entry = &source->table->entries[i];
+        for (int i = 0; i < source->table.capacity; i++) {
+            Entry* entry = &source->table.entries[i];
             if (entry->key != NULL) {
-                tableSet(vm, target->table, entry->key, entry->value);
+                tableSet(vm, &target->table, entry->key, entry->value);
             }
         }
         DISPATCH();
@@ -2920,7 +2920,7 @@ static InterpretResult run(VM* vm) {
             }
 
             Value result;
-            if (tableGet(map->table, key_str, &result)) {
+            if (tableGet(&map->table, key_str, &result)) {
                 vm->stack[a] = result;
             } else {
                 vm->stack[a] = NULL_VAL;
@@ -2977,7 +2977,7 @@ static InterpretResult run(VM* vm) {
             snprintf(buf, sizeof(buf), "%d", index);
             ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
             Value result;
-            if (tableGet(map->table, key_str, &result)) {
+            if (tableGet(&map->table, key_str, &result)) {
                 vm->stack[a] = result;
             } else {
                 vm->stack[a] = NULL_VAL;
@@ -3010,9 +3010,9 @@ static InterpretResult run(VM* vm) {
 
             // Delete key if value is null
             if (IS_NULL(value_val)) {
-                tableDelete(map->table, key_str);
+                tableDelete(&map->table, key_str);
             } else {
-                tableSet(vm, map->table, key_str, value_val);
+                tableSet(vm, &map->table, key_str, value_val);
             }
             DISPATCH();
         }
@@ -3067,9 +3067,9 @@ static InterpretResult run(VM* vm) {
             ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
 
             if (IS_NULL(value_val)) {
-                tableDelete(map->table, key_str);
+                tableDelete(&map->table, key_str);
             } else {
-                tableSet(vm, map->table, key_str, value_val);
+                tableSet(vm, &map->table, key_str, value_val);
             }
             DISPATCH();
         }
@@ -3118,7 +3118,7 @@ static InterpretResult run(VM* vm) {
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
-        if (tableGet(map->table, key_str, &result)) {
+        if (tableGet(&map->table, key_str, &result)) {
             vm->stack[a] = result;
         } else {
             vm->stack[a] = NULL_VAL;
@@ -3169,9 +3169,9 @@ static InterpretResult run(VM* vm) {
 
         // Normal set/delete
         if (IS_NULL(value_val)) {
-            tableDelete(map->table, key_str);
+            tableDelete(&map->table, key_str);
         } else {
-            tableSet(vm, map->table, key_str, value_val);
+            tableSet(vm, &map->table, key_str, value_val);
         }
         DISPATCH();
     }*/
@@ -3210,7 +3210,7 @@ static InterpretResult run(VM* vm) {
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
-        if (tableGet(map->table, key_str, &result)) {
+        if (tableGet(&map->table, key_str, &result)) {
             vm->stack[a] = result;
         } else {
             vm->stack[a] = NULL_VAL;
@@ -3253,9 +3253,9 @@ static InterpretResult run(VM* vm) {
 
         ObjMap* map = AS_MAP(container_val);
         if (IS_NULL(value_val)) {
-            tableDelete(map->table, key_str);
+            tableDelete(&map->table, key_str);
         } else {
-            tableSet(vm, map->table, key_str, value_val);
+            tableSet(vm, &map->table, key_str, value_val);
         }
         DISPATCH();
     }
@@ -3304,7 +3304,7 @@ static InterpretResult run(VM* vm) {
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
-        if (tableGet(map->table, key_str, &result)) {
+        if (tableGet(&map->table, key_str, &result)) {
             vm->stack[a] = result;
         } else {
             vm->stack[a] = NULL_VAL;
@@ -3357,9 +3357,9 @@ static InterpretResult run(VM* vm) {
 
         ObjMap* map = AS_MAP(container_val);
         if (IS_NULL(value_val)) {
-            tableDelete(map->table, key_str);
+            tableDelete(&map->table, key_str);
         } else {
-            tableSet(vm, map->table, key_str, value_val);
+            tableSet(vm, &map->table, key_str, value_val);
         }
         DISPATCH();
     }

@@ -205,8 +205,8 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
                     ObjMap* map = AS_MAP(value);
                     printf("{");
                     int printed = 0;
-                    for (int i = 0; i < map->table->capacity; i++) {
-                        Entry* entry = &map->table->entries[i];
+                    for (int i = 0; i < map->table.capacity; i++) {
+                        Entry* entry = &map->table.entries[i];
                         if (entry->key != NULL) {
                             if (printed > 0) {
                                 printf(", ");
@@ -290,11 +290,11 @@ Value cloneValue(VM* vm, Value value) {
                 ObjMap* original = (ObjMap*)obj;
                 ObjMap* cloned = newMap(vm);
                 pushTempRoot(vm, (Obj*)cloned);
-                for (int i = 0; i < original->table->capacity; i++) {
-                    Entry* entry = &original->table->entries[i];
+                for (int i = 0; i < original->table.capacity; i++) {
+                    Entry* entry = &original->table.entries[i];
                     if (entry->key != NULL) {
                         Value cloned_value = cloneValue(vm, entry->value);
-                        tableSet(vm, cloned->table, entry->key, cloned_value);
+                        tableSet(vm, &cloned->table, entry->key, cloned_value);
                     }
                 }
                 popTempRoot(vm);
@@ -446,11 +446,11 @@ static Value deepCloneHelper(VM* vm, Value value, CloneMap* visited, int depth) 
             pushTempRoot(vm, (Obj*)cloned);
             cloneMapPut(vm, visited, obj, OBJ_VAL(cloned));
 
-            for (int i = 0; i < original->table->capacity; i++) {
-                Entry* entry = &original->table->entries[i];
+            for (int i = 0; i < original->table.capacity; i++) {
+                Entry* entry = &original->table.entries[i];
                 if (entry->key != NULL) {
                     Value cloned_value = deepCloneHelper(vm, entry->value, visited, depth + 1);
-                    tableSet(vm, cloned->table, entry->key, cloned_value);
+                    tableSet(vm, &cloned->table, entry->key, cloned_value);
                 }
             }
 

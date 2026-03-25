@@ -541,8 +541,8 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
                 ObjMap* map = AS_MAP(value);
                 APPEND("{", 1);
                 int printed = 0;
-                for (int i = 0; i < map->table->capacity; i++) {
-                    Entry* entry = &map->table->entries[i];
+                for (int i = 0; i < map->table.capacity; i++) {
+                    Entry* entry = &map->table.entries[i];
                     if (entry->key != NULL) {
                         if (printed > 0) APPEND(", ", 2);
                         APPEND("\"", 1);
@@ -815,7 +815,7 @@ bool zym_listRemove(ZymVM* vm, ZymValue list, int index) {
 int zym_mapSize(ZymValue map) {
     if (!IS_MAP(map)) return -1;
     ObjMap* m = AS_MAP(map);
-    return m->table->count;
+    return m->table.count;
 }
 
 ZymValue zym_mapGet(ZymVM* vm, ZymValue map, const char* key) {
@@ -824,7 +824,7 @@ ZymValue zym_mapGet(ZymVM* vm, ZymValue map, const char* key) {
     ObjString* keyStr = copyString(vm, key, (int)strlen(key));
 
     Value result;
-    if (!tableGet(m->table, keyStr, &result)) {
+    if (!tableGet(&m->table, keyStr, &result)) {
         return ZYM_ERROR;
     }
     return result;
@@ -834,7 +834,7 @@ bool zym_mapSet(ZymVM* vm, ZymValue map, const char* key, ZymValue val) {
     if (!IS_MAP(map) || !key) return false;
     ObjMap* m = AS_MAP(map);
     ObjString* keyStr = copyString(vm, key, (int)strlen(key));
-    tableSet(vm, m->table, keyStr, val);
+    tableSet(vm, &m->table, keyStr, val);
     return true;
 }
 
@@ -849,11 +849,11 @@ bool zym_mapHas(ZymValue map, const char* key) {
         hash *= 16777619;
     }
 
-    ObjString* keyStr = tableFindString(m->table, key, len, hash);
+    ObjString* keyStr = tableFindString(&m->table, key, len, hash);
     if (!keyStr) return false;
 
     Value dummy;
-    return tableGet(m->table, keyStr, &dummy);
+    return tableGet(&m->table, keyStr, &dummy);
 }
 
 bool zym_mapDelete(ZymVM* vm, ZymValue map, const char* key) {
@@ -867,18 +867,18 @@ bool zym_mapDelete(ZymVM* vm, ZymValue map, const char* key) {
         hash *= 16777619;
     }
 
-    ObjString* keyStr = tableFindString(m->table, key, len, hash);
+    ObjString* keyStr = tableFindString(&m->table, key, len, hash);
     if (!keyStr) return false;
 
-    return tableDelete(m->table, keyStr);
+    return tableDelete(&m->table, keyStr);
 }
 
 void zym_mapForEach(ZymVM* vm, ZymValue map, ZymMapIterFunc func, void* userdata) {
     if (!IS_MAP(map) || !func) return;
     ObjMap* m = AS_MAP(map);
 
-    for (int i = 0; i < m->table->capacity; i++) {
-        Entry* entry = &m->table->entries[i];
+    for (int i = 0; i < m->table.capacity; i++) {
+        Entry* entry = &m->table.entries[i];
         if (entry->key != NULL) {
             bool shouldContinue = func(vm, entry->key->chars, entry->value, userdata);
             if (!shouldContinue) break;
