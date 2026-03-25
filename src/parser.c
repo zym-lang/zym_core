@@ -50,7 +50,7 @@ typedef struct {
 static Stmt* parse_statement(Parser* parser);
 static Stmt* parse_declaration(Parser* parser);
 static Expr* parse_expression(Parser* parser);
-static ParseRule* get_rule(TokenType type);
+static const ParseRule* get_rule(TokenType type);
 static void error_at_current(Parser* parser, const char* message);
 static void advance(Parser* parser);
 static void consume(Parser* parser, TokenType type, const char* message);
@@ -281,7 +281,7 @@ static void synchronize(Parser* parser) {
         advance(parser);
     }
 }
-static ParseRule* get_rule(TokenType type) { return &rules[type]; }
+static const ParseRule* get_rule(TokenType type) { return &rules[type]; }
 
 static Expr* parse_precedence(Parser* parser, Precedence precedence) {
     advance(parser);
@@ -529,7 +529,7 @@ static Expr* variable(Parser* parser, bool can_assign) {
 
 static Expr* binary(Parser* parser, Expr* left) {
     Token operator = parser->previous;
-    ParseRule* rule = get_rule(operator.type);
+    const ParseRule* rule = get_rule(operator.type);
     Expr* right = parse_precedence(parser, (Precedence)(rule->precedence + 1));
     return new_binary_expr(parser->vm, left, operator, right);
 }
