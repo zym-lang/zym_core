@@ -2036,14 +2036,21 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // Compile: condition ? then_expr : else_expr
             TernaryExpr* ternary = &expr->as.ternary;
 
-            // Compile condition, unwrapping NOT to use JUMP_IF_TRUE
-            int jump_to_else;
-            if (ternary->condition->type == EXPR_UNARY && ternary->condition->as.unary.operator.type == TOKEN_BANG) {
-                int cond_reg = compile_sub_expression(compiler, ternary->condition->as.unary.right);
-                jump_to_else = emit_jump_instruction(compiler, JUMP_IF_TRUE, cond_reg, expr->line);
-            } else {
-                int cond_reg = compile_sub_expression(compiler, ternary->condition);
-                jump_to_else = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, expr->line);
+            // Try to fuse comparison + branch into a single BRANCH_* opcode
+            Expr* tern_cond = ternary->condition;
+            bool tern_negated = (tern_cond->type == EXPR_UNARY && tern_cond->as.unary.operator.type == TOKEN_BANG);
+            Expr* tern_inner = tern_negated ? tern_cond->as.unary.right : tern_cond;
+
+            int jump_to_else = try_emit_branch_compare(compiler, tern_inner, tern_negated, expr->line);
+
+            if (jump_to_else == -1) {
+                if (tern_negated) {
+                    int cond_reg = compile_sub_expression(compiler, tern_inner);
+                    jump_to_else = emit_jump_instruction(compiler, JUMP_IF_TRUE, cond_reg, expr->line);
+                } else {
+                    int cond_reg = compile_sub_expression(compiler, tern_cond);
+                    jump_to_else = emit_jump_instruction(compiler, JUMP_IF_FALSE, cond_reg, expr->line);
+                }
             }
 
             // Compile then branch
@@ -3202,11 +3209,18 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
             /* int condition_start = compiler->compiling_chunk->count; */
             patch_jump(compiler, jump_to_condition);
 
-            int condition_reg = alloc_temp(compiler);
-            COMPILE_REQUIRED(compiler, stmt->as.do_while_stmt.condition, condition_reg);
+            // Try to fuse comparison + branch into a single BRANCH_* opcode
+            Expr* dw_cond = stmt->as.do_while_stmt.condition;
+            bool dw_negated = (dw_cond->type == EXPR_UNARY && dw_cond->as.unary.operator.type == TOKEN_BANG);
+            Expr* dw_inner = dw_negated ? dw_cond->as.unary.right : dw_cond;
 
-            // If condition is false, skip the loop-back jump
-            int skip_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, condition_reg, stmt->line);
+            int skip_jump = try_emit_branch_compare(compiler, dw_inner, dw_negated, stmt->line);
+
+            if (skip_jump == -1) {
+                int condition_reg = alloc_temp(compiler);
+                COMPILE_REQUIRED(compiler, stmt->as.do_while_stmt.condition, condition_reg);
+                skip_jump = emit_jump_instruction(compiler, JUMP_IF_FALSE, condition_reg, stmt->line);
+            }
 
             // If condition is true, jump back to body_start (not loop_start!)
             emit_loop(compiler, body_start, stmt->line);
@@ -3486,19 +3500,11 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 int case_value_reg = alloc_temp(compiler);
                 compile_expression(compiler, case_clause->value, case_value_reg);
 
-                // Compare: cmp_reg = (switch_reg == case_value_reg)
-                int cmp_reg = alloc_temp(compiler);
-                emit_instruction(compiler, PACK_ABC(EQ, cmp_reg, switch_reg, case_value_reg), stmt->line);
-
-                // If comparison is true (equal), jump to this case's body
-                // We emit a JUMP_IF_FALSE and then a JUMP - the JUMP gets us to the body
-                int skip_to_body = emit_jump_instruction(compiler, JUMP_IF_FALSE, cmp_reg, stmt->line);
+                // Fused compare+branch: if not equal, skip the JUMP to body
+                emit_instruction(compiler, PACK_ABC(BRANCH_NE, switch_reg, case_value_reg, 1), stmt->line);
 
                 // Match! Jump to case body (will be patched in second pass)
                 case_body_jumps[i] = emit_jump_instruction(compiler, JUMP, 0, stmt->line);
-
-                // No match - patch skip_to_body to continue to next case
-                patch_jump(compiler, skip_to_body);
             }
 
             // After all case checks, jump to default (if exists) or end
