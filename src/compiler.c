@@ -1353,19 +1353,15 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     }
                 }
 
-                int list_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub_expr->object, list_reg);
+                int list_reg = compile_sub_expression(compiler, sub_expr->object);
 
                 int value_reg;
                 if (use_imm) {
-                    value_reg = alloc_temp(compiler);
-                    COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
+                    value_reg = compile_sub_expression(compiler, expr->as.assign.value);
                     emit_instruction(compiler, PACK_ABC(SET_SUBSCRIPT_I, list_reg, imm_val, value_reg), expr->line);
                 } else {
-                    int index_reg = alloc_temp(compiler);
-                    COMPILE_REQUIRED(compiler, sub_expr->index, index_reg);
-                    value_reg = alloc_temp(compiler);
-                    COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
+                    int index_reg = compile_sub_expression(compiler, sub_expr->index);
+                    value_reg = compile_sub_expression(compiler, expr->as.assign.value);
                     emit_instruction(compiler, PACK_ABC(SET_SUBSCRIPT, list_reg, index_reg, value_reg), expr->line);
                 }
 
@@ -2319,10 +2315,8 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
                 SubscriptExpr* sub = &target_expr->as.subscript;
-                int obj_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub->object, obj_reg);
-                int idx_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub->index, idx_reg);
+                int obj_reg = compile_sub_expression(compiler, sub->object);
+                int idx_reg = compile_sub_expression(compiler, sub->index);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
@@ -2336,8 +2330,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             } else if (target_expr->type == EXPR_GET) {
                 // Property: obj.prop++
                 GetExpr* get = &target_expr->as.get;
-                int obj_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, get->object, obj_reg);
+                int obj_reg = compile_sub_expression(compiler, get->object);
                 int key_const = identifier_constant(compiler, &get->name);
 
                 // Get current value
@@ -2388,10 +2381,8 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
                 SubscriptExpr* sub = &target_expr->as.subscript;
-                int obj_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub->object, obj_reg);
-                int idx_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, sub->index, idx_reg);
+                int obj_reg = compile_sub_expression(compiler, sub->object);
+                int idx_reg = compile_sub_expression(compiler, sub->index);
 
                 // Get current value
                 int val_reg = alloc_temp(compiler);
@@ -2405,8 +2396,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             } else if (target_expr->type == EXPR_GET) {
                 // Property: obj.prop++
                 GetExpr* get = &target_expr->as.get;
-                int obj_reg = alloc_temp(compiler);
-                COMPILE_REQUIRED(compiler, get->object, obj_reg);
+                int obj_reg = compile_sub_expression(compiler, get->object);
                 int key_const = identifier_constant(compiler, &get->name);
 
                 // Get current value
