@@ -674,47 +674,63 @@ static InterpretResult run(VM* vm) {
     };
 #undef JUMP_ENTRY
 
+    // Cached hot VM state in locals for register allocation.
+    // These avoid repeated pointer-chase through vm-> on every opcode.
+    register uint32_t* ip = vm->ip;
+    register Value* stack = vm->stack;
+    register int base = vm->cur_base;
+
+    // Sync locals back to VM struct before calls that read vm->ip/cur_base
+#define STORE_IP()    (vm->ip = ip)
+#define STORE_STATE() do { vm->ip = ip; vm->cur_base = base; } while(0)
+    // Reload locals from VM struct after frame changes or stack reallocation
+#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; } while(0)
+
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
     if (vm->preemption_enabled && vm->preemption_disable_depth == 0 && (--vm->yield_budget <= 0 || vm->preempt_requested)) { \
         vm->yield_budget = vm->default_timeslice; \
         vm->preempt_requested = false; \
+        STORE_STATE(); \
         if (IS_CLOSURE(vm->on_preempt_callback)) { \
             if (pushPreemptFrame(vm)) { \
-                goto *dispatch_table[OPCODE(*vm->ip++)]; \
+                LOAD_STATE(); \
+                goto *dispatch_table[OPCODE(*ip++)]; \
             } \
         } \
         return INTERPRET_YIELD; \
     } \
-    goto *dispatch_table[OPCODE(*vm->ip++)]; \
+    goto *dispatch_table[OPCODE(*ip++)]; \
 } while(0)
-#define CUR_BASE() (vm->cur_base)
+#define CUR_BASE() (base)
 #define BINARY_OP(op) \
     do { \
-        uint32_t instr = vm->ip[-1]; \
+        uint32_t instr = ip[-1]; \
         int a = CUR_BASE() + REG_A(instr); \
         int b = CUR_BASE() + REG_B(instr); \
         int c = CUR_BASE() + REG_C(instr); \
-        Value vb = vm->stack[b]; \
-        Value vc = vm->stack[c]; \
+        Value vb = stack[b]; \
+        Value vc = stack[c]; \
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) { \
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) op AS_DOUBLE(vc)); \
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) op AS_DOUBLE(vc)); \
         } else { \
+            STORE_IP(); \
             runtimeError(vm, ERR_OPERANDS_NUMBERS); \
             return INTERPRET_RUNTIME_ERROR; \
         } \
     } while(false)
 #define BINARY_COMPARE(op) \
     do { \
-        uint32_t instr = vm->ip[-1]; \
+        uint32_t instr = ip[-1]; \
         int a = CUR_BASE() + REG_A(instr); \
         int b = CUR_BASE() + REG_B(instr); \
         int c = CUR_BASE() + REG_C(instr); \
-        Value vb = vm->stack[b]; \
-        Value vc = vm->stack[c]; \
+        Value vb = stack[b]; \
+        Value vc = stack[c]; \
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) { \
-            vm->stack[a] = BOOL_VAL(AS_DOUBLE(vb) op AS_DOUBLE(vc)); \
+            stack[a] = BOOL_VAL(AS_DOUBLE(vb) op AS_DOUBLE(vc)); \
         } else { \
+            STORE_IP(); \
             runtimeError(vm, "Operands must be numbers for comparison."); \
             return INTERPRET_RUNTIME_ERROR; \
         } \
@@ -726,11 +742,11 @@ static InterpretResult run(VM* vm) {
             fprintf(stderr, "IP bounds check failed: no current chunk\n"); \
             abort(); \
         } \
-        uint32_t* base = vm->chunk->code; \
-        uint32_t* end  = vm->chunk->code + vm->chunk->count; \
-        if (vm->ip < base || vm->ip > end) { \
+        uint32_t* code_base = vm->chunk->code; \
+        uint32_t* code_end  = vm->chunk->code + vm->chunk->count; \
+        if (ip < code_base || ip > code_end) { \
             fprintf(stderr, "IP out of range: ip=%p, base=%p, end=%p\n", \
-            (void*)vm->ip, (void*)base, (void*)end); \
+            (void*)ip, (void*)code_base, (void*)code_end); \
             abort(); \
         } \
     } while(0)
@@ -739,30 +755,30 @@ static InterpretResult run(VM* vm) {
     CHECK_IP_BOUNDS();
     DISPATCH();
     OP(MOVE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        vm->stack[a] = vm->stack[b];
+        stack[a] = stack[b];
         DISPATCH();
     }
     OP(LOAD_CONST) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
-        vm->stack[a] = currentChunk(vm)->constants.values[bx];
+        stack[a] = currentChunk(vm)->constants.values[bx];
         DISPATCH();
     }
     OP(ADD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value val_b = vm->stack[b];
-        Value val_c = vm->stack[c];
+        Value val_b = stack[b];
+        Value val_c = stack[c];
 
 
         if (IS_DOUBLE(val_b) && IS_DOUBLE(val_c)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(val_b) + AS_DOUBLE(val_c));
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(val_b) + AS_DOUBLE(val_c));
         } else if (IS_STRING(val_b) && IS_STRING(val_c)) {
             ObjString* str_b = AS_STRING(val_b);
             ObjString* str_c = AS_STRING(val_c);
@@ -775,15 +791,16 @@ static InterpretResult run(VM* vm) {
 
             // takeString takes ownership of the 'chars' buffer
             ObjString* result = takeString(vm, chars, length);
+            stack = vm->stack; // GC may have reallocated stack
 
             // Protect the string before the write (which can trigger GC via tableSet)
             pushTempRoot(vm, (Obj*)result);
-            vm->stack[a] = OBJ_VAL(result);
+            stack[a] = OBJ_VAL(result);
             popTempRoot(vm);
 
         } else {
-            runtimeError(vm, "Operands for '+' must be two numbers or two strings.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '+' must be two numbers or two strings.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
@@ -800,34 +817,34 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(MOD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
             double rhs = AS_DOUBLE(vc);
             if (rhs == 0.0) {
-                runtimeError(vm, "Division by zero in '%%'.");
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Division by zero in '%%'.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
-            vm->stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(vb), rhs));
+            stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(vb), rhs));
         } else {
-            runtimeError(vm, "Operands for '%%' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '%%' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(EQ) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         // Special handling for enum type checking
@@ -839,16 +856,16 @@ static InterpretResult run(VM* vm) {
                 const char* name_b = getEnumNameByTypeId(vm, type_b, &len_b);
                 const char* name_c = getEnumNameByTypeId(vm, type_c, &len_c);
                 if (name_b && name_c) {
-                    runtimeError(vm, "Cannot compare enum '%.*s' with enum '%.*s'",
+                    STORE_IP(); runtimeError(vm, "Cannot compare enum '%.*s' with enum '%.*s'",
                                 len_b, name_b, len_c, name_c);
                 } else {
-                    runtimeError(vm, "Cannot compare enum values of different types (type IDs: %d vs %d)", type_b, type_c);
+                    STORE_IP(); runtimeError(vm, "Cannot compare enum values of different types (type IDs: %d vs %d)", type_b, type_c);
                 }
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
         }
 
-        vm->stack[a] = BOOL_VAL(value_equals(vb, vc));
+        stack[a] = BOOL_VAL(value_equals(vb, vc));
         DISPATCH();
     }
     OP(GT) {
@@ -860,15 +877,15 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(NE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
-        vm->stack[a] = BOOL_VAL(!value_equals(vb, vc));
+        stack[a] = BOOL_VAL(!value_equals(vb, vc));
         DISPATCH();
     }
     OP(LE) { // Ra = (Rb <= Rc)
@@ -882,11 +899,11 @@ static InterpretResult run(VM* vm) {
 
     // ===== Comparison with 16-bit Immediate =====
     OP(EQ_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         Value imm_val = DOUBLE_VAL((double)imm);
         bool result = (va == imm_val);
@@ -898,15 +915,15 @@ static InterpretResult run(VM* vm) {
             }
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(GT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         bool result = false;
@@ -914,15 +931,15 @@ static InterpretResult run(VM* vm) {
             result = (AS_DOUBLE(va) > (double)imm);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(LT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         bool result = false;
@@ -930,15 +947,15 @@ static InterpretResult run(VM* vm) {
             result = (AS_DOUBLE(va) < (double)imm);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(NE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         Value imm_val = DOUBLE_VAL((double)imm);
         bool result = (va != imm_val);
@@ -950,15 +967,15 @@ static InterpretResult run(VM* vm) {
             }
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(LE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         bool result = false;
@@ -966,15 +983,15 @@ static InterpretResult run(VM* vm) {
             result = (AS_DOUBLE(va) <= (double)imm);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(GE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         bool result = false;
@@ -982,20 +999,20 @@ static InterpretResult run(VM* vm) {
             result = (AS_DOUBLE(va) >= (double)imm);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
 
     // ===== Comparison with 64-bit Literal =====
     OP(EQ_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = (vb == literal_val);
         if (!result) {
@@ -1009,58 +1026,58 @@ static InterpretResult run(VM* vm) {
             }
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(GT_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = false;
         if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) > literal);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(LT_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = false;
         if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) < literal);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(NE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = (vb != literal_val);
         if (result) {
@@ -1074,128 +1091,128 @@ static InterpretResult run(VM* vm) {
             }
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(LE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = false;
         if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) <= literal);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
     OP(GE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         bool result = false;
         if (__builtin_expect(IS_DOUBLE(vb), 1)) {
             result = (AS_DOUBLE(vb) >= literal);
         }
 
-        vm->stack[a] = BOOL_VAL(result);
+        stack[a] = BOOL_VAL(result);
         DISPATCH();
     }
 
     OP(NOT) { // Ra = !Rb    (false/null/0 => true, everything else => false)
-        uint32_t instr = vm->ip[-1];
-        int a = CUR_BASE() + REG_A(vm->ip[-1]);
-        int b = CUR_BASE() + REG_B(vm->ip[-1]);
-        Value v = vm->stack[b];
+        uint32_t instr = ip[-1];
+        int a = CUR_BASE() + REG_A(ip[-1]);
+        int b = CUR_BASE() + REG_B(ip[-1]);
+        Value v = stack[b];
 
 
         bool is_falsey = (v == 0) || (v == NULL_VAL) || (v == FALSE_VAL);
-        vm->stack[a] = BOOL_VAL(is_falsey);
+        stack[a] = BOOL_VAL(is_falsey);
         DISPATCH();
     }
     OP(BAND) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             int32_t result = lhs & rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '&' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '&' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BOR) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             int32_t result = lhs | rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '|' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '|' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BXOR) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             int32_t result = lhs ^ rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '^' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '^' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BLSHIFT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
@@ -1203,20 +1220,20 @@ static InterpretResult run(VM* vm) {
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             // Mask shift amount to 0-31 for i32
             int32_t result = lhs << (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '<<' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '<<' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_U) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
@@ -1225,20 +1242,20 @@ static InterpretResult run(VM* vm) {
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             // Mask shift amount to 0-31 for i32
             uint32_t result = lhs >> (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '>>>' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '>>>' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value vb = vm->stack[b];
-        Value vc = vm->stack[c];
+        Value vb = stack[b];
+        Value vc = stack[c];
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
@@ -1246,493 +1263,493 @@ static InterpretResult run(VM* vm) {
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             // Mask shift amount to 0-31 for 32-bit signed
             int32_t result = lhs >> (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operands for '>>' must be numbers.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands for '>>' must be numbers.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Arithmetic with 16-bit Immediate =====
     OP(ADD_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         // Sign-extend 16-bit immediate
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(va) + (double)imm);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(va) + (double)imm);
         } else {
-            runtimeError(vm, "Operand for '+' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '+' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(SUB_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(va) - (double)imm);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(va) - (double)imm);
         } else {
-            runtimeError(vm, "Operand for '-' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '-' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(MUL_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(va) * (double)imm);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(va) * (double)imm);
         } else {
-            runtimeError(vm, "Operand for '*' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '*' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(DIV_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(va) / (double)imm);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(va) / (double)imm);
         } else {
-            runtimeError(vm, "Operand for '/' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '/' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(MOD_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             double rhs = (double)imm;
             if (rhs == 0.0) {
-                runtimeError(vm, "Division by zero in '%%'.");
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Division by zero in '%%'.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
-            vm->stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(va), rhs));
+            stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(va), rhs));
         } else {
-            runtimeError(vm, "Operand for '%%' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '%%' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Arithmetic with 64-bit Literal =====
     OP(ADD_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         // Read 64-bit literal from next two instructions
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) + literal);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) + literal);
         } else {
-            runtimeError(vm, "Operand for '+' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '+' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(SUB_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) - literal);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) - literal);
         } else {
-            runtimeError(vm, "Operand for '-' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '-' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(MUL_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) * literal);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) * literal);
         } else {
-            runtimeError(vm, "Operand for '*' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '*' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(DIV_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
-            vm->stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) / literal);
+            stack[a] = DOUBLE_VAL(AS_DOUBLE(vb) / literal);
         } else {
-            runtimeError(vm, "Operand for '/' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '/' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(MOD_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             if (literal == 0.0) {
-                runtimeError(vm, "Division by zero in '%%'.");
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Division by zero in '%%'.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
-            vm->stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(vb), literal));
+            stack[a] = DOUBLE_VAL(fmod(AS_DOUBLE(vb), literal));
         } else {
-            runtimeError(vm, "Operand for '%%' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '%%' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Bitwise with 16-bit Immediate =====
     OP(BAND_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             int32_t lhs = (int32_t)AS_DOUBLE(va);
             int32_t result = lhs & (int32_t)imm;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '&' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '&' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BOR_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             int32_t lhs = (int32_t)AS_DOUBLE(va);
             int32_t result = lhs | (int32_t)imm;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '|' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '|' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BXOR_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             int32_t lhs = (int32_t)AS_DOUBLE(va);
             int32_t result = lhs ^ (int32_t)imm;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '^' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '^' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BLSHIFT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             int32_t lhs = (int32_t)AS_DOUBLE(va);
             int32_t result = lhs << ((int32_t)imm & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '<<' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '<<' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_U_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             uint32_t lhs = (uint32_t)AS_DOUBLE(va);
             uint32_t result = lhs >> ((int32_t)imm & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '>>>' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '>>>' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_I_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (IS_DOUBLE(va)) {
             int32_t lhs = (int32_t)AS_DOUBLE(va);
             int32_t result = lhs >> ((int32_t)imm & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '>>' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '>>' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Bitwise with 64-bit Literal =====
     OP(BAND_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             int32_t result = lhs & rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '&' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '&' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BOR_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             int32_t result = lhs | rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '|' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '|' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BXOR_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             int32_t result = lhs ^ rhs;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '^' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '^' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BLSHIFT_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             int32_t result = lhs << (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '<<' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '<<' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_U_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             uint32_t lhs = (uint32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             uint32_t result = lhs >> (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '>>>' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '>>>' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRSHIFT_I_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
 
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
         if (IS_DOUBLE(vb)) {
             int32_t lhs = (int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             int32_t result = lhs >> (rhs & 0x1F);
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '>>' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '>>' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     OP(NEG) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
+        Value val_b = stack[b];
 
 
         if (IS_DOUBLE(val_b)) {
-            vm->stack[a] = DOUBLE_VAL(-AS_DOUBLE(val_b));
+            stack[a] = DOUBLE_VAL(-AS_DOUBLE(val_b));
         } else {
-            runtimeError(vm, "Operand must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BNOT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value vb = vm->stack[b];
+        Value vb = stack[b];
 
 
         if (IS_DOUBLE(vb)) {
             int32_t val = (int32_t)AS_DOUBLE(vb);
             int32_t result = ~val;
-            vm->stack[a] = DOUBLE_VAL((double)result);
+            stack[a] = DOUBLE_VAL((double)result);
         } else {
-            runtimeError(vm, "Operand for '~' must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand for '~' must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(DEFINE_GLOBAL) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
         ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
@@ -1743,32 +1760,32 @@ static InterpretResult run(VM* vm) {
             // New global: allocate a slot
             int slot_index = vm->globalSlots.count;
             if (slot_index > UINT16_MAX) {
-                runtimeError(vm, "Too many global variables (max %d).", UINT16_MAX + 1);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Too many global variables (max %d).", UINT16_MAX + 1);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             // Store the slot index in the globals table
-            writeValueArray(vm, &vm->globalSlots, vm->stack[src_reg]);
+            writeValueArray(vm, &vm->globalSlots, stack[src_reg]);
             tableSet(vm, &vm->globals, name, DOUBLE_VAL((double)slot_index));
         } else if (IS_DOUBLE(existing_slot_or_value)) {
             // Redefining existing slot-based global: update the value in the slot
             int slot_index = (int)AS_DOUBLE(existing_slot_or_value);
-            vm->globalSlots.values[slot_index] = vm->stack[src_reg];
+            vm->globalSlots.values[slot_index] = stack[src_reg];
         } else {
             // Trying to redefine a direct-storage global (e.g., native function)
-            runtimeError(vm, "Cannot redefine native function '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Cannot redefine native function '%.*s'.", name->length, name->chars);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(GET_GLOBAL) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int dest_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
         ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
         Value slot_index_val;
         if (!tableGet(&vm->globals, name, &slot_index_val)) {
-            runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Check if this is a slot index (number) or direct value (e.g., native function)
@@ -1778,18 +1795,18 @@ static InterpretResult run(VM* vm) {
 
             // Self-modify: rewrite this instruction to GET_GLOBAL_CACHED with the slot index
             uint32_t new_instr = (uint32_t)GET_GLOBAL_CACHED | (REG_A(instr) << 8) | (slot_index << 16);
-            vm->ip[-1] = new_instr;
+            ip[-1] = new_instr;
 
             // Execute the cached version
-            vm->stack[dest_reg] = vm->globalSlots.values[slot_index];
+            stack[dest_reg] = vm->globalSlots.values[slot_index];
         } else {
             // Direct value (e.g., native function) - use as-is, no caching
-            vm->stack[dest_reg] = slot_index_val;
+            stack[dest_reg] = slot_index_val;
         }
         DISPATCH();
     }
     OP(SET_GLOBAL) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
         ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
@@ -1797,191 +1814,191 @@ static InterpretResult run(VM* vm) {
         // Check if global exists
         Value slot_index_val;
         if (!tableGet(&vm->globals, name, &slot_index_val)) {
-            runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Check if this is a slot index (number) or direct value (e.g., native function)
         if (IS_DOUBLE(slot_index_val)) {
             // Slot-based global: get slot index and cache it
             uint16_t slot_index = (uint16_t)AS_DOUBLE(slot_index_val);
-            vm->globalSlots.values[slot_index] = vm->stack[src_reg];
+            vm->globalSlots.values[slot_index] = stack[src_reg];
 
             // Self-modify: rewrite this instruction to SET_GLOBAL_CACHED with the slot index
             uint32_t new_instr = (uint32_t)SET_GLOBAL_CACHED | (REG_A(instr) << 8) | (slot_index << 16);
-            vm->ip[-1] = new_instr;
+            ip[-1] = new_instr;
         } else {
             // Direct value (e.g., native function) - can't set, this is an error
-            runtimeError(vm, "Cannot assign to native function '%.*s'.", name->length, name->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Cannot assign to native function '%.*s'.", name->length, name->chars);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         DISPATCH();
     }
     OP(GET_GLOBAL_CACHED) {
         // Fast path: direct array lookup using cached slot index
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int dest_reg = CUR_BASE() + REG_A(instr);
         uint16_t slot_index = REG_Bx(instr);
-        vm->stack[dest_reg] = vm->globalSlots.values[slot_index];
+        stack[dest_reg] = vm->globalSlots.values[slot_index];
         DISPATCH();
     }
     OP(SET_GLOBAL_CACHED) {
         // Fast path: direct array write using cached slot index
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t slot_index = REG_Bx(instr);
-        vm->globalSlots.values[slot_index] = vm->stack[src_reg];
+        vm->globalSlots.values[slot_index] = stack[src_reg];
         DISPATCH();
     }
     OP(JUMP_IF_FALSE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t raw = REG_Bx(instr);
         int32_t off = sign_extend_16(raw);
 
-        Value condition = vm->stack[a];
+        Value condition = stack[a];
 
         // falsey = null (0x7FF8000000000001), false (0x7FF8000000000002), or 0.0 (0x0000000000000000)
         if (condition == 0 || condition == NULL_VAL || condition == FALSE_VAL) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(JUMP_IF_TRUE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t raw = REG_Bx(instr);
         int32_t off = sign_extend_16(raw);
 
-        Value condition = vm->stack[a];
+        Value condition = stack[a];
 
         if (condition != 0 && condition != NULL_VAL && condition != FALSE_VAL) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(JUMP) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         uint16_t raw = REG_Bx(instr);
         int32_t off = sign_extend_16(raw);
-        vm->ip += off;
+        ip += off;
         DISPATCH();
     }
 
     // ===== Branch-Compare Opcodes (Register-Register) =====
     OP(BRANCH_EQ) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
         if (va == vb || (IS_DOUBLE(va) && IS_DOUBLE(vb) && AS_DOUBLE(va) == AS_DOUBLE(vb))) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_NE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
         if (va != vb && !(IS_DOUBLE(va) && IS_DOUBLE(vb) && AS_DOUBLE(va) == AS_DOUBLE(vb))) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_LT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
 
         if (IS_DOUBLE(va) && IS_DOUBLE(vb)) {
             if (AS_DOUBLE(va) < AS_DOUBLE(vb)) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operands must be numbers for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands must be numbers for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_LE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
 
         if (IS_DOUBLE(va) && IS_DOUBLE(vb)) {
             if (AS_DOUBLE(va) <= AS_DOUBLE(vb)) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operands must be numbers for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands must be numbers for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
 
         if (IS_DOUBLE(va) && IS_DOUBLE(vb)) {
             if (AS_DOUBLE(va) > AS_DOUBLE(vb)) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operands must be numbers for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands must be numbers for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int32_t off = sign_extend_8(REG_C(instr));
-        Value va = vm->stack[a];
-        Value vb = vm->stack[b];
+        Value va = stack[a];
+        Value vb = stack[b];
 
 
         if (IS_DOUBLE(va) && IS_DOUBLE(vb)) {
             if (AS_DOUBLE(va) >= AS_DOUBLE(vb)) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operands must be numbers for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operands must be numbers for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Branch-Compare Opcodes (Register-Immediate) =====
     OP(BRANCH_EQ_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;  // Offset in next instruction
+        int32_t off = *ip++;  // Offset in next instruction
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         Value imm_val = DOUBLE_VAL((double)imm);
         bool matches = (va == imm_val);
@@ -1994,18 +2011,18 @@ static InterpretResult run(VM* vm) {
         }
 
         if (matches) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_NE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         Value imm_val = DOUBLE_VAL((double)imm);
         bool matches = (va != imm_val);
@@ -2018,101 +2035,101 @@ static InterpretResult run(VM* vm) {
         }
 
         if (matches) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_LT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) < (double)imm) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_LE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) <= (double)imm) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) > (double)imm) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GE_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
         int16_t imm = (int16_t)((int32_t)(bx << 16) >> 16);
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) >= (double)imm) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     // ===== Branch-Compare Opcodes (Register-Literal) =====
     OP(BRANCH_EQ_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         bool matches = (va == literal_val);
         if (!matches) {
@@ -2127,19 +2144,19 @@ static InterpretResult run(VM* vm) {
         }
 
         if (matches) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_NE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         Value literal_val = ((uint64_t)high << 32) | (uint64_t)low;
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
         bool matches = (va != literal_val);
         if (matches) {
@@ -2154,121 +2171,121 @@ static InterpretResult run(VM* vm) {
         }
 
         if (matches) {
-            vm->ip += off;
+            ip += off;
         }
         DISPATCH();
     }
     OP(BRANCH_LT_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) < literal) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_LE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) <= literal) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GT_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) > literal) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
     OP(BRANCH_GE_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        uint32_t low = *vm->ip++;
-        uint32_t high = *vm->ip++;
+        uint32_t low = *ip++;
+        uint32_t high = *ip++;
         uint64_t bits = ((uint64_t)high << 32) | (uint64_t)low;
         double literal;
         memcpy(&literal, &bits, sizeof(double));
-        int32_t off = *vm->ip++;
+        int32_t off = *ip++;
         off = sign_extend_16(off);
-        Value va = vm->stack[a];
+        Value va = stack[a];
 
 
         if (__builtin_expect(IS_DOUBLE(va), 1)) {
             if (AS_DOUBLE(va) >= literal) {
-                vm->ip += off;
+                ip += off;
             }
         } else {
-            runtimeError(vm, "Operand must be a number for comparison.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Operand must be a number for comparison.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         DISPATCH();
     }
 
     OP(CALL) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int callee_slot = CUR_BASE() + REG_A(instr);
         uint16_t arg_count = REG_Bx(instr);
-        Value callee = vm->stack[callee_slot];
+        Value callee = stack[callee_slot];
 
         // Dereference if callee is a reference (refs are first-class)
-        vm->stack[callee_slot] = callee;
+        stack[callee_slot] = callee;
 
         // Resolve dispatcher overload if needed
         if (IS_DISPATCHER(callee)) {
             Value matched_closure = resolveOverload(vm, AS_DISPATCHER(callee), arg_count);
             if (IS_NULL(matched_closure)) {
-                runtimeError(vm, "No overload found for %u arguments.", arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "No overload found for %u arguments.", arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             callee = matched_closure;
-            vm->stack[callee_slot] = callee;
+            stack[callee_slot] = callee;
         }
 
         // Handle closures first (most common call target)
@@ -2285,27 +2302,28 @@ static InterpretResult run(VM* vm) {
                    function->arity);
             for (int i = 1; i <= arg_count; i++) {
                 printf("[VM CALL]   Arg %d at stack[%d]: ", i, callee_slot + i);
-                printValue(vm->stack[callee_slot + i]);
+                printValue(stack[callee_slot + i]);
                 printf("\n");
             }
             #endif
 
             if (__builtin_expect(arg_count != function->arity, 0)) {
-                runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
-                runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             // Calculate required stack size and grow if needed
             int needed_top = callee_slot + function->max_regs;
             if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
                 if (!growStackForCall(vm, needed_top, NULL)) {
-                    return INTERPRET_RUNTIME_ERROR;
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
                 }
+                stack = vm->stack;
             }
 
             // Update stack_top to track highest used slot
@@ -2316,16 +2334,16 @@ static InterpretResult run(VM* vm) {
             // Push frame
             CallFrame* frame = &vm->frames[vm->frame_count++];
             frame->closure      = closure;
-            frame->ip           = vm->ip;
+            frame->ip           = ip;
             frame->stack_base   = callee_slot;
             frame->caller_chunk = vm->chunk;
             frame->flags        = 0;
 
             vm->current_frame = frame;
-            vm->cur_base = callee_slot;
+            base = callee_slot;
             // Enter callee
             vm->chunk = function->chunk;
-            vm->ip = function->chunk->code;
+            ip = function->chunk->code;
             DISPATCH();
         }
 
@@ -2334,12 +2352,12 @@ static InterpretResult run(VM* vm) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
 
             if (arg_count != native->arity) {
-                runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             // Prepare arguments array (points to first arg on stack)
-            Value* args = &vm->stack[callee_slot + 1];
+            Value* args = &stack[callee_slot + 1];
 
             // Protect arguments from GC during native call
             int saved_temp_root_count = vm->temp_root_count;
@@ -2350,7 +2368,9 @@ static InterpretResult run(VM* vm) {
             }
 
             // Call native function via dispatcher
+            STORE_STATE();
             Value result = native->dispatcher(vm, args, native->func_ptr);
+            stack = vm->stack; // native may trigger GC that reallocates stack
 
             // Restore temp root count
             vm->temp_root_count = saved_temp_root_count;
@@ -2364,11 +2384,11 @@ static InterpretResult run(VM* vm) {
             // Check for control transfer (capture/abort)
             // The native has already modified VM state; just continue execution
             if (result == ZYM_CONTROL_TRANSFER) {
-                DISPATCH();
+                LOAD_STATE(); DISPATCH();
             }
 
             // Place result in callee slot
-            vm->stack[callee_slot] = result;
+            stack[callee_slot] = result;
 
             DISPATCH();
         }
@@ -2378,8 +2398,8 @@ static InterpretResult run(VM* vm) {
             ObjNativeClosure* native_closure = AS_NATIVE_CLOSURE(callee);
 
             if (arg_count != native_closure->arity) {
-                runtimeError(vm, "Expected %d arguments but got %u.", native_closure->arity, arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native_closure->arity, arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             // Prepare arguments array: [context, arg1, arg2, ...]
@@ -2387,7 +2407,7 @@ static InterpretResult run(VM* vm) {
             Value closure_args[MAX_NATIVE_ARITY + 1];
             closure_args[0] = native_closure->context;  // Context is first argument
             for (int i = 0; i < arg_count; i++) {
-                closure_args[i + 1] = vm->stack[callee_slot + 1 + i];
+                closure_args[i + 1] = stack[callee_slot + 1 + i];
             }
 
             // Protect arguments and context from GC during native call
@@ -2402,7 +2422,9 @@ static InterpretResult run(VM* vm) {
             }
 
             // Call native closure via dispatcher (context-aware dispatcher)
+            STORE_STATE();
             Value result = native_closure->dispatcher(vm, closure_args, native_closure->func_ptr);
+            stack = vm->stack; // native may trigger GC that reallocates stack
 
             // Restore temp root count
             vm->temp_root_count = saved_temp_root_count;
@@ -2416,26 +2438,26 @@ static InterpretResult run(VM* vm) {
             // Check for control transfer (capture/abort)
             // The native has already modified VM state; just continue execution
             if (result == ZYM_CONTROL_TRANSFER) {
-                DISPATCH();
+                LOAD_STATE(); DISPATCH();
             }
 
             // Place result in callee slot
-            vm->stack[callee_slot] = result;
+            stack[callee_slot] = result;
 
             DISPATCH();
         }
 
-        runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
-        return INTERPRET_RUNTIME_ERROR;
+        STORE_IP(); runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
+        STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
     }
     OP(CALL_SELF) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         CallFrame* current_frame = vm->current_frame;
         int callee_slot = current_frame->stack_base + REG_A(instr);
         ObjClosure* closure = current_frame->closure;
         ObjFunction* function = closure->function;
 
-        vm->stack[callee_slot] = OBJ_VAL(closure);
+        stack[callee_slot] = OBJ_VAL(closure);
 
         #ifdef DEBUG_CALL
         uint16_t arg_count_dbg = REG_Bx(instr);
@@ -2448,15 +2470,16 @@ static InterpretResult run(VM* vm) {
         #endif
 
         if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
-            runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         int needed_top = callee_slot + function->max_regs;
         if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
             if (!growStackForCall(vm, needed_top, NULL)) {
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
+            stack = vm->stack;
         }
 
         if (needed_top > vm->stack_top) {
@@ -2465,34 +2488,34 @@ static InterpretResult run(VM* vm) {
 
         CallFrame* frame = &vm->frames[vm->frame_count++];
         frame->closure      = closure;
-        frame->ip           = vm->ip;
+        frame->ip           = ip;
         frame->stack_base   = callee_slot;
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
 
         vm->current_frame = frame;
-        vm->cur_base = callee_slot;
-        vm->ip = function->chunk->code;
+        base = callee_slot;
+        ip = function->chunk->code;
         DISPATCH();
     }
     OP(TAIL_CALL) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int callee_slot = CUR_BASE() + REG_A(instr);
         uint16_t arg_count = REG_Bx(instr);
-        Value callee = vm->stack[callee_slot];
+        Value callee = stack[callee_slot];
 
         // Dereference if callee is a reference
-        vm->stack[callee_slot] = callee;
+        stack[callee_slot] = callee;
 
         // Resolve dispatcher overload if needed
         if (IS_DISPATCHER(callee)) {
             Value matched_closure = resolveOverload(vm, AS_DISPATCHER(callee), arg_count);
             if (IS_NULL(matched_closure)) {
-                runtimeError(vm, "No overload found for %u arguments.", arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "No overload found for %u arguments.", arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             callee = matched_closure;
-            vm->stack[callee_slot] = callee;
+            stack[callee_slot] = callee;
         }
 
         // Handle closures first (most common tail call target)
@@ -2501,8 +2524,8 @@ static InterpretResult run(VM* vm) {
             ObjFunction* function = closure->function;
 
             if (arg_count != function->arity) {
-                runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
@@ -2512,8 +2535,9 @@ static InterpretResult run(VM* vm) {
 
             // Grow stack if needed
             if (!growStackForCall(vm, needed_top, NULL)) {
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
+            stack = vm->stack;
 
             if (needed_top > vm->stack_top) {
                 vm->stack_top = needed_top;
@@ -2522,18 +2546,18 @@ static InterpretResult run(VM* vm) {
             // Upvalues have already been closed by CLOSE_FRAME_UPVALUES instruction
             // Move args to the frame base
             for (int i = 0; i < arg_count; i++) {
-                vm->stack[frame_base + 1 + i] = vm->stack[callee_slot + 1 + i];
+                stack[frame_base + 1 + i] = stack[callee_slot + 1 + i];
             }
 
             // Put the new callee in R0 of this frame
-            vm->stack[frame_base] = callee;
+            stack[frame_base] = callee;
 
             // Update the frame to point at the new closure
             current_frame->closure = closure;
 
             // Jump into the new function
             vm->chunk = function->chunk;
-            vm->ip    = function->chunk->code;
+            ip    = function->chunk->code;
 
             DISPATCH();
         }
@@ -2543,11 +2567,11 @@ static InterpretResult run(VM* vm) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
 
             if (arg_count != native->arity) {
-                runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
-            Value* args = &vm->stack[callee_slot + 1];
+            Value* args = &stack[callee_slot + 1];
 
             int saved_temp_root_count = vm->temp_root_count;
             for (int i = 0; i < arg_count; i++) {
@@ -2556,7 +2580,9 @@ static InterpretResult run(VM* vm) {
                 }
             }
 
+            STORE_STATE();
             Value result = native->dispatcher(vm, args, native->func_ptr);
+            stack = vm->stack; // native may trigger GC that reallocates stack
 
             vm->temp_root_count = saved_temp_root_count;
 
@@ -2565,17 +2591,17 @@ static InterpretResult run(VM* vm) {
             }
 
             if (result == ZYM_CONTROL_TRANSFER) {
-                DISPATCH();
+                LOAD_STATE(); DISPATCH();
             }
 
             // Tail position: return the native's result from the current frame
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
-                                vm->open_upvalues->location >= &vm->stack[frame->stack_base], 0)) {
-                closeUpvalues(vm, &vm->stack[frame->stack_base]);
+                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base]);
             }
             vm->frame_count--;
-            vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
@@ -2591,47 +2617,47 @@ static InterpretResult run(VM* vm) {
                 if (vm->resume_depth > 0) {
                     ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
                     if (vm->frame_count == ctx->frame_boundary) {
-                        vm->stack[ctx->result_slot] = result;
+                        stack[ctx->result_slot] = result;
                         vm->resume_depth--;
                         vm->active_boundaries--;
-                        vm->ip    = frame->ip;
+                        ip    = frame->ip;
                         vm->chunk = frame->caller_chunk;
                         DISPATCH();
                     }
                 }
             }
 
-            vm->ip    = frame->ip;
+            ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
-            vm->stack[frame->stack_base] = result;
+            stack[frame->stack_base] = result;
 
             DISPATCH();
         }
 
-        runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
-        return INTERPRET_RUNTIME_ERROR;
+        STORE_IP(); runtimeError(vm, ERR_ONLY_CALL_FUNCTIONS);
+        STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
     }
     OP(TAIL_CALL_SELF) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         CallFrame* current_frame = vm->current_frame;
         int callee_slot = current_frame->stack_base + REG_A(instr);
         uint16_t arg_count = REG_Bx(instr);
         ObjClosure* closure = current_frame->closure;
         ObjFunction* function = closure->function;
 
-        vm->stack[callee_slot] = OBJ_VAL(closure);
+        stack[callee_slot] = OBJ_VAL(closure);
 
         int frame_base = current_frame->stack_base;
         int needed_top = frame_base + function->max_regs;
 
         if (__builtin_expect(needed_top > STACK_MAX, 0)) {
-            runtimeError(vm, "Stack overflow.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Stack overflow.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Move arguments from callee_slot to frame_base
         for (int i = 0; i <= arg_count; i++) {
-            vm->stack[frame_base + i] = vm->stack[callee_slot + i];
+            stack[frame_base + i] = stack[callee_slot + i];
         }
 
         // Update stack_top if needed
@@ -2640,14 +2666,14 @@ static InterpretResult run(VM* vm) {
         }
 
         // Jump into the function (restart from beginning)
-        vm->ip = function->chunk->code;
+        ip = function->chunk->code;
 
         DISPATCH();
     }
     OP(RET) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         if (vm->frame_count == 0) {
-            return INTERPRET_OK;
+            STORE_STATE(); return INTERPRET_OK;
         }
 
         int  ret_reg = REG_A(instr);
@@ -2657,18 +2683,18 @@ static InterpretResult run(VM* vm) {
         // Get the return value BEFORE closing upvalues
         Value return_value = implicit_null
                            ? NULL_VAL
-                           : vm->stack[frame->stack_base + ret_reg];
+                           : stack[frame->stack_base + ret_reg];
 
         // Before we pop the frame, close any upvalues pointing to its stack slots.
         // Fast path: skip the function call if no open upvalues reach into this frame.
         if (__builtin_expect(vm->open_upvalues != NULL &&
-                            vm->open_upvalues->location >= &vm->stack[frame->stack_base], 0)) {
-            closeUpvalues(vm, &vm->stack[frame->stack_base]);
+                            vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+            closeUpvalues(vm, &stack[frame->stack_base]);
         }
 
         // Now pop the callee frame
         vm->frame_count--;
-        vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+        base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
         vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
 
         if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
@@ -2691,10 +2717,10 @@ static InterpretResult run(VM* vm) {
             if (vm->resume_depth > 0) {
                 ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
                 if (vm->frame_count == ctx->frame_boundary) {
-                    vm->stack[ctx->result_slot] = return_value;
+                    stack[ctx->result_slot] = return_value;
                     vm->resume_depth--;
                     vm->active_boundaries--;
-                    vm->ip    = frame->ip;
+                    ip    = frame->ip;
                     vm->chunk = frame->caller_chunk;
                     DISPATCH();
                 }
@@ -2702,14 +2728,14 @@ static InterpretResult run(VM* vm) {
         }
 
         // Normal return: restore caller context
-        vm->ip    = frame->ip;
+        ip    = frame->ip;
         vm->chunk = frame->caller_chunk;
-        vm->stack[frame->stack_base] = return_value;
+        stack[frame->stack_base] = return_value;
 
         DISPATCH();
     }
     OP(CLOSURE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
 
@@ -2718,10 +2744,11 @@ static InterpretResult run(VM* vm) {
 
         // 2. Create the closure object.
         ObjClosure* closure = newClosure(vm, function);
+        stack = vm->stack; // GC may have reallocated stack
         // Protect closure from GC during stack write and captureUpvalue calls
         pushTempRoot(vm, (Obj*)closure);
 
-        vm->stack[a] = OBJ_VAL(closure);
+        stack[a] = OBJ_VAL(closure);
 
         // 3. Capture the upvalues based on the "recipe" stored in the ObjFunction.
         // Get the current stack base (handles both main script with frame_count=0 and functions)
@@ -2731,7 +2758,8 @@ static InterpretResult run(VM* vm) {
             uint8_t index = function->upvalues[i].index;
             if (is_local) {
                 // Capture a local variable from the current (enclosing) function's stack frame.
-                closure->upvalues[i] = captureUpvalue(vm, &vm->stack[cur_base + index]);
+                closure->upvalues[i] = captureUpvalue(vm, &stack[cur_base + index]);
+                stack = vm->stack; // GC may have reallocated stack
             } else {
                 // Capture an upvalue from the enclosing function itself.
                 // This requires an actual call frame (not the main script).
@@ -2748,7 +2776,7 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(GET_UPVALUE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
 
@@ -2758,77 +2786,78 @@ static InterpretResult run(VM* vm) {
 
         // Don't auto-dereference - let references be first-class values
         // Dereferencing happens at use sites (arithmetic, print, etc.)
-        vm->stack[a] = value;
+        stack[a] = value;
         DISPATCH();
     }
     OP(SET_UPVALUE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
 
         CallFrame* frame = vm->current_frame;
         if (!validateUpvalue(vm, frame->closure->upvalues[bx], "SET_UPVALUE")) {
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
-        *frame->closure->upvalues[bx]->location = vm->stack[a];
+        *frame->closure->upvalues[bx]->location = stack[a];
         DISPATCH();
     }
     OP(CLOSE_UPVALUE) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
-        closeUpvalues(vm, &vm->stack[a]);
+        closeUpvalues(vm, &stack[a]);
         DISPATCH();
     }
     OP(CLOSE_FRAME_UPVALUES) {
         // Close all upvalues for the current frame
         // Used before TAIL_CALL to ensure upvalues are closed before we overwrite the stack
         CallFrame* frame = vm->current_frame;
-        closeUpvalues(vm, &vm->stack[frame->stack_base]);
+        closeUpvalues(vm, &stack[frame->stack_base]);
         DISPATCH();
     }
     OP(NEW_LIST) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int count = REG_Bx(instr);
         ObjList* list = newList(vm);
+        stack = vm->stack; // GC may have reallocated stack
         // Protect the list from GC during writeValueArray and stack write
         pushTempRoot(vm, (Obj*)list);
         // If count > 0, copy elements from subsequent stack slots.
         // (This makes our opcode future-proof for optimizations).
         for (int i = 0; i < count; i++) {
-            writeValueArray(vm, &list->items, vm->stack[a + 1 + i]);
+            writeValueArray(vm, &list->items, stack[a + 1 + i]);
         }
-        vm->stack[a] = OBJ_VAL(list);
+        stack[a] = OBJ_VAL(list);
         popTempRoot(vm);
         DISPATCH();
     }
     OP(LIST_APPEND) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // list
         int b = CUR_BASE() + REG_B(instr); // value
-        Value list_val = vm->stack[a];
+        Value list_val = stack[a];
         if (!IS_LIST(list_val)) {
-            runtimeError(vm, "Can only append to a list.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Can only append to a list.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjList* list = AS_LIST(list_val);
-        Value value_to_append = vm->stack[b];
+        Value value_to_append = stack[b];
         writeValueArray(vm, &list->items, value_to_append);
         DISPATCH();
     }
     OP(LIST_SPREAD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // target list
         int b = CUR_BASE() + REG_B(instr); // source list to spread
-        Value target_val = vm->stack[a];
-        Value source_val = vm->stack[b];
+        Value target_val = stack[a];
+        Value source_val = stack[b];
         if (!IS_LIST(target_val)) {
-            runtimeError(vm, "Spread target must be a list.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread target must be a list.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         if (!IS_LIST(source_val)) {
-            runtimeError(vm, "Spread source must be a list.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread source must be a list.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjList* target = AS_LIST(target_val);
         ObjList* source = AS_LIST(source_val);
@@ -2839,34 +2868,35 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(NEW_MAP) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         ObjMap* map = newMap(vm);
+        stack = vm->stack; // GC may have reallocated stack
         // Protect the map from GC during stack write
         pushTempRoot(vm, (Obj*)map);
-        vm->stack[a] = OBJ_VAL(map);
+        stack[a] = OBJ_VAL(map);
         popTempRoot(vm);
         DISPATCH();
     }
     OP(MAP_SET) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Map register
         int b = CUR_BASE() + REG_B(instr); // Key register
         int c = CUR_BASE() + REG_C(instr); // Value register
-        Value map_val = vm->stack[a];
-        Value key_val = vm->stack[b];
-        Value value_val = vm->stack[c];
+        Value map_val = stack[a];
+        Value key_val = stack[b];
+        Value value_val = stack[c];
 
         if (!IS_MAP(map_val)) {
-            runtimeError(vm, "MAP_SET expects a map object.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "MAP_SET expects a map object.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(map_val);
         ObjString* key_str = keyToString(vm, key_val);
         if (!key_str) {
-            runtimeError(vm, ERR_MAP_KEYS_TYPE);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_MAP_KEYS_TYPE);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Set the key-value pair (or skip if value is null)
@@ -2876,18 +2906,18 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(MAP_SPREAD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // target map
         int b = CUR_BASE() + REG_B(instr); // source map to spread
-        Value target_val = vm->stack[a];
-        Value source_val = vm->stack[b];
+        Value target_val = stack[a];
+        Value source_val = stack[b];
         if (!IS_MAP(target_val)) {
-            runtimeError(vm, "Spread target must be a map.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread target must be a map.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         if (!IS_MAP(source_val)) {
-            runtimeError(vm, "Spread source must be a map.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread source must be a map.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjMap* target = AS_MAP(target_val);
         ObjMap* source = AS_MAP(source_val);
@@ -2901,12 +2931,12 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(GET_SUBSCRIPT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
         int b = CUR_BASE() + REG_B(instr); // Object register (list or map)
         int c = CUR_BASE() + REG_C(instr); // Index/Key register
-        Value obj_val = vm->stack[b];
-        Value key_val = vm->stack[c];
+        Value obj_val = stack[b];
+        Value key_val = stack[c];
 
         // Dereference container if it's a reference
 
@@ -2915,59 +2945,59 @@ static InterpretResult run(VM* vm) {
             ObjMap* map = AS_MAP(obj_val);
             ObjString* key_str = keyToString(vm, key_val);
             if (!key_str) {
-                runtimeError(vm, ERR_MAP_KEYS_TYPE);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, ERR_MAP_KEYS_TYPE);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             Value result;
             if (tableGet(&map->table, key_str, &result)) {
-                vm->stack[a] = result;
+                stack[a] = result;
             } else {
-                vm->stack[a] = NULL_VAL;
+                stack[a] = NULL_VAL;
             }
             DISPATCH();
         }
 
         // Handle lists
         if (!IS_LIST(obj_val)) {
-            runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjList* list = AS_LIST(obj_val);
         if (!IS_DOUBLE(key_val)) {
-            runtimeError(vm, ERR_LIST_INDEX_TYPE);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_LIST_INDEX_TYPE);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         double index_double = AS_DOUBLE(key_val);
         int index = (int)index_double;
         if (index != index_double) {
-            runtimeError(vm, "List index must be an integer.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "List index must be an integer.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         if (index < 0 || index >= list->items.count) {
-            runtimeError(vm, "List index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "List index out of bounds.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         Value result = list->items.values[index];
         // Don't auto-dereference - refs are first-class values
-        vm->stack[a] = result;
+        stack[a] = result;
         DISPATCH();
     }
     OP(GET_SUBSCRIPT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int index = REG_C(instr);
-        Value obj_val = vm->stack[b];
+        Value obj_val = stack[b];
 
 
         if (IS_LIST(obj_val)) {
             ObjList* list = AS_LIST(obj_val);
             if (index >= list->items.count) {
-                runtimeError(vm, "List index out of bounds.");
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "List index out of bounds.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
-            vm->stack[a] = list->items.values[index];
+            stack[a] = list->items.values[index];
             DISPATCH();
         }
 
@@ -2976,26 +3006,27 @@ static InterpretResult run(VM* vm) {
             char buf[12];
             snprintf(buf, sizeof(buf), "%d", index);
             ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
+            stack = vm->stack; // GC may have reallocated stack
             Value result;
             if (tableGet(&map->table, key_str, &result)) {
-                vm->stack[a] = result;
+                stack[a] = result;
             } else {
-                vm->stack[a] = NULL_VAL;
+                stack[a] = NULL_VAL;
             }
             DISPATCH();
         }
 
-        runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
-        return INTERPRET_RUNTIME_ERROR;
+        STORE_IP(); runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+        STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
     }
     OP(SET_SUBSCRIPT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Object register (list or map)
         int b = CUR_BASE() + REG_B(instr); // Index/Key register
         int c = CUR_BASE() + REG_C(instr); // Value register
-        Value obj_val = vm->stack[a];
-        Value key_val = vm->stack[b];
-        Value value_val = vm->stack[c];
+        Value obj_val = stack[a];
+        Value key_val = stack[b];
+        Value value_val = stack[c];
 
         // Dereference container if it's a reference
 
@@ -3004,8 +3035,8 @@ static InterpretResult run(VM* vm) {
             ObjMap* map = AS_MAP(obj_val);
             ObjString* key_str = keyToString(vm, key_val);
             if (!key_str) {
-                runtimeError(vm, ERR_MAP_KEYS_TYPE);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, ERR_MAP_KEYS_TYPE);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
             // Delete key if value is null
@@ -3019,42 +3050,42 @@ static InterpretResult run(VM* vm) {
 
         // Handle lists
         if (!IS_LIST(obj_val)) {
-            runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjList* list = AS_LIST(obj_val);
         if (!IS_DOUBLE(key_val)) {
-            runtimeError(vm, ERR_LIST_INDEX_TYPE);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_LIST_INDEX_TYPE);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         double index_double = AS_DOUBLE(key_val);
         int index = (int)index_double;
         if (index != index_double) {
-            runtimeError(vm, "List index must be an integer.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "List index must be an integer.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         if (index < 0 || index >= list->items.count) {
-            runtimeError(vm, "List index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "List index out of bounds.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         list->items.values[index] = value_val;
         DISPATCH();
     }
     OP(SET_SUBSCRIPT_I) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int index = REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
-        Value obj_val = vm->stack[a];
-        Value value_val = vm->stack[c];
+        Value obj_val = stack[a];
+        Value value_val = stack[c];
 
 
         if (IS_LIST(obj_val)) {
             ObjList* list = AS_LIST(obj_val);
             if (index >= list->items.count) {
-                runtimeError(vm, "List index out of bounds.");
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_IP(); runtimeError(vm, "List index out of bounds.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             list->items.values[index] = value_val;
             DISPATCH();
@@ -3065,6 +3096,7 @@ static InterpretResult run(VM* vm) {
             char buf[12];
             snprintf(buf, sizeof(buf), "%d", index);
             ObjString* key_str = copyString(vm, buf, (int)strlen(buf));
+            stack = vm->stack; // GC may have reallocated stack
 
             if (IS_NULL(value_val)) {
                 tableDelete(&map->table, key_str);
@@ -3074,22 +3106,22 @@ static InterpretResult run(VM* vm) {
             DISPATCH();
         }
 
-        runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
-        return INTERPRET_RUNTIME_ERROR;
+        STORE_IP(); runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
+        STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
     }
     /*OP(GET_MAP_PROPERTY) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
         int b = CUR_BASE() + REG_B(instr); // Container register (map or struct)
         int c = CUR_BASE() + REG_C(instr); // Key register (must be a string)
-        Value container_val = vm->stack[b];
-        Value key_val = vm->stack[c];
+        Value container_val = stack[b];
+        Value key_val = stack[c];
 
         // Dereference container if it's a reference
 
         if (!IS_STRING(key_val)) {
-            runtimeError(vm, "Property key must be a string.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Property key must be a string.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjString* key_str = AS_STRING(key_val);
@@ -3101,44 +3133,44 @@ static InterpretResult run(VM* vm) {
             // Fast field lookup using pointer comparison on interned strings
             int field_index = find_field_index(instance->schema, key_str);
             if (field_index >= 0) {
-                vm->stack[a] = instance->fields[field_index];
+                stack[a] = instance->fields[field_index];
             } else {
-                runtimeError(vm, "Struct '%s' has no field '%s'.",
+                STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                              instance->schema->name->chars, key_str->chars);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             DISPATCH();
         }
 
         // Handle maps
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
         if (tableGet(&map->table, key_str, &result)) {
-            vm->stack[a] = result;
+            stack[a] = result;
         } else {
-            vm->stack[a] = NULL_VAL;
+            stack[a] = NULL_VAL;
         }
         DISPATCH();
     }*/
     /*OP(SET_MAP_PROPERTY) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Container register (map or struct)
         int b = CUR_BASE() + REG_B(instr); // Key register (must be a string)
         int c = CUR_BASE() + REG_C(instr); // Value register
-        Value container_val = vm->stack[a];
-        Value key_val = vm->stack[b];
-        Value value_val = vm->stack[c];
+        Value container_val = stack[a];
+        Value key_val = stack[b];
+        Value value_val = stack[c];
 
         // Dereference container if it's a reference
 
         if (!IS_STRING(key_val)) {
-            runtimeError(vm, "Property key must be a string.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Property key must be a string.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjString* key_str = AS_STRING(key_val);
@@ -3152,17 +3184,17 @@ static InterpretResult run(VM* vm) {
             if (field_index >= 0) {
                 instance->fields[field_index] = value_val;
             } else {
-                runtimeError(vm, "Struct '%s' has no field '%s'.",
+                STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                              instance->schema->name->chars, key_str->chars);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
             DISPATCH();
         }
 
         // Handle maps
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
@@ -3176,58 +3208,58 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }*/
     OP(GET_MAP_PROPERTY_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
 
         // Read key string from constant pool via trailing index word
-        uint32_t const_idx = *vm->ip++;
+        uint32_t const_idx = *ip++;
         ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
 
-        Value container_val = vm->stack[b];
+        Value container_val = stack[b];
 
         // Handle struct instances
         if (IS_STRUCT_INSTANCE(container_val)) {
             ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
             int field_index = find_field_index(instance->schema, key_str);
             if (field_index >= 0) {
-                vm->stack[a] = instance->fields[field_index];
+                stack[a] = instance->fields[field_index];
 
                 // Self-patch: bake field_index into C, switch to IC opcode
-                vm->ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
+                ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
                 DISPATCH();
             }
-            runtimeError(vm, "Struct '%s' has no field '%s'.",
+            STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                          instance->schema->name->chars, key_str->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Handle maps
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
         if (tableGet(&map->table, key_str, &result)) {
-            vm->stack[a] = result;
+            stack[a] = result;
         } else {
-            vm->stack[a] = NULL_VAL;
+            stack[a] = NULL_VAL;
         }
         DISPATCH();
     }
     OP(SET_MAP_PROPERTY_L) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int c = CUR_BASE() + REG_C(instr);
 
         // Read key string from constant pool via trailing index word
-        uint32_t const_idx = *vm->ip++;
+        uint32_t const_idx = *ip++;
         ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
 
-        Value container_val = vm->stack[a];
-        Value value_val = vm->stack[c];
+        Value container_val = stack[a];
+        Value value_val = stack[c];
 
         // Handle struct instances
         if (IS_STRUCT_INSTANCE(container_val)) {
@@ -3237,18 +3269,18 @@ static InterpretResult run(VM* vm) {
                 instance->fields[field_index] = value_val;
 
                 // Self-patch: bake field_index into B, switch to IC opcode
-                vm->ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
+                ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
                 DISPATCH();
             }
-            runtimeError(vm, "Struct '%s' has no field '%s'.",
+            STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                          instance->schema->name->chars, key_str->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Handle maps
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
@@ -3260,16 +3292,16 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(GET_STRUCT_FIELD_IC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
         int cached_field = REG_C(instr);
 
         // Read key from constant pool via trailing index word
-        uint32_t const_idx = *vm->ip++;
+        uint32_t const_idx = *ip++;
         ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
 
-        Value container_val = vm->stack[b];
+        Value container_val = stack[b];
 
         if (IS_STRUCT_INSTANCE(container_val)) {
             ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
@@ -3277,52 +3309,52 @@ static InterpretResult run(VM* vm) {
             // IC hit: verify cached field index maps to the expected field name
             if (cached_field < instance->field_count &&
                 instance->schema->field_names[cached_field] == key_str) {
-                vm->stack[a] = instance->fields[cached_field];
+                stack[a] = instance->fields[cached_field];
                 DISPATCH();
             }
 
             // IC miss: full lookup, re-cache
             int field_index = find_field_index(instance->schema, key_str);
             if (field_index >= 0) {
-                vm->ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
-                vm->stack[a] = instance->fields[field_index];
+                ip[-2] = (uint32_t)(GET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16) | ((uint32_t)field_index << 24);
+                stack[a] = instance->fields[field_index];
                 DISPATCH();
             }
-            runtimeError(vm, "Struct '%s' has no field '%s'.",
+            STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                          instance->schema->name->chars, key_str->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Not a struct: revert to _L and handle as map
-        vm->ip[-2] = (uint32_t)(GET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16);
+        ip[-2] = (uint32_t)(GET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_B(instr) << 16);
 
         // Handle maps inline (avoid re-dispatch overhead)
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
         Value result;
         if (tableGet(&map->table, key_str, &result)) {
-            vm->stack[a] = result;
+            stack[a] = result;
         } else {
-            vm->stack[a] = NULL_VAL;
+            stack[a] = NULL_VAL;
         }
         DISPATCH();
     }
     OP(SET_STRUCT_FIELD_IC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int cached_field = REG_B(instr);
         int c = CUR_BASE() + REG_C(instr);
 
         // Read key from constant pool via trailing index word
-        uint32_t const_idx = *vm->ip++;
+        uint32_t const_idx = *ip++;
         ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
 
-        Value container_val = vm->stack[a];
-        Value value_val = vm->stack[c];
+        Value container_val = stack[a];
+        Value value_val = stack[c];
 
         if (IS_STRUCT_INSTANCE(container_val)) {
             ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
@@ -3337,22 +3369,22 @@ static InterpretResult run(VM* vm) {
             // IC miss: full lookup, re-cache
             int field_index = find_field_index(instance->schema, key_str);
             if (field_index >= 0) {
-                vm->ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
+                ip[-2] = (uint32_t)(SET_STRUCT_FIELD_IC) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)field_index << 16) | ((uint32_t)REG_C(instr) << 24);
                 instance->fields[field_index] = value_val;
                 DISPATCH();
             }
-            runtimeError(vm, "Struct '%s' has no field '%s'.",
+            STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
                          instance->schema->name->chars, key_str->chars);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         // Not a struct: revert to _L and handle as map
-        vm->ip[-2] = (uint32_t)(SET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_C(instr) << 24);
+        ip[-2] = (uint32_t)(SET_MAP_PROPERTY_L) | ((uint32_t)REG_A(instr) << 8) | ((uint32_t)REG_C(instr) << 24);
 
         // Handle maps inline
         if (!IS_MAP(container_val)) {
-            runtimeError(vm, ERR_ONLY_MAPS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjMap* map = AS_MAP(container_val);
@@ -3364,75 +3396,76 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(NEW_DISPATCHER) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         ObjDispatcher* dispatcher = newDispatcher(vm);
         pushTempRoot(vm, (Obj*)dispatcher);
-        vm->stack[a] = OBJ_VAL(dispatcher);
+        stack[a] = OBJ_VAL(dispatcher);
         popTempRoot(vm);
         DISPATCH();
     }
     OP(ADD_OVERLOAD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Dispatcher register
         int b = CUR_BASE() + REG_B(instr); // Closure register
 
-        Value disp_val = vm->stack[a];
-        Value closure_val = vm->stack[b];
+        Value disp_val = stack[a];
+        Value closure_val = stack[b];
 
         if (!IS_DISPATCHER(disp_val)) {
-            runtimeError(vm, "ADD_OVERLOAD requires a dispatcher.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "ADD_OVERLOAD requires a dispatcher.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         if (!IS_CLOSURE(closure_val)) {
-            runtimeError(vm, "ADD_OVERLOAD requires a closure.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "ADD_OVERLOAD requires a closure.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjDispatcher* dispatcher = AS_DISPATCHER(disp_val);
         ObjClosure* closure = AS_CLOSURE(closure_val);
 
         if (dispatcher->count >= MAX_OVERLOADS) {
-            runtimeError(vm, "Too many overloads (max %d).", MAX_OVERLOADS);
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Too many overloads (max %d).", MAX_OVERLOADS);
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         dispatcher->overloads[dispatcher->count++] = (Obj*)closure;
         DISPATCH();
     }
     OP(NEW_STRUCT) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
         int bx = REG_Bx(instr);             // Schema constant index
 
         Value schema_val = vm->chunk->constants.values[bx];
         if (!IS_STRUCT_SCHEMA(schema_val)) {
-            runtimeError(vm, "NEW_STRUCT requires a struct schema constant.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "NEW_STRUCT requires a struct schema constant.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjStructSchema* schema = AS_STRUCT_SCHEMA(schema_val);
         ObjStructInstance* instance = newStructInstance(vm, schema);
+        stack = vm->stack; // GC may have reallocated stack
         // Protect instance before writing to stack (which can trigger GC)
         pushTempRoot(vm, (Obj*)instance);
-        vm->stack[a] = OBJ_VAL(instance);
+        stack[a] = OBJ_VAL(instance);
         popTempRoot(vm);
         DISPATCH();
     }
     OP(STRUCT_SPREAD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // target struct
         int b = CUR_BASE() + REG_B(instr); // source struct to spread
-        Value target_val = vm->stack[a];
-        Value source_val = vm->stack[b];
+        Value target_val = stack[a];
+        Value source_val = stack[b];
         if (!IS_STRUCT_INSTANCE(target_val)) {
-            runtimeError(vm, "Spread target must be a struct instance.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread target must be a struct instance.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         if (!IS_STRUCT_INSTANCE(source_val)) {
-            runtimeError(vm, "Spread source must be a struct instance.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Spread source must be a struct instance.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
         ObjStructInstance* target = AS_STRUCT_INSTANCE(target_val);
         ObjStructInstance* source = AS_STRUCT_INSTANCE(source_val);
@@ -3452,9 +3485,9 @@ static InterpretResult run(VM* vm) {
             }
 
             if (!compatible) {
-                runtimeError(vm, "Cannot spread struct '%s' into struct '%s' - incompatible types.",
+                STORE_IP(); runtimeError(vm, "Cannot spread struct '%s' into struct '%s' - incompatible types.",
                             source->schema->name->chars, target->schema->name->chars);
-                return INTERPRET_RUNTIME_ERROR;
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
         }
 
@@ -3465,119 +3498,119 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     OP(GET_STRUCT_FIELD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Destination register
         int b = CUR_BASE() + REG_B(instr); // Struct instance register
         int c = REG_C(instr);               // Field index
 
-        Value struct_val = vm->stack[b];
+        Value struct_val = stack[b];
 
         // Dereference container if it's a reference
 
         if (!IS_STRUCT_INSTANCE(struct_val)) {
-            runtimeError(vm, "GET_STRUCT_FIELD requires a struct instance.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "GET_STRUCT_FIELD requires a struct instance.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjStructInstance* instance = AS_STRUCT_INSTANCE(struct_val);
         if (c < 0 || c >= instance->schema->field_count) {
-            runtimeError(vm, "Struct field index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Struct field index out of bounds.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        vm->stack[a] = instance->fields[c];
+        stack[a] = instance->fields[c];
         DISPATCH();
     }
     OP(SET_STRUCT_FIELD) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr); // Struct instance register
         int b = REG_B(instr);               // Field index
         int c = CUR_BASE() + REG_C(instr); // Value register
 
-        Value struct_val = vm->stack[a];
-        Value new_value = vm->stack[c];
+        Value struct_val = stack[a];
+        Value new_value = stack[c];
 
         // Dereference container if it's a reference
 
         if (!IS_STRUCT_INSTANCE(struct_val)) {
-            runtimeError(vm, "SET_STRUCT_FIELD requires a struct instance.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "SET_STRUCT_FIELD requires a struct instance.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjStructInstance* instance = AS_STRUCT_INSTANCE(struct_val);
         if (b < 0 || b >= instance->schema->field_count) {
-            runtimeError(vm, "Struct field index out of bounds.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Struct field index out of bounds.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         instance->fields[b] = new_value;
         DISPATCH();
     }
     OP(PRE_INC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
+        Value val_b = stack[b];
 
         if (!IS_DOUBLE(val_b)) {
-            runtimeError(vm, "Pre-increment operand must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Pre-increment operand must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         Value result = DOUBLE_VAL(AS_DOUBLE(val_b) + 1.0);
-        vm->stack[b] = result;
-        vm->stack[a] = result;
+        stack[b] = result;
+        stack[a] = result;
 
         DISPATCH();
     }
     OP(POST_INC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
+        Value val_b = stack[b];
 
         if (!IS_DOUBLE(val_b)) {
-            runtimeError(vm, "Post-increment operand must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Post-increment operand must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         double old_value = AS_DOUBLE(val_b);
-        vm->stack[b] = DOUBLE_VAL(old_value + 1.0);
-        vm->stack[a] = DOUBLE_VAL(old_value);
+        stack[b] = DOUBLE_VAL(old_value + 1.0);
+        stack[a] = DOUBLE_VAL(old_value);
 
         DISPATCH();
     }
     OP(PRE_DEC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
+        Value val_b = stack[b];
 
         if (!IS_DOUBLE(val_b)) {
-            runtimeError(vm, "Pre-decrement operand must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Pre-decrement operand must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         Value result = DOUBLE_VAL(AS_DOUBLE(val_b) - 1.0);
-        vm->stack[b] = result;
-        vm->stack[a] = result;
+        stack[b] = result;
+        stack[a] = result;
 
         DISPATCH();
     }
     OP(POST_DEC) {
-        uint32_t instr = vm->ip[-1];
+        uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         int b = CUR_BASE() + REG_B(instr);
-        Value val_b = vm->stack[b];
+        Value val_b = stack[b];
 
         if (!IS_DOUBLE(val_b)) {
-            runtimeError(vm, "Post-decrement operand must be a number.");
-            return INTERPRET_RUNTIME_ERROR;
+            STORE_IP(); runtimeError(vm, "Post-decrement operand must be a number.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         double old_value = AS_DOUBLE(val_b);
-        vm->stack[b] = DOUBLE_VAL(old_value - 1.0);
-        vm->stack[a] = DOUBLE_VAL(old_value);
+        stack[b] = DOUBLE_VAL(old_value - 1.0);
+        stack[a] = DOUBLE_VAL(old_value);
 
         DISPATCH();
     }
@@ -3586,6 +3619,9 @@ static InterpretResult run(VM* vm) {
 #undef CUR_BASE
 #undef BINARY_OP
 #undef BINARY_COMPARE
+#undef STORE_IP
+#undef STORE_STATE
+#undef LOAD_STATE
 }
 
 InterpretResult runVM(VM* vm) {
