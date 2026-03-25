@@ -513,6 +513,14 @@ static int add_upvalue(Compiler* compiler, uint8_t index, bool is_local, ObjStru
         return -1;
     }
 
+    // Grow the dynamic upvalue array if needed
+    if (compiler->upvalue_count >= compiler->upvalue_capacity) {
+        int old_capacity = compiler->upvalue_capacity;
+        compiler->upvalue_capacity = old_capacity < 8 ? 8 : old_capacity * 2;
+        compiler->upvalues = GROW_ARRAY(compiler->vm, Upvalue, compiler->upvalues,
+                                        old_capacity, compiler->upvalue_capacity);
+    }
+
     compiler->upvalues[compiler->upvalue_count].is_local = is_local;
     compiler->upvalues[compiler->upvalue_count].index = index;
     compiler->upvalues[compiler->upvalue_count].struct_type = struct_type;
@@ -3577,8 +3585,9 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->break_count = 0;
     compiler->break_capacity = 0;
 
-    memset(compiler->upvalues, 0, sizeof(compiler->upvalues));
+    compiler->upvalues = NULL;
     compiler->upvalue_count = 0;
+    compiler->upvalue_capacity = 0;
 
     memset(compiler->hoisted, 0, sizeof(compiler->hoisted));
     compiler->hoisted_count = 0;
@@ -4083,9 +4092,18 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     fn_compiler.function->max_regs = fn_compiler.max_register_seen + 1;
 
     fn_compiler.function->upvalue_count = fn_compiler.upvalue_count;
-    memcpy(fn_compiler.function->upvalues, fn_compiler.upvalues, sizeof(Upvalue) * fn_compiler.upvalue_count);
+    if (fn_compiler.upvalue_count > 0) {
+        fn_compiler.function->upvalues = ALLOCATE(fn_compiler.vm, Upvalue, fn_compiler.upvalue_count);
+        fn_compiler.function->upvalue_capacity = fn_compiler.upvalue_count;
+        memcpy(fn_compiler.function->upvalues, fn_compiler.upvalues, sizeof(Upvalue) * fn_compiler.upvalue_count);
+    }
 
     free_owned_names(&fn_compiler);
+
+    // Clean up dynamic upvalue array
+    if (fn_compiler.upvalues) {
+        FREE_ARRAY(fn_compiler.vm, Upvalue, fn_compiler.upvalues, fn_compiler.upvalue_capacity);
+    }
 
     // Clean up break jumps array
     if (fn_compiler.break_jumps) {
@@ -4224,6 +4242,11 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
 cleanup_on_error:
     // Clean up owned names
     free_owned_names(&compiler);
+
+    // Clean up dynamic upvalue array
+    if (compiler.upvalues) {
+        FREE_ARRAY(vm, Upvalue, compiler.upvalues, compiler.upvalue_capacity);
+    }
 
     // Clean up global types array
     if (compiler.global_types) {

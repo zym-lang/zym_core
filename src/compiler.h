@@ -117,8 +117,9 @@ typedef struct Compiler {
     struct Compiler* enclosing;
     ObjFunction* function;
 
-    Upvalue upvalues[MAX_LOCALS];
+    Upvalue* upvalues;
     int upvalue_count;
+    int upvalue_capacity;
 
     HoistedFn hoisted[MAX_HOISTED];
     int hoisted_count;

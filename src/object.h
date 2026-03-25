@@ -92,8 +92,9 @@ typedef struct ObjFunction {
     Chunk* chunk;
     ObjString* name;
     ObjString* module_name;
-    Upvalue upvalues[MAX_LOCALS];
+    Upvalue* upvalues;
     int upvalue_count;
+    int upvalue_capacity;
 } ObjFunction;
 
 typedef Value (*NativeDispatcher)(VM* vm, Value* args, void* func_ptr);

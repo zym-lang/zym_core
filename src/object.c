@@ -75,6 +75,8 @@ ObjFunction* newFunction(VM* vm) {
 
     function->arity = 0;
     function->upvalue_count = 0;
+    function->upvalue_capacity = 0;
+    function->upvalues = NULL;
     function->max_regs = 1;
     function->name = NULL;
     function->module_name = NULL;

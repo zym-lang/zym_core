@@ -232,6 +232,8 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
                 if (fn->upvalue_count > 0) {
+                    fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);
+                    fn->upvalue_capacity = fn->upvalue_count;
                     READ_BYTES_OR_FAIL(fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
                 }
 

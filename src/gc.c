@@ -587,6 +587,9 @@ void freeObject(VM* vm, Obj* object) {
 
         case OBJ_FUNCTION: {
             ObjFunction* function = (ObjFunction*)object;
+            if (function->upvalues != NULL && function->upvalue_capacity > 0) {
+                FREE_ARRAY(vm, Upvalue, function->upvalues, function->upvalue_capacity);
+            }
             if (function->chunk) {
                 if (function->chunk->code && function->chunk->capacity > 0) {
                     FREE_ARRAY(vm, uint32_t, function->chunk->code, function->chunk->capacity);
