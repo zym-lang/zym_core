@@ -80,14 +80,8 @@ ObjFunction* newFunction(VM* vm) {
     function->max_regs = 1;
     function->name = NULL;
     function->module_name = NULL;
-    function->chunk = NULL;
+    initChunk(&function->chunk);
 
-    pushTempRoot(vm, (Obj*)function);
-
-    function->chunk = ALLOCATE(vm, Chunk, 1);
-    initChunk(function->chunk);
-
-    popTempRoot(vm);
     return function;
 }
 

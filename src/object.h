@@ -98,7 +98,7 @@ typedef struct ObjFunction {
     Obj obj;
     int arity;
     int max_regs;
-    Chunk* chunk;
+    Chunk chunk;
     ObjString* name;
     ObjString* module_name;
     Upvalue* upvalues;

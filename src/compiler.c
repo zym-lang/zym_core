@@ -3900,7 +3900,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     // Assign function to compiler BEFORE registering with VM
     // This ensures the function is marked if GC triggers
     fn_compiler.function = function;
-    fn_compiler.compiling_chunk = function->chunk;
+    fn_compiler.compiling_chunk = &function->chunk;
 
     // Now register this compiler with VM so GC can find it
     current_compiler->vm->compiler = &fn_compiler;
@@ -4151,7 +4151,7 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
         // Also store in VM for runtime errors when no frames exist
         vm->entry_file = compiler.function->module_name;
     }
-    compiler.compiling_chunk = compiler.function->chunk;
+    compiler.compiling_chunk = &compiler.function->chunk;
     // ---------------
 
     // --- PASS 1: DECLARATION ---
@@ -4286,21 +4286,21 @@ cleanup_on_error:
     // Deep copy the compiled chunk to the external chunk parameter
     // We compiled into compiler.function->chunk, but caller expects results in chunk parameter
     if (success) {
-        chunk->count = compiler.function->chunk->count;
-        chunk->capacity = compiler.function->chunk->capacity;
-        chunk->code = compiler.function->chunk->code;
-        chunk->lines = compiler.function->chunk->lines;
-        chunk->constants = compiler.function->chunk->constants;
+        chunk->count = compiler.function->chunk.count;
+        chunk->capacity = compiler.function->chunk.capacity;
+        chunk->code = compiler.function->chunk.code;
+        chunk->lines = compiler.function->chunk.lines;
+        chunk->constants = compiler.function->chunk.constants;
 
         // Mark the function's chunk as "don't free" by NULLing the pointers
         // This prevents double-free when the function is eventually freed by GC
-        compiler.function->chunk->code = NULL;
-        compiler.function->chunk->lines = NULL;
-        compiler.function->chunk->constants.values = NULL;
-        compiler.function->chunk->count = 0;
-        compiler.function->chunk->capacity = 0;
-        compiler.function->chunk->constants.count = 0;
-        compiler.function->chunk->constants.capacity = 0;
+        compiler.function->chunk.code = NULL;
+        compiler.function->chunk.lines = NULL;
+        compiler.function->chunk.constants.values = NULL;
+        compiler.function->chunk.count = 0;
+        compiler.function->chunk.capacity = 0;
+        compiler.function->chunk.constants.count = 0;
+        compiler.function->chunk.constants.capacity = 0;
 
         // Set vm->chunk to point to the external chunk so GC will mark its constants
         // This keeps the compiled functions alive until the VM is freed

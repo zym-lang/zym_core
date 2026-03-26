@@ -179,8 +179,8 @@ static ZymValue preempt_withDisabled(ZymVM* vm, ZymValue context, ZymValue fn) {
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
-    vm->chunk = function->chunk;
-    vm->ip = function->chunk->code;
+    vm->chunk = &function->chunk;
+    vm->ip = function->chunk.code;
 
     if (needed_top > vm->stack_top) {
         vm->stack_top = needed_top;

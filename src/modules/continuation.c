@@ -361,8 +361,8 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
-    vm->chunk = function->chunk;
-    vm->ip = function->chunk->code;
+    vm->chunk = &function->chunk;
+    vm->ip = function->chunk.code;
 
     if (needed_top > vm->stack_top) {
         vm->stack_top = needed_top;
@@ -417,12 +417,12 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         vm->chunk = captured_frame->caller_chunk;
 
         if (vm->chunk == NULL && vm->frame_count > 0) {
-            vm->chunk = vm->frames[vm->frame_count - 1].closure->function->chunk;
+            vm->chunk = &vm->frames[vm->frame_count - 1].closure->function->chunk;
         }
     } else if (vm->frame_count > 0) {
         CallFrame* frame = &vm->frames[vm->frame_count - 1];
         vm->ip = frame->ip;
-        vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
+        vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
     popPrompt(vm);
@@ -547,12 +547,12 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         vm->chunk = saved_chunk;
 
         if (vm->chunk == NULL && vm->frame_count > 0) {
-            vm->chunk = vm->frames[vm->frame_count - 1].closure->function->chunk;
+            vm->chunk = &vm->frames[vm->frame_count - 1].closure->function->chunk;
         }
     } else if (vm->frame_count > 0) {
         CallFrame* frame = &vm->frames[vm->frame_count - 1];
         vm->ip = frame->ip;
-        vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
+        vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
     popPrompt(vm);
@@ -648,12 +648,12 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         vm->chunk = captured_frame->caller_chunk;
 
         if (vm->chunk == NULL && vm->frame_count > 0) {
-            vm->chunk = vm->frames[vm->frame_count - 1].closure->function->chunk;
+            vm->chunk = &vm->frames[vm->frame_count - 1].closure->function->chunk;
         }
     } else if (vm->frame_count > 0) {
         CallFrame* frame = &vm->frames[vm->frame_count - 1];
         vm->ip = frame->ip;
-        vm->chunk = frame->caller_chunk ? frame->caller_chunk : frame->closure->function->chunk;
+        vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
     popPrompt(vm);
@@ -723,8 +723,8 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     frame->flags = 0;
 
     vm->current_frame = frame;
-    vm->chunk = handler_fn->chunk;
-    vm->ip = handler_fn->chunk->code;
+    vm->chunk = &handler_fn->chunk;
+    vm->ip = handler_fn->chunk.code;
 
     if (needed_top > vm->stack_top) {
         vm->stack_top = needed_top;

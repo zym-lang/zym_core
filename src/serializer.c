@@ -80,7 +80,7 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
 
             OutputBuffer nested;
             initOutputBuffer(&nested);
-            serializeChunk(vm, fn->chunk, config, &nested);
+            serializeChunk(vm, &fn->chunk, config, &nested);
             int32_t nestedSize = (int32_t)nested.count;
             writeBytes(vm, out, &nestedSize, sizeof(int32_t));
             writeBytes(vm, out, nested.buffer, (size_t)nestedSize);
@@ -272,7 +272,7 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                         goto fn_deserialize_fail;
                     }
 
-                    if (!deserializeChunk(vm, fn->chunk, nestedStart, (size_t)nestedSize)) {
+                    if (!deserializeChunk(vm, &fn->chunk, nestedStart, (size_t)nestedSize)) {
                         fprintf(stderr, "Function deserialization: recursive deserializeChunk failed for nested function\n");
                         goto fn_deserialize_fail;
                     }

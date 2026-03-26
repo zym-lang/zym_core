@@ -207,8 +207,8 @@ void disassembleChunkToFile(Chunk* chunk, const char* name, FILE* file) {
             ObjFunction* fn = AS_FUNCTION(v);
             const char* fname = fn->name ? fn->name->chars : "<anon>";
             fprintf(file, "\n-- Function constant %d: %s/%d --\n", i, fname, fn->arity);
-            if (fn->chunk && fn->chunk->count > 0) {
-                disassembleChunkToFile(fn->chunk, fname, file);
+            if (fn->chunk.count > 0) {
+                disassembleChunkToFile(&fn->chunk, fname, file);
             }
         }
     }
@@ -227,8 +227,8 @@ void disassembleChunk(Chunk* chunk, const char* name) {
             ObjFunction* fn = AS_FUNCTION(v);
             const char* fname = fn->name ? fn->name->chars : "<anon>";
             printf("\n-- Function constant %d: %s/%d --\n", i, fname, fn->arity);
-            if (fn->chunk && fn->chunk->count > 0) {
-                disassembleChunk(fn->chunk, fname);
+            if (fn->chunk.count > 0) {
+                disassembleChunk(&fn->chunk, fname);
             }
         }
     }

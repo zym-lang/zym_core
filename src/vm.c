@@ -180,7 +180,7 @@ void runtimeError(VM* vm, const char* format, ...) {
 
     if (vm->frame_count > 0) {
         CallFrame* cur = &vm->frames[vm->frame_count - 1];
-        Chunk* cur_chunk = cur->closure->function ? cur->closure->function->chunk : vm->chunk;
+        Chunk* cur_chunk = cur->closure->function ? &cur->closure->function->chunk : vm->chunk;
         err_line = line_at_ip(cur_chunk, vm->ip);
         if (cur->closure->function && cur->closure->function->module_name) {
             err_file = cur->closure->function->module_name->chars;
@@ -541,8 +541,8 @@ static bool pushPreemptFrame(VM* vm) {
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
-    vm->chunk = function->chunk;
-    vm->ip = function->chunk->code;
+    vm->chunk = &function->chunk;
+    vm->ip = function->chunk.code;
 
     vm->preemption_disable_depth++;
 
@@ -2342,8 +2342,8 @@ static InterpretResult run(VM* vm) {
             vm->current_frame = frame;
             base = callee_slot;
             // Enter callee
-            vm->chunk = function->chunk;
-            ip = function->chunk->code;
+            vm->chunk = &function->chunk;
+            ip = function->chunk.code;
             DISPATCH();
         }
 
@@ -2495,7 +2495,7 @@ static InterpretResult run(VM* vm) {
 
         vm->current_frame = frame;
         base = callee_slot;
-        ip = function->chunk->code;
+        ip = function->chunk.code;
         DISPATCH();
     }
     OP(TAIL_CALL) {
@@ -2556,8 +2556,8 @@ static InterpretResult run(VM* vm) {
             current_frame->closure = closure;
 
             // Jump into the new function
-            vm->chunk = function->chunk;
-            ip    = function->chunk->code;
+            vm->chunk = &function->chunk;
+            ip    = function->chunk.code;
 
             DISPATCH();
         }
@@ -2666,7 +2666,7 @@ static InterpretResult run(VM* vm) {
         }
 
         // Jump into the function (restart from beginning)
-        ip = function->chunk->code;
+        ip = function->chunk.code;
 
         DISPATCH();
     }
@@ -3748,8 +3748,8 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     CallFrame* saved_current_frame = vm->current_frame;
 
     // Enter the callee
-    vm->chunk = function->chunk;
-    vm->ip    = function->chunk->code;
+    vm->chunk = &function->chunk;
+    vm->ip    = function->chunk.code;
 
     InterpretResult result = run(vm);
 

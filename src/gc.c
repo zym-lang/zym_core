@@ -374,7 +374,7 @@ static void blackenObject(VM* vm, Obj* object) {
             if (function->module_name != NULL) {
                 markObject(vm, (Obj*)function->module_name);
             }
-            markChunk(vm, function->chunk);
+            markChunk(vm, &function->chunk);
             break;
         }
 
@@ -588,18 +588,7 @@ void freeObject(VM* vm, Obj* object) {
             if (function->upvalues != NULL && function->upvalue_capacity > 0) {
                 FREE_ARRAY(vm, Upvalue, function->upvalues, function->upvalue_capacity);
             }
-            if (function->chunk) {
-                if (function->chunk->code && function->chunk->capacity > 0) {
-                    FREE_ARRAY(vm, uint32_t, function->chunk->code, function->chunk->capacity);
-                }
-                if (function->chunk->lines && function->chunk->capacity > 0) {
-                    FREE_ARRAY(vm, int, function->chunk->lines, function->chunk->capacity);
-                }
-                if (function->chunk->constants.values && function->chunk->constants.capacity > 0) {
-                    FREE_ARRAY(vm, Value, function->chunk->constants.values, function->chunk->constants.capacity);
-                }
-                FREE(vm, Chunk, function->chunk);
-            }
+            freeChunk(vm, &function->chunk);
             FREE(vm, ObjFunction, object);
             break;
         }
