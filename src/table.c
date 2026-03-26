@@ -92,13 +92,16 @@ static void adjustCapacity(VM* vm, Table* table, int capacity) {
 }
 
 bool tableSet(VM* vm, Table* table, ObjString* key, Value value) {
-    // Protect key and value from GC during adjustCapacity (which can trigger GC)
-    pushTempRoot(vm, (Obj*)key);
-    if (IS_OBJ(value)) pushTempRoot(vm, AS_OBJ(value));
-
     if (table->count + 1 > table->capacity * TABLE_MAX_LOAD) {
+        // Protect key and value from GC only when adjustCapacity triggers reallocation
+        pushTempRoot(vm, (Obj*)key);
+        if (IS_OBJ(value)) pushTempRoot(vm, AS_OBJ(value));
+
         int capacity = table->capacity < 8 ? 8 : table->capacity * 2;
         adjustCapacity(vm, table, capacity);
+
+        if (IS_OBJ(value)) popTempRoot(vm);
+        popTempRoot(vm);
     }
 
     Entry* entry = findEntry(table->entries, table->capacity, key);
@@ -108,8 +111,6 @@ bool tableSet(VM* vm, Table* table, ObjString* key, Value value) {
     entry->key = key;
     entry->value = value;
 
-    if (IS_OBJ(value)) popTempRoot(vm);
-    popTempRoot(vm);
     return isNewKey;
 }
 
