@@ -679,12 +679,13 @@ static InterpretResult run(VM* vm) {
     register uint32_t* ip = vm->ip;
     register Value* stack = vm->stack;
     register int base = vm->cur_base;
+    register Value* constants = vm->chunk ? vm->chunk->constants.values : NULL;
 
     // Sync locals back to VM struct before calls that read vm->ip/cur_base
 #define STORE_IP()    (vm->ip = ip)
 #define STORE_STATE() do { vm->ip = ip; vm->cur_base = base; } while(0)
     // Reload locals from VM struct after frame changes or stack reallocation
-#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; } while(0)
+#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; constants = vm->chunk->constants.values; } while(0)
 
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
@@ -765,7 +766,7 @@ static InterpretResult run(VM* vm) {
         uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
         uint16_t bx = REG_Bx(instr);
-        stack[a] = currentChunk(vm)->constants.values[bx];
+        stack[a] = constants[bx];
         DISPATCH();
     }
     OP(ADD) {
@@ -1752,7 +1753,7 @@ static InterpretResult run(VM* vm) {
         uint32_t instr = ip[-1];
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
-        ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
+        ObjString* name = AS_STRING(constants[name_const_idx]);
 
         // Check if this global already has a slot
         Value existing_slot_or_value;
@@ -1781,7 +1782,7 @@ static InterpretResult run(VM* vm) {
         uint32_t instr = ip[-1];
         int dest_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
-        ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
+        ObjString* name = AS_STRING(constants[name_const_idx]);
         Value slot_index_val;
         if (!tableGet(&vm->globals, name, &slot_index_val)) {
             STORE_IP(); runtimeError(vm, "Undefined identifier '%.*s'.", name->length, name->chars);
@@ -1809,7 +1810,7 @@ static InterpretResult run(VM* vm) {
         uint32_t instr = ip[-1];
         int src_reg = CUR_BASE() + REG_A(instr);
         uint16_t name_const_idx = REG_Bx(instr);
-        ObjString* name = AS_STRING(currentChunk(vm)->constants.values[name_const_idx]);
+        ObjString* name = AS_STRING(constants[name_const_idx]);
 
         // Check if global exists
         Value slot_index_val;
@@ -2343,6 +2344,7 @@ static InterpretResult run(VM* vm) {
             base = callee_slot;
             // Enter callee
             vm->chunk = &function->chunk;
+            constants = vm->chunk->constants.values;
             ip = function->chunk.code;
             DISPATCH();
         }
@@ -2557,6 +2559,7 @@ static InterpretResult run(VM* vm) {
 
             // Jump into the new function
             vm->chunk = &function->chunk;
+            constants = vm->chunk->constants.values;
             ip    = function->chunk.code;
 
             DISPATCH();
@@ -2622,6 +2625,7 @@ static InterpretResult run(VM* vm) {
                         vm->active_boundaries--;
                         ip    = frame->ip;
                         vm->chunk = frame->caller_chunk;
+                        constants = vm->chunk->constants.values;
                         DISPATCH();
                     }
                 }
@@ -2629,6 +2633,7 @@ static InterpretResult run(VM* vm) {
 
             ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
+            constants = vm->chunk->constants.values;
             stack[frame->stack_base] = result;
 
             DISPATCH();
@@ -2667,6 +2672,7 @@ static InterpretResult run(VM* vm) {
 
         // Jump into the function (restart from beginning)
         ip = function->chunk.code;
+        constants = vm->chunk->constants.values;
 
         DISPATCH();
     }
@@ -2722,6 +2728,7 @@ static InterpretResult run(VM* vm) {
                     vm->active_boundaries--;
                     ip    = frame->ip;
                     vm->chunk = frame->caller_chunk;
+                    constants = vm->chunk->constants.values;
                     DISPATCH();
                 }
             }
@@ -2730,6 +2737,7 @@ static InterpretResult run(VM* vm) {
         // Normal return: restore caller context
         ip    = frame->ip;
         vm->chunk = frame->caller_chunk;
+        constants = vm->chunk->constants.values;
         stack[frame->stack_base] = return_value;
 
         DISPATCH();
@@ -2740,7 +2748,7 @@ static InterpretResult run(VM* vm) {
         uint16_t bx = REG_Bx(instr);
 
         // 1. Get the function template from the constant pool.
-        ObjFunction* function = AS_FUNCTION(currentChunk(vm)->constants.values[bx]);
+        ObjFunction* function = AS_FUNCTION(constants[bx]);
 
         // 2. Create the closure object.
         ObjClosure* closure = newClosure(vm, function);
@@ -3214,7 +3222,7 @@ static InterpretResult run(VM* vm) {
 
         // Read key string from constant pool via trailing index word
         uint32_t const_idx = *ip++;
-        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+        ObjString* key_str = AS_STRING(constants[const_idx]);
 
         Value container_val = stack[b];
 
@@ -3256,7 +3264,7 @@ static InterpretResult run(VM* vm) {
 
         // Read key string from constant pool via trailing index word
         uint32_t const_idx = *ip++;
-        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+        ObjString* key_str = AS_STRING(constants[const_idx]);
 
         Value container_val = stack[a];
         Value value_val = stack[c];
@@ -3299,7 +3307,7 @@ static InterpretResult run(VM* vm) {
 
         // Read key from constant pool via trailing index word
         uint32_t const_idx = *ip++;
-        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+        ObjString* key_str = AS_STRING(constants[const_idx]);
 
         Value container_val = stack[b];
 
@@ -3351,7 +3359,7 @@ static InterpretResult run(VM* vm) {
 
         // Read key from constant pool via trailing index word
         uint32_t const_idx = *ip++;
-        ObjString* key_str = AS_STRING(currentChunk(vm)->constants.values[const_idx]);
+        ObjString* key_str = AS_STRING(constants[const_idx]);
 
         Value container_val = stack[a];
         Value value_val = stack[c];
