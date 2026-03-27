@@ -549,6 +549,19 @@ static bool pushPreemptFrame(VM* vm) {
     return true;
 }
 
+// --- Cold error helper: outlined from run() to reduce I-cache pressure ---
+__attribute__((noinline, cold))
+static InterpretResult vm_error(VM* vm, uint32_t* ip, const char* fmt, ...) {
+    vm->ip = ip;
+    va_list args;
+    va_start(args, fmt);
+    char buf[256];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    runtimeError(vm, "%s", buf);
+    return INTERPRET_RUNTIME_ERROR;
+}
+
 // --- The Core Execution Loop ---
 static InterpretResult run(VM* vm) {
 #define JUMP_ENTRY(op) [op] = &&CASE_##op
@@ -655,8 +668,6 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(NEW_MAP),
         JUMP_ENTRY(MAP_SET),
         JUMP_ENTRY(MAP_SPREAD),
-        //JUMP_ENTRY(GET_MAP_PROPERTY),
-        //JUMP_ENTRY(SET_MAP_PROPERTY),
         JUMP_ENTRY(GET_MAP_PROPERTY_L),
         JUMP_ENTRY(SET_MAP_PROPERTY_L),
         JUMP_ENTRY(GET_STRUCT_FIELD_IC),
@@ -3117,104 +3128,6 @@ static InterpretResult run(VM* vm) {
         STORE_IP(); runtimeError(vm, ERR_ONLY_SUBSCRIPT_LISTS_MAPS);
         STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
     }
-    /*OP(GET_MAP_PROPERTY) {
-        uint32_t instr = ip[-1];
-        int a = CUR_BASE() + REG_A(instr); // Destination register
-        int b = CUR_BASE() + REG_B(instr); // Container register (map or struct)
-        int c = CUR_BASE() + REG_C(instr); // Key register (must be a string)
-        Value container_val = stack[b];
-        Value key_val = stack[c];
-
-        // Dereference container if it's a reference
-
-        if (!IS_STRING(key_val)) {
-            STORE_IP(); runtimeError(vm, "Property key must be a string.");
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjString* key_str = AS_STRING(key_val);
-
-        // Handle struct instances
-        if (IS_STRUCT_INSTANCE(container_val)) {
-            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
-
-            // Fast field lookup using pointer comparison on interned strings
-            int field_index = find_field_index(instance->schema, key_str);
-            if (field_index >= 0) {
-                stack[a] = instance->fields[field_index];
-            } else {
-                STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
-                             instance->schema->name->chars, key_str->chars);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
-            DISPATCH();
-        }
-
-        // Handle maps
-        if (!IS_MAP(container_val)) {
-            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjMap* map = AS_MAP(container_val);
-        Value result;
-        if (tableGet(&map->table, key_str, &result)) {
-            stack[a] = result;
-        } else {
-            stack[a] = NULL_VAL;
-        }
-        DISPATCH();
-    }*/
-    /*OP(SET_MAP_PROPERTY) {
-        uint32_t instr = ip[-1];
-        int a = CUR_BASE() + REG_A(instr); // Container register (map or struct)
-        int b = CUR_BASE() + REG_B(instr); // Key register (must be a string)
-        int c = CUR_BASE() + REG_C(instr); // Value register
-        Value container_val = stack[a];
-        Value key_val = stack[b];
-        Value value_val = stack[c];
-
-        // Dereference container if it's a reference
-
-        if (!IS_STRING(key_val)) {
-            STORE_IP(); runtimeError(vm, "Property key must be a string.");
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjString* key_str = AS_STRING(key_val);
-
-        // Handle struct instances
-        if (IS_STRUCT_INSTANCE(container_val)) {
-            ObjStructInstance* instance = AS_STRUCT_INSTANCE(container_val);
-
-            // Fast field lookup using pointer comparison on interned strings
-            int field_index = find_field_index(instance->schema, key_str);
-            if (field_index >= 0) {
-                instance->fields[field_index] = value_val;
-            } else {
-                STORE_IP(); runtimeError(vm, "Struct '%s' has no field '%s'.",
-                             instance->schema->name->chars, key_str->chars);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
-            DISPATCH();
-        }
-
-        // Handle maps
-        if (!IS_MAP(container_val)) {
-            STORE_IP(); runtimeError(vm, ERR_ONLY_MAPS);
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-
-        ObjMap* map = AS_MAP(container_val);
-
-        // Normal set/delete
-        if (IS_NULL(value_val)) {
-            tableDelete(&map->table, key_str);
-        } else {
-            tableSet(vm, &map->table, key_str, value_val);
-        }
-        DISPATCH();
-    }*/
     OP(GET_MAP_PROPERTY_L) {
         uint32_t instr = ip[-1];
         int a = CUR_BASE() + REG_A(instr);
