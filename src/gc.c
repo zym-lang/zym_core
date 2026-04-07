@@ -53,14 +53,14 @@ void markObject(VM* vm, Obj* object) {
         #endif
         return;
     }
+    #ifdef DEBUG
     if (object->type < 0 || object->type > 20) {
-        //#ifdef GC_DEBUG_FULL
         printf("WARNING: markObject called with invalid object %p [type=%d] - skipping\n",
                (void*)object, object->type);
         fflush(stdout);
-        //#endif
         return;
     }
+    #endif
 
     if (object->is_marked) {
         #ifdef GC_DEBUG_FULL
@@ -578,7 +578,7 @@ void freeObject(VM* vm, Obj* object) {
     switch (object->type) {
         case OBJ_STRING: {
             ObjString* string = (ObjString*)object;
-            FREE_ARRAY(vm, char, string->chars, string->length + 1);
+            FREE_ARRAY(vm, char, string->chars, string->byte_length + 1);
             FREE(vm, ObjString, object);
             break;
         }
