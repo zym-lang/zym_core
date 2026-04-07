@@ -797,14 +797,14 @@ static InterpretResult run(VM* vm) {
             ObjString* str_b = AS_STRING(val_b);
             ObjString* str_c = AS_STRING(val_c);
 
-            int length = str_b->length + str_c->length;
-            char* chars = (char*)reallocate(vm, NULL, 0, length + 1);
-            memcpy(chars, str_b->chars, str_b->length);
-            memcpy(chars + str_b->length, str_c->chars, str_c->length);
-            chars[length] = '\0';
+            int byte_len = str_b->byte_length + str_c->byte_length;
+            char* chars = (char*)reallocate(vm, NULL, 0, byte_len + 1);
+            memcpy(chars, str_b->chars, str_b->byte_length);
+            memcpy(chars + str_b->byte_length, str_c->chars, str_c->byte_length);
+            chars[byte_len] = '\0';
 
             // takeString takes ownership of the 'chars' buffer
-            ObjString* result = takeString(vm, chars, length);
+            ObjString* result = takeString(vm, chars, byte_len);
             RELOAD_STACK(); // GC may have reallocated stack
 
             // Protect the string before the write (which can trigger GC via tableSet)
@@ -2218,21 +2218,13 @@ static InterpretResult run(VM* vm) {
             // Prepare arguments array (points to first arg on stack)
             Value* args = &stack[callee_slot + 1];
 
-            // Protect arguments from GC during native call
-            int saved_temp_root_count = vm->temp_root_count;
-            for (int i = 0; i < arg_count; i++) {
-                if (IS_OBJ(args[i])) {
-                    pushTempRoot(vm, AS_OBJ(args[i]));
-                }
-            }
+            // Args are already on the stack and covered by stack_top,
+            // so the GC will mark them as roots. No temp root protection needed.
 
             // Call native function via dispatcher
             STORE_STATE();
             Value result = native->dispatcher(vm, args, native->func_ptr);
             RELOAD_STACK(); // native may trigger GC that reallocates stack
-
-            // Restore temp root count
-            vm->temp_root_count = saved_temp_root_count;
 
             // Check for error
             if (result == ZYM_ERROR) {
@@ -2269,24 +2261,14 @@ static InterpretResult run(VM* vm) {
                 closure_args[i + 1] = stack[callee_slot + 1 + i];
             }
 
-            // Protect arguments and context from GC during native call
-            int saved_temp_root_count = vm->temp_root_count;
-            if (IS_OBJ(closure_args[0])) {
-                pushTempRoot(vm, AS_OBJ(closure_args[0]));
-            }
-            for (int i = 0; i < arg_count; i++) {
-                if (IS_OBJ(closure_args[i + 1])) {
-                    pushTempRoot(vm, AS_OBJ(closure_args[i + 1]));
-                }
-            }
+            // Args on the stack are already covered by stack_top (GC roots).
+            // The context is held by the native_closure object (also a GC root).
+            // closure_args[] is a stack-local copy — no temp root protection needed.
 
             // Call native closure via dispatcher (context-aware dispatcher)
             STORE_STATE();
             Value result = native_closure->dispatcher(vm, closure_args, native_closure->func_ptr);
             RELOAD_STACK(); // native may trigger GC that reallocates stack
-
-            // Restore temp root count
-            vm->temp_root_count = saved_temp_root_count;
 
             // Check for error
             if (result == ZYM_ERROR) {
@@ -2432,18 +2414,11 @@ static InterpretResult run(VM* vm) {
 
             Value* args = &stack[callee_slot + 1];
 
-            int saved_temp_root_count = vm->temp_root_count;
-            for (int i = 0; i < arg_count; i++) {
-                if (IS_OBJ(args[i])) {
-                    pushTempRoot(vm, AS_OBJ(args[i]));
-                }
-            }
+            // Args are already on the stack and covered by stack_top — GC roots.
 
             STORE_STATE();
             Value result = native->dispatcher(vm, args, native->func_ptr);
             RELOAD_STACK(); // native may trigger GC that reallocates stack
-
-            vm->temp_root_count = saved_temp_root_count;
 
             if (result == ZYM_ERROR) {
                 return INTERPRET_RUNTIME_ERROR;
