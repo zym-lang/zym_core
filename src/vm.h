@@ -3,6 +3,7 @@
 #include "./chunk.h"
 #include "./value.h"
 #include "./table.h"
+#include <stdint.h>
 #include "./config.h"
 #include "./allocator.h"
 
@@ -115,7 +116,8 @@ typedef struct VM {
     int prompt_count;
     uint32_t next_prompt_tag_id;
 
-    int yield_budget;
+    int32_t preempt_counter;
+    int32_t saved_budget;
     bool preempt_requested;
     bool preemption_enabled;
     int preemption_disable_depth;

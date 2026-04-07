@@ -79,7 +79,8 @@ void initVM(VM* vm) {
     vm->prompt_count = 0;
     vm->next_prompt_tag_id = 1;
 
-    vm->yield_budget = DEFAULT_TIMESLICE;
+    vm->preempt_counter = INT32_MAX;
+    vm->saved_budget = DEFAULT_TIMESLICE;
     vm->default_timeslice = DEFAULT_TIMESLICE;
     vm->preempt_requested = false;
     vm->preemption_enabled = false;
@@ -549,6 +550,26 @@ static bool pushPreemptFrame(VM* vm) {
     return true;
 }
 
+// --- Cold preemption handler: outlined from DISPATCH to reduce I-cache pressure ---
+__attribute__((noinline, cold))
+static InterpretResult handlePreemption(VM* vm) {
+    if (!vm->preemption_enabled || vm->preemption_disable_depth > 0) {
+        // Spurious trigger: counter wrapped from INT32_MAX or preempt_requested while disabled
+        vm->preempt_counter = INT32_MAX;
+        vm->preempt_requested = false;
+        return INTERPRET_OK;
+    }
+    // Real preemption
+    vm->preempt_counter = vm->default_timeslice;
+    vm->preempt_requested = false;
+    if (IS_CLOSURE(vm->on_preempt_callback)) {
+        if (pushPreemptFrame(vm)) {
+            return INTERPRET_OK;  // callback pushed, continue execution
+        }
+    }
+    return INTERPRET_YIELD;
+}
+
 // --- Cold error helper: outlined from run() to reduce I-cache pressure ---
 __attribute__((noinline, cold))
 static InterpretResult vm_error(VM* vm, uint32_t* ip, const char* fmt, ...) {
@@ -700,17 +721,11 @@ static InterpretResult run(VM* vm) {
 
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
-    if (vm->preemption_enabled && vm->preemption_disable_depth == 0 && (--vm->yield_budget <= 0 || vm->preempt_requested)) { \
-        vm->yield_budget = vm->default_timeslice; \
-        vm->preempt_requested = false; \
+    if (__builtin_expect(--vm->preempt_counter <= 0, 0)) { \
         STORE_STATE(); \
-        if (IS_CLOSURE(vm->on_preempt_callback)) { \
-            if (pushPreemptFrame(vm)) { \
-                LOAD_STATE(); \
-                goto *dispatch_table[OPCODE(*ip++)]; \
-            } \
-        } \
-        return INTERPRET_YIELD; \
+        InterpretResult _pr = handlePreemption(vm); \
+        if (_pr == INTERPRET_YIELD) return INTERPRET_YIELD; \
+        LOAD_STATE(); \
     } \
     goto *dispatch_table[OPCODE(*ip++)]; \
 } while(0)

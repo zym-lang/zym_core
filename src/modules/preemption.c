@@ -14,19 +14,28 @@
 
 void preemptionEnable(VM* vm) {
     vm->preemption_enabled = true;
+    vm->preempt_counter = vm->default_timeslice;
 }
 
 void preemptionDisable(VM* vm) {
     vm->preemption_enabled = false;
+    vm->preempt_counter = INT32_MAX;
 }
 
 void preemptionPushDisable(VM* vm) {
+    if (vm->preemption_disable_depth == 0 && vm->preemption_enabled) {
+        vm->saved_budget = vm->preempt_counter;
+    }
     vm->preemption_disable_depth++;
+    vm->preempt_counter = INT32_MAX;
 }
 
 void preemptionPopDisable(VM* vm) {
     if (vm->preemption_disable_depth > 0) {
         vm->preemption_disable_depth--;
+        if (vm->preemption_disable_depth == 0 && vm->preemption_enabled) {
+            vm->preempt_counter = vm->saved_budget;
+        }
     }
 }
 
@@ -47,15 +56,16 @@ int preemptionGetTimeslice(VM* vm) {
 
 void preemptionRequest(VM* vm) {
     vm->preempt_requested = true;
+    vm->preempt_counter = 0;
 }
 
 void preemptionReset(VM* vm) {
-    vm->yield_budget = vm->default_timeslice;
+    vm->preempt_counter = vm->preemption_enabled ? vm->default_timeslice : INT32_MAX;
     vm->preempt_requested = false;
 }
 
 int preemptionRemaining(VM* vm) {
-    return vm->yield_budget;
+    return vm->preempt_counter;
 }
 
 // ============================================================================
@@ -234,7 +244,7 @@ static ZymValue preempt_remaining(ZymVM* vm, ZymValue context) {
 static ZymValue preempt_yield(ZymVM* vm, ZymValue context) {
     (void)zym_getNativeData(context);
     vm->preempt_requested = true;
-    vm->yield_budget = 0;
+    vm->preempt_counter = 0;
     return zym_newNull();
 }
 
