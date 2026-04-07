@@ -50,6 +50,7 @@ void initVM(VM* vm) {
     vm->objects = NULL;
     vm->bytes_allocated = 0;
     vm->next_gc = 1024 * 1024;
+    vm->gc_debt = INT32_MAX;  // GC starts disabled during init
     vm->gray_count = 0;
     vm->gray_capacity = 0;
     vm->gray_stack = NULL;
@@ -94,12 +95,18 @@ void initVM(VM* vm) {
     vm->error_user_data = NULL;
 
     vm->gc_enabled = true;
+    // Recalculate debt: headroom = next_gc - bytes_allocated, clamped to INT32_MAX
+    {
+        size_t headroom = vm->next_gc > vm->bytes_allocated ? vm->next_gc - vm->bytes_allocated : 0;
+        vm->gc_debt = headroom > (size_t)INT32_MAX ? INT32_MAX : (int32_t)headroom;
+    }
 
     setupCoreModules(vm);
 }
 
 void freeVM(VM* vm) {
     vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;
 
     freeTable(vm, &vm->globals);
     freeValueArray(vm, &vm->globalSlots);
@@ -486,7 +493,9 @@ static bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     Value* old_stack = vm->stack;
 
     bool gc_was_enabled = vm->gc_enabled;
+    int32_t gc_saved_debt = vm->gc_debt;
     vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;
 
     Value* new_stack = (Value*)reallocate(vm, vm->stack,
         sizeof(Value) * vm->stack_capacity,
@@ -502,6 +511,7 @@ static bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     updateStackReferences(vm, old_stack, new_stack);
 
     vm->gc_enabled = gc_was_enabled;
+    vm->gc_debt = gc_saved_debt;
 
     if (old_stack_out) *old_stack_out = old_stack;
     return true;

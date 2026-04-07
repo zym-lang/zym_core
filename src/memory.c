@@ -49,12 +49,19 @@ ZymAllocator zym_defaultAllocator(void) {
 void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
     vm->bytes_allocated += newSize - oldSize;
 
-    if (vm->gc_enabled && newSize > oldSize) {
+    if (newSize > oldSize) {
+        int32_t delta = (int32_t)((newSize - oldSize) > (size_t)INT32_MAX ? (size_t)INT32_MAX : (newSize - oldSize));
+        vm->gc_debt -= delta;
         #ifdef DEBUG_STRESS_GC
-            collectGarbage(vm);
+            if (vm->gc_enabled) collectGarbage(vm);
         #else
-            if (vm->bytes_allocated > vm->next_gc) {
-                collectGarbage(vm);
+            if (__builtin_expect(vm->gc_debt <= 0, 0)) {
+                if (vm->gc_enabled) {
+                    collectGarbage(vm);
+                } else {
+                    // GC disabled but debt wrapped — reset to prevent repeated triggers
+                    vm->gc_debt = INT32_MAX;
+                }
             }
         #endif
     }

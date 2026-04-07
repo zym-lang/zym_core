@@ -102,6 +102,7 @@ typedef struct VM {
     // Garbage Collector
     size_t bytes_allocated;
     size_t next_gc;
+    int32_t gc_debt;  // Allocation debt counter: triggers GC when <= 0; INT32_MAX when GC disabled
     Obj** gray_stack;
     int gray_count;
     int gray_capacity;

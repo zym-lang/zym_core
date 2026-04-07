@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "gc_native.h"
 #include "../memory.h"
 #include "../gc.h"
@@ -43,6 +44,7 @@ void gc_cleanup(ZymVM* vm, void* ptr) {
 ZymValue gc_pause(ZymVM* vm, ZymValue context) {
     (void)zym_getNativeData(context);  // Verify context is valid
     vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;
     return context;
 }
 
@@ -50,6 +52,10 @@ ZymValue gc_pause(ZymVM* vm, ZymValue context) {
 ZymValue gc_resume(ZymVM* vm, ZymValue context) {
     (void)zym_getNativeData(context);  // Verify context is valid
     vm->gc_enabled = true;
+    {
+        size_t headroom = vm->next_gc > vm->bytes_allocated ? vm->next_gc - vm->bytes_allocated : 0;
+        vm->gc_debt = headroom > (size_t)INT32_MAX ? INT32_MAX : (int32_t)headroom;
+    }
     return context;
 }
 
@@ -72,6 +78,9 @@ ZymValue gc_cycle(ZymVM* vm, ZymValue context) {
 
     // Restore previous state
     vm->gc_enabled = was_enabled;
+    if (!was_enabled) {
+        vm->gc_debt = INT32_MAX;
+    }
 
     return context;
 }
@@ -110,6 +119,11 @@ ZymValue gc_setBytesThreshold(ZymVM* vm, ZymValue context, ZymValue thresholdVal
     }
 
     vm->next_gc = new_threshold;
+    // Recalculate debt with new threshold
+    if (vm->gc_enabled) {
+        size_t headroom = vm->next_gc > vm->bytes_allocated ? vm->next_gc - vm->bytes_allocated : 0;
+        vm->gc_debt = headroom > (size_t)INT32_MAX ? INT32_MAX : (int32_t)headroom;
+    }
     return context;
 }
 

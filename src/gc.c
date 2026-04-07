@@ -729,6 +729,7 @@ void collectGarbage(VM* vm) {
 
     bool was_enabled = vm->gc_enabled;
     vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;  // Prevent re-entrant GC triggers during collection
 
     #ifdef GC_DEBUG_FULL
     printf("=== Phase 1: Marking roots ===\n");
@@ -753,6 +754,10 @@ void collectGarbage(VM* vm) {
     vm->next_gc = vm->bytes_allocated * GC_HEAP_GROW_FACTOR;
 
     vm->gc_enabled = was_enabled;
+    if (was_enabled) {
+        size_t headroom = vm->next_gc > vm->bytes_allocated ? vm->next_gc - vm->bytes_allocated : 0;
+        vm->gc_debt = headroom > (size_t)INT32_MAX ? INT32_MAX : (int32_t)headroom;
+    }
 
     #if defined(GC_DEBUG) || defined(GC_DEBUG_FULL)
     printf("   collected %zu bytes (from %zu to %zu) next at %zu\n",
