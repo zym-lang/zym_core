@@ -36,6 +36,7 @@ set(ZYM_CORE_SOURCES
     src/natives/shared.c
     src/natives/string_natives.c
     src/natives/math.c
+    src/natives/typeof.c
 )
 
 # --- Compiler sources (only for full build) ---
