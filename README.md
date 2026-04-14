@@ -45,37 +45,6 @@ var c = Color.Red;
 ```
 
 ```javascript
-// memory semantics, the distinction is observable
-func makeMachine() {
-    var total = 0
-    var totalRef = ref total
-
-    func bump(ref by) { total = total + by }
-
-    func mix(slot ext, ref mirror, val snap) {
-        ext = ext + 1       // writes back to caller's variable
-        mirror = ext         // writes through to caller's ref
-        bump(ext)            // total += ext via ref
-        snap[0] = 999       // local copy only — caller unchanged
-        totalRef = totalRef + 1
-    }
-
-    return { mix: mix, total: func() { return total; } }
-}
-
-var m = makeMachine()
-var x = 10
-var y = 0
-var arr = [5, 6, 7]
-
-m.mix(x, y, arr)
-assert(x == 11,           "slot wrote back")
-assert(y == 11,            "ref wrote through")
-assert(arr[0] == 5,        "val kept caller safe")
-assert(m.total() == 12,    "ref chain updated total")
-```
-
-```javascript
 // cooperative fibers, all from continuations
 var tag = Cont.newPrompt("fiber");
 
@@ -93,31 +62,14 @@ func worker(name) {
 ```
 
 ```javascript
-// continuations, TCO, and ref, working together
-var TAG = Cont.newPrompt("cap-val-nested");
-
+// TCO — never overflow the stack
 @tco aggressive
-func test_nested(ref counter, stepsLeft) {
-    if (stepsLeft == 0) return counter;
-
-    if (counter == 3) {
-        var x = Cont.capture(TAG);
-        if (x != null) counter = counter + x;
-    }
-
-    counter = counter + 1;
-    return test_nested(counter, stepsLeft - 1);
+func sum(n, acc) {
+    if (n == 0) return acc;
+    return sum(n - 1, acc + n);
 }
 
-var base = 0;
-
-Cont.pushPrompt(TAG);
-var k = test_nested(base, 10);
-
-Cont.pushPrompt(TAG);
-Cont.resume(k, 5);
-
-assert(base == 15, "nested capture value delivered");
+print(sum(1000000, 0));  // no stack overflow
 ```
 
 ## Why Zym?
@@ -126,13 +78,12 @@ assert(base == 15, "nested capture value delivered");
 - **Small** — the entire language fits in a compact codebase, minimal footprint for embedded and resource-constrained environments.
 - **Rich built-in types** — strings, lists, maps, structs, enums, all first-class, all doing what you'd expect.
 - **First-class functions** — closures, higher-order functions, anonymous functions, natural and lightweight.
-- **Real memory semantics** — `ref`, `slot`, and `val` modifiers control how values move between caller and callee, the distinction is observable.
 - **Delimited continuations** — fibers, coroutines, generators, async/await, algebraic effects, all from a small set of primitives.
-- **Script-directed tail-call optimization** — `@tco` with `aggressive`, `safe`, `smart`, and `off` modes, stack behavior is predictable.
+- **Script-directed tail-call optimization** — `@tco` with `aggressive`, `safe`, and `off` modes, stack behavior is predictable.
 - **Preemptive scheduling** — instruction-count-based time slicing at the VM level, build fair schedulers without cooperative yields, correctness is yours.
 - **Thread-safe VM** — each instance owns its heap, globals, and execution state, nothing shared.
 - **Bytecode serialization** — compile once, distribute bytecode, run anywhere, this is efficient.
-- **Native C API** — register functions, bind closures to C data, expose references with get/set hooks, consistently named `zym_*` prefixed API.
+- **Native C API** — register functions, bind closures to C data, consistently named `zym_*` prefixed API.
 
 ## Building
 
@@ -209,7 +160,7 @@ Try Zym instantly in the browser: **[Playground](https://zym-lang.org/playground
 The docs cover:
 
 - **[Language Guide](https://zym-lang.org/docs-language.html)** — variables, types, operators, control flow, functions, and a tour of all language features
-- **[Language Semantics](https://zym-lang.org/docs-control-flow.html)** — deep-dive pages for control flow, functions, memory semantics, structs & enums, TCO, and spread
+- **[Language Semantics](https://zym-lang.org/docs-control-flow.html)** — deep-dive pages for control flow, functions, structs & enums, TCO, and spread
 - **[Core Modules](https://zym-lang.org/docs-strings.html)** — built-in APIs for strings, math, lists, maps, conversions, error handling, and GC
 - **[Continuations & Preemption](https://zym-lang.org/docs-continuations.html)** — delimited continuations, fibers, generators, and preemptive scheduling
 - **[Macros & Preprocessor](https://zym-lang.org/docs-macros.html)** — compile-time macros, conditional compilation, and block macros
