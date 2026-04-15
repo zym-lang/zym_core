@@ -37,7 +37,7 @@ hello("world");  // Hello, world!
 struct Point { x, y }
 
 var p = Point(3, 4);
-var distance = Math.sqrt(Math.pow(p.x, 2) + Math.pow(p.y, 2));
+var distance = sqrt(pow(p.x, 2) + pow(p.y, 2));
 print("Distance: " + str(distance));
 
 enum Color { Red, Green, Blue }
@@ -123,7 +123,7 @@ Include with `#include "zym/zym.h"`, configuration is minimal.
 #include "zym/zym.h"
 
 int main() {
-    ZymVM* vm = zym_newVM();
+    ZymVM* vm = zym_newVM(NULL);
 
     ZymChunk* chunk = zym_newChunk(vm);
     ZymLineMap* map = zym_newLineMap(vm);
