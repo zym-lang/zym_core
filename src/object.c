@@ -94,6 +94,8 @@ ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* f
     native->arity = arity;
     native->func_ptr = func_ptr;
     native->dispatcher = dispatcher;
+    native->variadic_dispatcher = NULL;
+    native->is_variadic = false;
     return native;
 }
 
@@ -111,7 +113,9 @@ ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* fun
     closure->arity = arity;
     closure->func_ptr = func_ptr;
     closure->dispatcher = dispatcher;
+    closure->variadic_dispatcher = NULL;
     closure->context = context;
+    closure->is_variadic = false;
     return closure;
 }
 

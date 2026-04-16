@@ -226,6 +226,15 @@ ZymStatus zym_defineNative(ZymVM* vm, const char* signature, void* func_ptr) {
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
+ZymStatus zym_defineNativeVariadic(ZymVM* vm, const char* signature, void* func_ptr) {
+    if (!vm || !signature || !func_ptr) {
+        return ZYM_STATUS_COMPILE_ERROR;
+    }
+
+    bool success = registerNativeVariadicFunction(vm, signature, func_ptr);
+    return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
+}
+
 ZymStatus zym_defineGlobal(ZymVM* vm, const char* name, ZymValue value) {
     if (!vm || !name) {
         return ZYM_STATUS_COMPILE_ERROR;
@@ -299,6 +308,47 @@ ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_pt
     return OBJ_VAL(closure);
 }
 
+ZymValue zym_createNativeClosureVariadic(ZymVM* vm, const char* signature, void* func_ptr, ZymValue context) {
+    if (!vm || !signature || !func_ptr) {
+        return NULL_VAL;
+    }
+
+    if (!IS_NATIVE_CONTEXT(context)) {
+        fprintf(stderr, "zym_createNativeClosureVariadic: context must be a native context\n");
+        return NULL_VAL;
+    }
+
+    char func_name[256];
+    int fixed_arity;
+    bool is_variadic;
+
+    if (!parseNativeSignatureEx(signature, func_name, &fixed_arity, &is_variadic)) {
+        return NULL_VAL;
+    }
+
+    if (!is_variadic) {
+        fprintf(stderr, "zym_createNativeClosureVariadic: signature must contain '...'\n");
+        return NULL_VAL;
+    }
+
+    NativeVariadicDispatcher vdispatcher = getNativeVariadicClosureDispatcher(fixed_arity);
+    if (!vdispatcher) {
+        fprintf(stderr, "No variadic closure dispatcher available for fixed arity %d\n", fixed_arity);
+        return NULL_VAL;
+    }
+
+    pushTempRoot(vm, AS_OBJ(context));
+    ObjString* name_obj = copyString(vm, func_name, (int)strlen(func_name));
+    pushTempRoot(vm, (Obj*)name_obj);
+    ObjNativeClosure* closure = newNativeClosure(vm, name_obj, fixed_arity, func_ptr, NULL, context);
+    closure->variadic_dispatcher = vdispatcher;
+    closure->is_variadic = true;
+    popTempRoot(vm);
+    popTempRoot(vm);
+
+    return OBJ_VAL(closure);
+}
+
 ZymValue zym_getClosureContext(ZymValue closure) {
     if (!IS_OBJ(closure)) {
         return NULL_VAL;
@@ -347,6 +397,26 @@ bool zym_addOverload(ZymVM* vm, ZymValue dispatcher, ZymValue closure) {
     }
 
     disp->overloads[disp->count++] = obj;
+    return true;
+}
+
+bool zym_setVariadicFallback(ZymVM* vm, ZymValue dispatcher, ZymValue closure, int min_arity) {
+    if (!vm || !IS_DISPATCHER(dispatcher)) {
+        return false;
+    }
+
+    if (!IS_OBJ(closure)) {
+        return false;
+    }
+
+    Obj* obj = AS_OBJ(closure);
+    if (obj->type != OBJ_CLOSURE && obj->type != OBJ_NATIVE_CLOSURE) {
+        return false;
+    }
+
+    ObjDispatcher* disp = AS_DISPATCHER(dispatcher);
+    disp->variadic_fallback = obj;
+    disp->variadic_min_arity = min_arity;
     return true;
 }
 

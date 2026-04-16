@@ -109,13 +109,16 @@ typedef struct ObjFunction {
 } ObjFunction;
 
 typedef Value (*NativeDispatcher)(VM* vm, Value* args, void* func_ptr);
+typedef Value (*NativeVariadicDispatcher)(VM* vm, Value* args, void* func_ptr, int argc);
 
 typedef struct ObjNativeFunction {
     Obj obj;
     ObjString* name;
     int arity;
     void* func_ptr;
-    NativeDispatcher dispatcher;
+    NativeDispatcher dispatcher;              // for fixed-arity natives
+    NativeVariadicDispatcher variadic_dispatcher;  // for variadic natives
+    bool is_variadic;
 } ObjNativeFunction;
 
 typedef void (*NativeFinalizerFunc)(VM* vm, void* native_data);
@@ -131,8 +134,10 @@ typedef struct {
     ObjString* name;
     int arity;
     void* func_ptr;
-    NativeDispatcher dispatcher;
+    NativeDispatcher dispatcher;              // for fixed-arity closures
+    NativeVariadicDispatcher variadic_dispatcher;  // for variadic closures
     Value context;
+    bool is_variadic;
 } ObjNativeClosure;
 
 

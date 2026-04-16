@@ -11,6 +11,7 @@
 #include "./memory.h"
 #include "./utils.h"
 #include "gc.h"
+#include "./native.h"
 
 #define OPCODE(i) ((i) & 0xFF)
 
@@ -844,6 +845,55 @@ static bool has_any_hoisted_local(Compiler* c, const Token* name) {
     return false;
 }
 
+// Check if a native variadic function with the given base name exists in vm->globals.
+// Tries mangled names "name@v0", "name@v1", ... up to a small limit.
+// If found and arg_count >= fixed_arity, returns true and sets *out_fixed_arity.
+static bool has_native_variadic_global(Compiler* c, const Token* name, int arg_count, int* out_fixed_arity) {
+    char buf[256 + 8];
+    for (int fixed = 0; fixed <= MAX_NATIVE_ARITY; fixed++) {
+        snprintf(buf, sizeof(buf), "%.*s@v%d", name->length, name->start, fixed);
+        ObjString* key = copyString(c->vm, buf, (int)strlen(buf));
+        pushTempRoot(c->vm, (Obj*)key);
+        Value val;
+        bool found = tableGet(&c->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val);
+        popTempRoot(c->vm);
+        if (found) {
+            ObjNativeFunction* native = AS_NATIVE_FUNCTION(val);
+            if (native->is_variadic && arg_count >= fixed) {
+                if (out_fixed_arity) *out_fixed_arity = fixed;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Check if any native function (fixed or variadic) with the given base name exists in vm->globals.
+static bool has_any_native_global(Compiler* c, const Token* name) {
+    char buf[256 + 8];
+    // Check fixed-arity natives name@0 .. name@MAX_NATIVE_ARITY
+    for (int arity = 0; arity <= MAX_NATIVE_ARITY; arity++) {
+        snprintf(buf, sizeof(buf), "%.*s@%d", name->length, name->start, arity);
+        ObjString* key = copyString(c->vm, buf, (int)strlen(buf));
+        pushTempRoot(c->vm, (Obj*)key);
+        Value val;
+        bool found = tableGet(&c->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val);
+        popTempRoot(c->vm);
+        if (found) return true;
+    }
+    // Check variadic natives name@v0 .. name@vMAX_NATIVE_ARITY
+    for (int fixed = 0; fixed <= MAX_NATIVE_ARITY; fixed++) {
+        snprintf(buf, sizeof(buf), "%.*s@v%d", name->length, name->start, fixed);
+        ObjString* key = copyString(c->vm, buf, (int)strlen(buf));
+        pushTempRoot(c->vm, (Obj*)key);
+        Value val;
+        bool found = tableGet(&c->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val);
+        popTempRoot(c->vm);
+        if (found) return true;
+    }
+    return false;
+}
+
 static int single_hoisted_arity(Compiler* c, const Token* name) {
     Compiler* root = root_compiler(c);
     int found = -1;
@@ -1053,6 +1103,11 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             }
             popTempRoot(compiler->vm);
             scoped_string_free(&mangled);
+
+            // Check if it's a registered native variadic function (e.g., "print@v0")
+            if (!should_mangle && has_native_variadic_global(compiler, name, arg_count, NULL)) {
+                needs_dispatcher = true;
+            }
         }
 
         if (needs_dispatcher) {
@@ -1200,7 +1255,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
             }
         }
     } else {
-        // Collect global overloads
+        // Collect global overloads from hoisted script functions
         Compiler* root = root_compiler(compiler);
         for (int i = 0; i < root->hoisted_count && overload_count < MAX_OVERLOADS; i++) {
             if (tokens_equal(&root->hoisted[i].name, name)) {
@@ -1230,6 +1285,45 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     emit_get_global(compiler, temp_reg, k, line);
                     overload_regs[overload_count++] = temp_reg;
                 }
+            }
+        }
+
+        // Also collect native functions from vm->globals
+        char buf[256 + 8];
+        // Native fixed-arity overloads (name@0 .. name@MAX_NATIVE_ARITY)
+        for (int arity = 0; arity <= MAX_NATIVE_ARITY && overload_count < MAX_OVERLOADS; arity++) {
+            snprintf(buf, sizeof(buf), "%.*s@%d", name->length, name->start, arity);
+            ObjString* key = copyString(compiler->vm, buf, (int)strlen(buf));
+            pushTempRoot(compiler->vm, (Obj*)key);
+            Value val;
+            if (tableGet(&compiler->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val)) {
+                int k = make_constant(compiler, OBJ_VAL(key));
+                int temp_reg = alloc_temp(compiler);
+                emit_get_global(compiler, temp_reg, k, line);
+                overload_regs[overload_count++] = temp_reg;
+            }
+            popTempRoot(compiler->vm);
+        }
+        // Native variadic fallback (name@v0 .. name@vMAX_NATIVE_ARITY)
+        if (variadic_reg == -1) {
+            for (int fixed = 0; fixed <= MAX_NATIVE_ARITY; fixed++) {
+                snprintf(buf, sizeof(buf), "%.*s@v%d", name->length, name->start, fixed);
+                ObjString* key = copyString(compiler->vm, buf, (int)strlen(buf));
+                pushTempRoot(compiler->vm, (Obj*)key);
+                Value val;
+                if (tableGet(&compiler->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val)) {
+                    ObjNativeFunction* native = AS_NATIVE_FUNCTION(val);
+                    if (native->is_variadic) {
+                        variadic_min_arity = fixed;
+                        int k = make_constant(compiler, OBJ_VAL(key));
+                        int temp_reg = alloc_temp(compiler);
+                        emit_get_global(compiler, temp_reg, k, line);
+                        variadic_reg = temp_reg;
+                        popTempRoot(compiler->vm);
+                        break;
+                    }
+                }
+                popTempRoot(compiler->vm);
             }
         }
     }
@@ -1338,6 +1432,11 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             }
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+
+            // Check if it's a registered native variadic function (e.g., "print@v0")
+            if (!should_mangle && has_native_variadic_global(compiler, name, arg_count, NULL)) {
+                needs_dispatcher = true;
+            }
         }
 
         if (needs_dispatcher) {
@@ -3839,6 +3938,35 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
                 exit(1);
             }
         }
+    }
+
+    // Check for collision with native functions in vm->globals
+    {
+        char* check_mangled;
+        if (is_variadic) {
+            int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+            check_mangled = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+        } else {
+            check_mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+        }
+        ObjString* check_str = copyString(compiler->vm, check_mangled, (int)strlen(check_mangled));
+        pushTempRoot(compiler->vm, (Obj*)check_str);
+        Value existing;
+        if (tableGet(&compiler->vm->globals, check_str, &existing) &&
+            (IS_NATIVE_FUNCTION(existing) || IS_NATIVE_CLOSURE(existing))) {
+            if (is_variadic) {
+                fprintf(stderr, "Error at line %d: Cannot redefine native variadic function '%.*s'.\n",
+                        stmt->line, func_stmt->name.length, func_stmt->name.start);
+            } else {
+                fprintf(stderr, "Error at line %d: Cannot redefine native function '%.*s' with %d parameter(s).\n",
+                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
+            }
+            popTempRoot(compiler->vm);
+            FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
+            exit(1);
+        }
+        popTempRoot(compiler->vm);
+        FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
     }
 
     // For hoisting, we only need to declare a global variable for the function.

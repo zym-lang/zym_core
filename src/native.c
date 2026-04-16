@@ -8,6 +8,7 @@
 #include "./memory.h"
 #include "gc.h"
 
+// Fixed-arity native function trampolines (0-10)
 static Value native_dispatch_0(VM* vm, Value* args, void* func_ptr) {
     ZymNative0 func = (ZymNative0)func_ptr;
     return func(vm);
@@ -63,114 +64,11 @@ static Value native_dispatch_10(VM* vm, Value* args, void* func_ptr) {
     return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
 }
 
-static Value native_dispatch_11(VM* vm, Value* args, void* func_ptr) {
-    ZymNative11 func = (ZymNative11)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10]);
-}
-
-static Value native_dispatch_12(VM* vm, Value* args, void* func_ptr) {
-    ZymNative12 func = (ZymNative12)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11]);
-}
-
-static Value native_dispatch_13(VM* vm, Value* args, void* func_ptr) {
-    ZymNative13 func = (ZymNative13)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12]);
-}
-
-static Value native_dispatch_14(VM* vm, Value* args, void* func_ptr) {
-    ZymNative14 func = (ZymNative14)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13]);
-}
-
-static Value native_dispatch_15(VM* vm, Value* args, void* func_ptr) {
-    ZymNative15 func = (ZymNative15)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14]);
-}
-
-static Value native_dispatch_16(VM* vm, Value* args, void* func_ptr) {
-    ZymNative16 func = (ZymNative16)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15]);
-}
-
-static Value native_dispatch_17(VM* vm, Value* args, void* func_ptr) {
-    ZymNative17 func = (ZymNative17)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16]);
-}
-
-static Value native_dispatch_18(VM* vm, Value* args, void* func_ptr) {
-    ZymNative18 func = (ZymNative18)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17]);
-}
-
-static Value native_dispatch_19(VM* vm, Value* args, void* func_ptr) {
-    ZymNative19 func = (ZymNative19)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18]);
-}
-
-static Value native_dispatch_20(VM* vm, Value* args, void* func_ptr) {
-    ZymNative20 func = (ZymNative20)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19]);
-}
-
-static Value native_dispatch_21(VM* vm, Value* args, void* func_ptr) {
-    ZymNative21 func = (ZymNative21)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20]);
-}
-
-static Value native_dispatch_22(VM* vm, Value* args, void* func_ptr) {
-    ZymNative22 func = (ZymNative22)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21]);
-}
-
-static Value native_dispatch_23(VM* vm, Value* args, void* func_ptr) {
-    ZymNative23 func = (ZymNative23)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22]);
-}
-
-static Value native_dispatch_24(VM* vm, Value* args, void* func_ptr) {
-    ZymNative24 func = (ZymNative24)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23]);
-}
-
-static Value native_dispatch_25(VM* vm, Value* args, void* func_ptr) {
-    ZymNative25 func = (ZymNative25)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23], args[24]);
-}
-
-static Value native_dispatch_26(VM* vm, Value* args, void* func_ptr) {
-    ZymNative26 func = (ZymNative26)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23], args[24], args[25]);
-}
-
 static NativeDispatcher dispatchers[MAX_NATIVE_ARITY + 1] = {
-    native_dispatch_0,
-    native_dispatch_1,
-    native_dispatch_2,
-    native_dispatch_3,
-    native_dispatch_4,
-    native_dispatch_5,
-    native_dispatch_6,
-    native_dispatch_7,
-    native_dispatch_8,
-    native_dispatch_9,
-    native_dispatch_10,
-    native_dispatch_11,
-    native_dispatch_12,
-    native_dispatch_13,
-    native_dispatch_14,
-    native_dispatch_15,
-    native_dispatch_16,
-    native_dispatch_17,
-    native_dispatch_18,
-    native_dispatch_19,
-    native_dispatch_20,
-    native_dispatch_21,
-    native_dispatch_22,
-    native_dispatch_23,
-    native_dispatch_24,
-    native_dispatch_25,
-    native_dispatch_26,
+    native_dispatch_0,  native_dispatch_1,  native_dispatch_2,
+    native_dispatch_3,  native_dispatch_4,  native_dispatch_5,
+    native_dispatch_6,  native_dispatch_7,  native_dispatch_8,
+    native_dispatch_9,  native_dispatch_10,
 };
 
 NativeDispatcher getNativeDispatcher(int arity) {
@@ -180,6 +78,8 @@ NativeDispatcher getNativeDispatcher(int arity) {
     return dispatchers[arity];
 }
 
+// Fixed-arity native closure trampolines (0-10)
+// args[0] = context, args[1..] = call args
 static Value native_closure_dispatch_0(VM* vm, Value* args, void* func_ptr) {
     ZymNativeClosure0 func = (ZymNativeClosure0)func_ptr;
     return func(vm, args[0]);  // args[0] = context
@@ -235,114 +135,11 @@ static Value native_closure_dispatch_10(VM* vm, Value* args, void* func_ptr) {
     return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10]);
 }
 
-static Value native_closure_dispatch_11(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure11 func = (ZymNativeClosure11)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11]);
-}
-
-static Value native_closure_dispatch_12(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure12 func = (ZymNativeClosure12)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12]);
-}
-
-static Value native_closure_dispatch_13(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure13 func = (ZymNativeClosure13)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13]);
-}
-
-static Value native_closure_dispatch_14(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure14 func = (ZymNativeClosure14)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14]);
-}
-
-static Value native_closure_dispatch_15(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure15 func = (ZymNativeClosure15)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15]);
-}
-
-static Value native_closure_dispatch_16(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure16 func = (ZymNativeClosure16)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16]);
-}
-
-static Value native_closure_dispatch_17(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure17 func = (ZymNativeClosure17)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17]);
-}
-
-static Value native_closure_dispatch_18(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure18 func = (ZymNativeClosure18)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18]);
-}
-
-static Value native_closure_dispatch_19(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure19 func = (ZymNativeClosure19)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19]);
-}
-
-static Value native_closure_dispatch_20(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure20 func = (ZymNativeClosure20)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20]);
-}
-
-static Value native_closure_dispatch_21(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure21 func = (ZymNativeClosure21)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21]);
-}
-
-static Value native_closure_dispatch_22(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure22 func = (ZymNativeClosure22)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22]);
-}
-
-static Value native_closure_dispatch_23(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure23 func = (ZymNativeClosure23)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23]);
-}
-
-static Value native_closure_dispatch_24(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure24 func = (ZymNativeClosure24)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23], args[24]);
-}
-
-static Value native_closure_dispatch_25(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure25 func = (ZymNativeClosure25)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23], args[24], args[25]);
-}
-
-static Value native_closure_dispatch_26(VM* vm, Value* args, void* func_ptr) {
-    ZymNativeClosure26 func = (ZymNativeClosure26)func_ptr;
-    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], args[20], args[21], args[22], args[23], args[24], args[25], args[26]);
-}
-
 static NativeDispatcher closure_dispatchers[MAX_NATIVE_ARITY + 1] = {
-    native_closure_dispatch_0,
-    native_closure_dispatch_1,
-    native_closure_dispatch_2,
-    native_closure_dispatch_3,
-    native_closure_dispatch_4,
-    native_closure_dispatch_5,
-    native_closure_dispatch_6,
-    native_closure_dispatch_7,
-    native_closure_dispatch_8,
-    native_closure_dispatch_9,
-    native_closure_dispatch_10,
-    native_closure_dispatch_11,
-    native_closure_dispatch_12,
-    native_closure_dispatch_13,
-    native_closure_dispatch_14,
-    native_closure_dispatch_15,
-    native_closure_dispatch_16,
-    native_closure_dispatch_17,
-    native_closure_dispatch_18,
-    native_closure_dispatch_19,
-    native_closure_dispatch_20,
-    native_closure_dispatch_21,
-    native_closure_dispatch_22,
-    native_closure_dispatch_23,
-    native_closure_dispatch_24,
-    native_closure_dispatch_25,
-    native_closure_dispatch_26,
+    native_closure_dispatch_0,  native_closure_dispatch_1,  native_closure_dispatch_2,
+    native_closure_dispatch_3,  native_closure_dispatch_4,  native_closure_dispatch_5,
+    native_closure_dispatch_6,  native_closure_dispatch_7,  native_closure_dispatch_8,
+    native_closure_dispatch_9,  native_closure_dispatch_10,
 };
 
 NativeDispatcher getNativeClosureDispatcher(int arity) {
@@ -350,6 +147,151 @@ NativeDispatcher getNativeClosureDispatcher(int arity) {
         return NULL;
     }
     return closure_dispatchers[arity];
+}
+
+// Variadic function trampolines: split args into positional + vargs array
+// Signature: (VM* vm, Value* args, void* func_ptr, int argc)
+// args points to the raw stack args, argc is total arg count
+
+static Value native_variadic_dispatch_0(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic0 func = (ZymNativeVariadic0)func_ptr;
+    return func(vm, args, argc);
+}
+
+static Value native_variadic_dispatch_1(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic1 func = (ZymNativeVariadic1)func_ptr;
+    return func(vm, args[0], args + 1, argc - 1);
+}
+
+static Value native_variadic_dispatch_2(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic2 func = (ZymNativeVariadic2)func_ptr;
+    return func(vm, args[0], args[1], args + 2, argc - 2);
+}
+
+static Value native_variadic_dispatch_3(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic3 func = (ZymNativeVariadic3)func_ptr;
+    return func(vm, args[0], args[1], args[2], args + 3, argc - 3);
+}
+
+static Value native_variadic_dispatch_4(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic4 func = (ZymNativeVariadic4)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args + 4, argc - 4);
+}
+
+static Value native_variadic_dispatch_5(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic5 func = (ZymNativeVariadic5)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args + 5, argc - 5);
+}
+
+static Value native_variadic_dispatch_6(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic6 func = (ZymNativeVariadic6)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args + 6, argc - 6);
+}
+
+static Value native_variadic_dispatch_7(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic7 func = (ZymNativeVariadic7)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args + 7, argc - 7);
+}
+
+static Value native_variadic_dispatch_8(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic8 func = (ZymNativeVariadic8)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args + 8, argc - 8);
+}
+
+static Value native_variadic_dispatch_9(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic9 func = (ZymNativeVariadic9)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args + 9, argc - 9);
+}
+
+static Value native_variadic_dispatch_10(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeVariadic10 func = (ZymNativeVariadic10)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args + 10, argc - 10);
+}
+
+static NativeVariadicDispatcher variadic_dispatchers[MAX_NATIVE_ARITY + 1] = {
+    native_variadic_dispatch_0,  native_variadic_dispatch_1,  native_variadic_dispatch_2,
+    native_variadic_dispatch_3,  native_variadic_dispatch_4,  native_variadic_dispatch_5,
+    native_variadic_dispatch_6,  native_variadic_dispatch_7,  native_variadic_dispatch_8,
+    native_variadic_dispatch_9,  native_variadic_dispatch_10,
+};
+
+NativeVariadicDispatcher getNativeVariadicDispatcher(int fixed_arity) {
+    if (fixed_arity < 0 || fixed_arity > MAX_NATIVE_ARITY) {
+        return NULL;
+    }
+    return variadic_dispatchers[fixed_arity];
+}
+
+// Variadic closure trampolines: args[0] = context, args[1..] = call args
+// Split into: context, positional fixed args, vargs pointer, vargc
+
+static Value native_variadic_closure_dispatch_0(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic0 func = (ZymNativeClosureVariadic0)func_ptr;
+    return func(vm, args[0], args + 1, argc);
+}
+
+static Value native_variadic_closure_dispatch_1(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic1 func = (ZymNativeClosureVariadic1)func_ptr;
+    return func(vm, args[0], args[1], args + 2, argc - 1);
+}
+
+static Value native_variadic_closure_dispatch_2(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic2 func = (ZymNativeClosureVariadic2)func_ptr;
+    return func(vm, args[0], args[1], args[2], args + 3, argc - 2);
+}
+
+static Value native_variadic_closure_dispatch_3(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic3 func = (ZymNativeClosureVariadic3)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args + 4, argc - 3);
+}
+
+static Value native_variadic_closure_dispatch_4(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic4 func = (ZymNativeClosureVariadic4)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args + 5, argc - 4);
+}
+
+static Value native_variadic_closure_dispatch_5(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic5 func = (ZymNativeClosureVariadic5)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args + 6, argc - 5);
+}
+
+static Value native_variadic_closure_dispatch_6(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic6 func = (ZymNativeClosureVariadic6)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args + 7, argc - 6);
+}
+
+static Value native_variadic_closure_dispatch_7(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic7 func = (ZymNativeClosureVariadic7)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args + 8, argc - 7);
+}
+
+static Value native_variadic_closure_dispatch_8(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic8 func = (ZymNativeClosureVariadic8)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args + 9, argc - 8);
+}
+
+static Value native_variadic_closure_dispatch_9(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic9 func = (ZymNativeClosureVariadic9)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args + 10, argc - 9);
+}
+
+static Value native_variadic_closure_dispatch_10(VM* vm, Value* args, void* func_ptr, int argc) {
+    ZymNativeClosureVariadic10 func = (ZymNativeClosureVariadic10)func_ptr;
+    return func(vm, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args + 11, argc - 10);
+}
+
+static NativeVariadicDispatcher variadic_closure_dispatchers[MAX_NATIVE_ARITY + 1] = {
+    native_variadic_closure_dispatch_0,  native_variadic_closure_dispatch_1,  native_variadic_closure_dispatch_2,
+    native_variadic_closure_dispatch_3,  native_variadic_closure_dispatch_4,  native_variadic_closure_dispatch_5,
+    native_variadic_closure_dispatch_6,  native_variadic_closure_dispatch_7,  native_variadic_closure_dispatch_8,
+    native_variadic_closure_dispatch_9,  native_variadic_closure_dispatch_10,
+};
+
+NativeVariadicDispatcher getNativeVariadicClosureDispatcher(int fixed_arity) {
+    if (fixed_arity < 0 || fixed_arity > MAX_NATIVE_ARITY) {
+        return NULL;
+    }
+    return variadic_closure_dispatchers[fixed_arity];
 }
 
 static const char* skipWhitespace(const char* str) {
@@ -367,10 +309,12 @@ static const char* parseIdentifier(const char* str, char* out, int max_len) {
     return str;
 }
 
-bool parseNativeSignature(const char* signature, char* out_name, int* out_arity) {
+bool parseNativeSignatureEx(const char* signature, char* out_name, int* out_arity, bool* out_is_variadic) {
     if (!signature || !out_name || !out_arity) {
         return false;
     }
+
+    if (out_is_variadic) *out_is_variadic = false;
 
     const char* ptr = parseIdentifier(signature, out_name, 256);
     if (out_name[0] == '\0') {
@@ -395,8 +339,24 @@ bool parseNativeSignature(const char* signature, char* out_name, int* out_arity)
                 return false;
             }
 
-            char param_name[256];
             ptr = skipWhitespace(ptr);
+
+            // Check for variadic "..."
+            if (ptr[0] == '.' && ptr[1] == '.' && ptr[2] == '.') {
+                ptr += 3;
+                if (out_is_variadic) *out_is_variadic = true;
+                // Skip optional rest param name (e.g., "...args")
+                char rest_name[256];
+                ptr = parseIdentifier(ptr, rest_name, 256);
+                ptr = skipWhitespace(ptr);
+                if (*ptr != ')') {
+                    fprintf(stderr, "Native function signature parse error: '...' must be the last parameter\n");
+                    return false;
+                }
+                break;
+            }
+
+            char param_name[256];
             ptr = parseIdentifier(ptr, param_name, 256);
             if (param_name[0] == '\0') {
                 fprintf(stderr, "Native function signature parse error: expected parameter name\n");
@@ -427,6 +387,10 @@ bool parseNativeSignature(const char* signature, char* out_name, int* out_arity)
     return true;
 }
 
+bool parseNativeSignature(const char* signature, char* out_name, int* out_arity) {
+    return parseNativeSignatureEx(signature, out_name, out_arity, NULL);
+}
+
 bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
     char func_name[256];
     int arity;
@@ -453,6 +417,46 @@ bool registerNativeFunction(VM* vm, const char* signature, void* func_ptr) {
     pushTempRoot(vm, (Obj*)name_obj);
 
     ObjNativeFunction* native = newNativeFunction(vm, name_obj, arity, func_ptr, dispatcher);
+    pushTempRoot(vm, (Obj*)native);
+
+    tableSet(vm, &vm->globals, name_obj, OBJ_VAL(native));
+    popTempRoot(vm);
+    popTempRoot(vm);
+
+    return true;
+}
+
+bool registerNativeVariadicFunction(VM* vm, const char* signature, void* func_ptr) {
+    char func_name[256];
+    int fixed_arity;
+    bool is_variadic;
+
+    if (!parseNativeSignatureEx(signature, func_name, &fixed_arity, &is_variadic)) {
+        return false;
+    }
+
+    if (!is_variadic) {
+        fprintf(stderr, "Native variadic function '%s' signature must contain '...'\n", func_name);
+        return false;
+    }
+
+    // Variadic mangling: name@v<fixed_count>
+    char mangled_name[256 + 16];
+    snprintf(mangled_name, sizeof(mangled_name), "%s@v%d", func_name, fixed_arity);
+
+    ObjString* name_obj = copyString(vm, mangled_name, (int)strlen(mangled_name));
+    pushTempRoot(vm, (Obj*)name_obj);
+
+    NativeVariadicDispatcher vdispatcher = getNativeVariadicDispatcher(fixed_arity);
+    if (!vdispatcher) {
+        fprintf(stderr, "No variadic dispatcher available for fixed arity %d\n", fixed_arity);
+        popTempRoot(vm);
+        return false;
+    }
+
+    ObjNativeFunction* native = newNativeFunction(vm, name_obj, fixed_arity, func_ptr, NULL);
+    native->variadic_dispatcher = vdispatcher;
+    native->is_variadic = true;
     pushTempRoot(vm, (Obj*)native);
 
     tableSet(vm, &vm->globals, name_obj, OBJ_VAL(native));

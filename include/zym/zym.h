@@ -92,6 +92,17 @@ ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, s
 // Returns ZYM_STATUS_OK on success, ZYM_STATUS_COMPILE_ERROR on parse error
 ZymStatus zym_defineNative(ZymVM* vm, const char* signature, void* func_ptr);
 
+// Register a variadic native function
+// Fixed params are passed directly, followed by a variadic args array + count:
+//   "print(...)"          -> ZymValue myFunc(ZymVM* vm, ZymValue* vargs, int vargc)
+//   "format(template, ...)" -> ZymValue myFunc(ZymVM* vm, ZymValue template, ZymValue* vargs, int vargc)
+//   "log(level, tag, ...)"  -> ZymValue myFunc(ZymVM* vm, ZymValue level, ZymValue tag, ZymValue* vargs, int vargc)
+// vargs points to the remaining arguments after the fixed params, vargc is their count
+// Signature format: "funcName(...)" for pure variadic (min 0 args)
+//                   "funcName(a, b, ...)" for fixed + rest (min 2 args)
+// Returns ZYM_STATUS_OK on success, ZYM_STATUS_COMPILE_ERROR on parse error
+ZymStatus zym_defineNativeVariadic(ZymVM* vm, const char* signature, void* func_ptr);
+
 // Define a global variable accessible from Zym code
 // This sets the value directly in the VM's global table
 ZymStatus zym_defineGlobal(ZymVM* vm, const char* name, ZymValue value);
@@ -115,6 +126,13 @@ void* zym_getNativeData(ZymValue context);
 // Context is passed as the first argument after vm
 ZymValue zym_createNativeClosure(ZymVM* vm, const char* signature, void* func_ptr, ZymValue context);
 
+// Create a variadic native closure bound to context
+// Fixed params are passed directly after context, followed by variadic args array + count:
+//   "func(...)"       -> ZymValue myFunc(ZymVM* vm, ZymValue context, ZymValue* vargs, int vargc)
+//   "func(a, ...)"    -> ZymValue myFunc(ZymVM* vm, ZymValue context, ZymValue a, ZymValue* vargs, int vargc)
+// Signature format: "funcName(...)" or "funcName(a, b, ...)"
+ZymValue zym_createNativeClosureVariadic(ZymVM* vm, const char* signature, void* func_ptr, ZymValue context);
+
 // Get the context from a native closure
 // Returns the context value that was bound when the closure was created
 // Returns ZYM_NULL if the value is not a native closure
@@ -135,6 +153,13 @@ ZymValue zym_createDispatcher(ZymVM* vm);
 // closure: A closure created with zym_createNativeClosure
 // Returns: true on success, false if dispatcher is full (>8 overloads)
 bool zym_addOverload(ZymVM* vm, ZymValue dispatcher, ZymValue closure);
+
+// Set the variadic fallback on a dispatcher
+// Called when no exact-arity overload matches
+// closure: A native closure (variadic or fixed) to use as fallback
+// min_arity: minimum number of args required (number of fixed params before ...)
+// Returns: true on success, false if dispatcher is invalid
+bool zym_setVariadicFallback(ZymVM* vm, ZymValue dispatcher, ZymValue closure, int min_arity);
 
 // =============================================================================
 // VALUE TYPE CHECKING

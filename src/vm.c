@@ -2241,22 +2241,34 @@ static InterpretResult run(VM* vm) {
         // Handle native functions
         if (IS_NATIVE_FUNCTION(callee)) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
-
-            if (arg_count != native->arity) {
-                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
+            Value result;
 
             // Prepare arguments array (points to first arg on stack)
             Value* args = &stack[callee_slot + 1];
 
-            // Args are already on the stack and covered by stack_top,
-            // so the GC will mark them as roots. No temp root protection needed.
+            if (native->is_variadic) {
+                // Variadic: check minimum arity, call via variadic dispatcher
+                if (arg_count < (uint16_t)native->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", native->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                STORE_STATE();
+                result = native->variadic_dispatcher(vm, args, native->func_ptr, (int)arg_count);
+                RELOAD_STACK();
+            } else {
+                if (arg_count != native->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
 
-            // Call native function via dispatcher
-            STORE_STATE();
-            Value result = native->dispatcher(vm, args, native->func_ptr);
-            RELOAD_STACK(); // native may trigger GC that reallocates stack
+                // Args are already on the stack and covered by stack_top,
+                // so the GC will mark them as roots. No temp root protection needed.
+
+                // Call native function via dispatcher
+                STORE_STATE();
+                result = native->dispatcher(vm, args, native->func_ptr);
+                RELOAD_STACK(); // native may trigger GC that reallocates stack
+            }
 
             // Check for error
             if (result == ZYM_ERROR) {
@@ -2279,28 +2291,46 @@ static InterpretResult run(VM* vm) {
         // Handle native closures
         if (IS_NATIVE_CLOSURE(callee)) {
             ObjNativeClosure* native_closure = AS_NATIVE_CLOSURE(callee);
+            Value result;
 
-            if (arg_count != native_closure->arity) {
-                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native_closure->arity, arg_count);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            if (native_closure->is_variadic) {
+                // Variadic closure: check minimum arity, call via variadic dispatcher
+                if (arg_count < (uint16_t)native_closure->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", native_closure->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                // Build closure_args: [context, arg1, arg2, ...] for variadic dispatcher
+                Value closure_args[MAX_NATIVE_ARITY + 27 + 1];
+                closure_args[0] = native_closure->context;
+                for (int i = 0; i < arg_count; i++) {
+                    closure_args[i + 1] = stack[callee_slot + 1 + i];
+                }
+                STORE_STATE();
+                result = native_closure->variadic_dispatcher(vm, closure_args, native_closure->func_ptr, (int)arg_count);
+                RELOAD_STACK();
+            } else {
+                if (arg_count != native_closure->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native_closure->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // Prepare arguments array: [context, arg1, arg2, ...]
+                // We need to build a temporary array with context as first element
+                Value closure_args[MAX_NATIVE_ARITY + 1];
+                closure_args[0] = native_closure->context;  // Context is first argument
+                for (int i = 0; i < arg_count; i++) {
+                    closure_args[i + 1] = stack[callee_slot + 1 + i];
+                }
+
+                // Args on the stack are already covered by stack_top (GC roots).
+                // The context is held by the native_closure object (also a GC root).
+                // closure_args[] is a stack-local copy — no temp root protection needed.
+
+                // Call native closure via dispatcher (context-aware dispatcher)
+                STORE_STATE();
+                result = native_closure->dispatcher(vm, closure_args, native_closure->func_ptr);
+                RELOAD_STACK(); // native may trigger GC that reallocates stack
             }
-
-            // Prepare arguments array: [context, arg1, arg2, ...]
-            // We need to build a temporary array with context as first element
-            Value closure_args[MAX_NATIVE_ARITY + 1];
-            closure_args[0] = native_closure->context;  // Context is first argument
-            for (int i = 0; i < arg_count; i++) {
-                closure_args[i + 1] = stack[callee_slot + 1 + i];
-            }
-
-            // Args on the stack are already covered by stack_top (GC roots).
-            // The context is held by the native_closure object (also a GC root).
-            // closure_args[] is a stack-local copy — no temp root protection needed.
-
-            // Call native closure via dispatcher (context-aware dispatcher)
-            STORE_STATE();
-            Value result = native_closure->dispatcher(vm, closure_args, native_closure->func_ptr);
-            RELOAD_STACK(); // native may trigger GC that reallocates stack
 
             // Check for error
             if (result == ZYM_ERROR) {
@@ -2448,19 +2478,27 @@ static InterpretResult run(VM* vm) {
         // Handle native functions in tail position: call directly and return result
         if (IS_NATIVE_FUNCTION(callee)) {
             ObjNativeFunction* native = AS_NATIVE_FUNCTION(callee);
-
-            if (arg_count != native->arity) {
-                STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
-
+            Value result;
             Value* args = &stack[callee_slot + 1];
 
-            // Args are already on the stack and covered by stack_top — GC roots.
+            if (native->is_variadic) {
+                if (arg_count < (uint16_t)native->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", native->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                STORE_STATE();
+                result = native->variadic_dispatcher(vm, args, native->func_ptr, (int)arg_count);
+                RELOAD_STACK();
+            } else {
+                if (arg_count != native->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
 
-            STORE_STATE();
-            Value result = native->dispatcher(vm, args, native->func_ptr);
-            RELOAD_STACK(); // native may trigger GC that reallocates stack
+                STORE_STATE();
+                result = native->dispatcher(vm, args, native->func_ptr);
+                RELOAD_STACK();
+            }
 
             if (result == ZYM_ERROR) {
                 return INTERPRET_RUNTIME_ERROR;
@@ -2471,6 +2509,91 @@ static InterpretResult run(VM* vm) {
             }
 
             // Tail position: return the native's result from the current frame
+            CallFrame* frame = vm->current_frame;
+            if (__builtin_expect(vm->open_upvalues != NULL &&
+                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base]);
+            }
+            vm->frame_count--;
+            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            bp = stack + base;
+            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+
+            if (__builtin_expect(vm->active_boundaries > 0, 0)) {
+                if (vm->with_prompt_depth > 0) {
+                    WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
+                    if (vm->frame_count == wpc->frame_boundary) {
+                        popPrompt(vm);
+                        vm->with_prompt_depth--;
+                        vm->active_boundaries--;
+                    }
+                }
+
+                if (vm->resume_depth > 0) {
+                    ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
+                    if (vm->frame_count == ctx->frame_boundary) {
+                        stack[ctx->result_slot] = result;
+                        vm->resume_depth--;
+                        vm->active_boundaries--;
+                        ip    = frame->ip;
+                        vm->chunk = frame->caller_chunk;
+                        constants = vm->chunk->constants.values;
+                        DISPATCH();
+                    }
+                }
+            }
+
+            ip    = frame->ip;
+            vm->chunk = frame->caller_chunk;
+            constants = vm->chunk->constants.values;
+            stack[frame->stack_base] = result;
+
+            DISPATCH();
+        }
+
+        // Handle native closures in tail position
+        if (IS_NATIVE_CLOSURE(callee)) {
+            ObjNativeClosure* native_closure = AS_NATIVE_CLOSURE(callee);
+            Value result;
+
+            if (native_closure->is_variadic) {
+                if (arg_count < (uint16_t)native_closure->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", native_closure->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                // Build closure_args: [context, arg1, arg2, ...] for variadic dispatcher
+                Value closure_args[MAX_NATIVE_ARITY + 27 + 1];
+                closure_args[0] = native_closure->context;
+                for (int i = 0; i < arg_count; i++) {
+                    closure_args[i + 1] = stack[callee_slot + 1 + i];
+                }
+                STORE_STATE();
+                result = native_closure->variadic_dispatcher(vm, closure_args, native_closure->func_ptr, (int)arg_count);
+                RELOAD_STACK();
+            } else {
+                if (arg_count != native_closure->arity) {
+                    STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", native_closure->arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                Value closure_args[MAX_NATIVE_ARITY + 1];
+                closure_args[0] = native_closure->context;
+                for (int i = 0; i < arg_count; i++) {
+                    closure_args[i + 1] = stack[callee_slot + 1 + i];
+                }
+                STORE_STATE();
+                result = native_closure->dispatcher(vm, closure_args, native_closure->func_ptr);
+                RELOAD_STACK();
+            }
+
+            if (result == ZYM_ERROR) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+
+            if (result == ZYM_CONTROL_TRANSFER) {
+                LOAD_STATE(); DISPATCH();
+            }
+
+            // Tail position: return the native closure's result from the current frame
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
                                 vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
