@@ -40,6 +40,7 @@ set(ZYM_CORE_SOURCES
         ${ZYM_ROOT}/src/natives/shared.c
         ${ZYM_ROOT}/src/natives/string_natives.c
         ${ZYM_ROOT}/src/natives/math.c
+        ${ZYM_ROOT}/src/natives/typeof.c
 )
 
 if(NOT CONFIG_ZYM_RUNTIME_ONLY)

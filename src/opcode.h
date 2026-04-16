@@ -152,6 +152,10 @@ typedef enum {
     // Dispatcher Opcodes (for overloaded function returns)
     NEW_DISPATCHER,
     ADD_OVERLOAD,
+    SET_VARIADIC_FALLBACK, // Set variadic fallback on dispatcher: Ra = dispatcher, Rb = closure
+
+    // Variadic Function Opcodes
+    PACK_REST,             // Pack extra args into list: Ra = rest list, B = fixed_count (actual arg_count from frame)
 
 
     // Struct Opcodes

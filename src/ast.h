@@ -133,6 +133,7 @@ typedef struct {
 
 struct Param {
     Token name;
+    bool is_rest;
 };
 
 typedef struct {

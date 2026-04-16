@@ -336,15 +336,23 @@ static Expr* grouping(Parser* parser, bool can_assign) {
         return NULL;
     }
 
-    if (parser->current.type == TOKEN_IDENTIFIER) {
+    if (parser->current.type == TOKEN_IDENTIFIER || parser->current.type == TOKEN_DOT_DOT_DOT) {
         Token saved_current = parser->current;
         Token saved_previous = parser->previous;
         Scanner saved_scanner = parser->scanner;
 
         bool looks_like_arrow_function = false;
         int lookahead_depth = 0;
-        while (parser->current.type == TOKEN_IDENTIFIER || parser->current.type == TOKEN_COMMA) {
-            if (parser->current.type == TOKEN_IDENTIFIER) {
+        while (parser->current.type == TOKEN_IDENTIFIER || parser->current.type == TOKEN_COMMA || parser->current.type == TOKEN_DOT_DOT_DOT) {
+            if (parser->current.type == TOKEN_DOT_DOT_DOT) {
+                advance(parser);
+                // ... must be followed by identifier then ')'
+                if (parser->current.type == TOKEN_IDENTIFIER) {
+                    advance(parser);
+                    lookahead_depth++;
+                }
+                break; // rest param must be last
+            } else if (parser->current.type == TOKEN_IDENTIFIER) {
                 advance(parser);
                 lookahead_depth++;
             } else if (parser->current.type == TOKEN_COMMA) {
@@ -371,6 +379,12 @@ static Expr* grouping(Parser* parser, bool can_assign) {
         int param_capacity = 0;
 
         do {
+            bool is_rest = false;
+            if (parser->current.type == TOKEN_DOT_DOT_DOT) {
+                advance(parser);
+                is_rest = true;
+            }
+
             if (parser->current.type != TOKEN_IDENTIFIER) {
                 goto parse_as_expression;
             }
@@ -383,8 +397,11 @@ static Expr* grouping(Parser* parser, bool can_assign) {
 
             advance(parser);
             params[param_count].name = parser->previous;
+            params[param_count].is_rest = is_rest;
 
             param_count++;
+
+            if (is_rest) break; // rest param must be last
         } while (match(parser, TOKEN_COMMA));
 
         if (parser->current.type == TOKEN_RIGHT_PAREN) {
@@ -771,6 +788,8 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
                 error_at_current(parser, "Can't have more than 255 parameters.");
             }
 
+            bool is_rest = match(parser, TOKEN_DOT_DOT_DOT);
+
             if (param_count + 1 > param_capacity) {
                 int old_capacity = param_capacity;
                 param_capacity = GROW_CAPACITY(old_capacity);
@@ -779,7 +798,15 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
+            params[param_count].is_rest = is_rest;
             param_count++;
+
+            if (is_rest) {
+                if (parser->current.type == TOKEN_COMMA) {
+                    error_at_current(parser, "Rest parameter must be last.");
+                }
+                break;
+            }
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
@@ -841,6 +868,8 @@ static Stmt* function(Parser* parser, const char* kind) {
                 error_at_current(parser, "Can't have more than 255 parameters.");
             }
 
+            bool is_rest = match(parser, TOKEN_DOT_DOT_DOT);
+
             if (param_count + 1 > param_capacity) {
                 int old_capacity = param_capacity;
                 param_capacity = GROW_CAPACITY(old_capacity);
@@ -850,7 +879,15 @@ static Stmt* function(Parser* parser, const char* kind) {
             consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
 
             params[param_count].name = parser->previous;
+            params[param_count].is_rest = is_rest;
             param_count++;
+
+            if (is_rest) {
+                if (parser->current.type == TOKEN_COMMA) {
+                    error_at_current(parser, "Rest parameter must be last.");
+                }
+                break;
+            }
         } while (match(parser, TOKEN_COMMA));
     }
     consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");

@@ -454,6 +454,7 @@ static ObjString* keyToString(VM* vm, Value key_val) {
 }
 
 static Value resolveOverload(VM* vm, ObjDispatcher* dispatcher, uint16_t arg_count) {
+    // Try exact arity match first
     for (int i = 0; i < dispatcher->count; i++) {
         Obj* overload = dispatcher->overloads[i];
         int arity = -1;
@@ -468,6 +469,12 @@ static Value resolveOverload(VM* vm, ObjDispatcher* dispatcher, uint16_t arg_cou
             return OBJ_VAL(overload);
         }
     }
+
+    // Fall back to variadic if present and arg_count meets minimum
+    if (dispatcher->variadic_fallback && arg_count >= dispatcher->variadic_min_arity) {
+        return OBJ_VAL(dispatcher->variadic_fallback);
+    }
+
     return NULL_VAL;
 }
 
@@ -549,6 +556,7 @@ static bool pushPreemptFrame(VM* vm) {
     frame->stack_base   = callee_slot;
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_PREEMPT;
+    frame->arg_count    = 0;
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
@@ -705,6 +713,8 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(SET_STRUCT_FIELD_IC),
         JUMP_ENTRY(NEW_DISPATCHER),
         JUMP_ENTRY(ADD_OVERLOAD),
+        JUMP_ENTRY(SET_VARIADIC_FALLBACK),
+        JUMP_ENTRY(PACK_REST),
         JUMP_ENTRY(NEW_STRUCT),
         JUMP_ENTRY(STRUCT_SPREAD),
         JUMP_ENTRY(GET_STRUCT_FIELD),
@@ -2174,7 +2184,13 @@ static InterpretResult run(VM* vm) {
             }
             #endif
 
-            if (__builtin_expect(arg_count != function->arity, 0)) {
+            if (__builtin_expect(function->is_variadic, 0)) {
+                // Variadic: need at least fixed_arity args
+                if (arg_count < (uint16_t)function->fixed_arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", function->fixed_arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+            } else if (__builtin_expect(arg_count != function->arity, 0)) {
                 STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
@@ -2185,7 +2201,12 @@ static InterpretResult run(VM* vm) {
             }
 
             // Calculate required stack size and grow if needed
+            // For variadic functions, extra args beyond arity occupy stack slots too
             int needed_top = callee_slot + function->max_regs;
+            if (function->is_variadic && arg_count > (uint16_t)function->arity) {
+                int extra = arg_count - function->arity;
+                needed_top += extra;
+            }
             if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
                 if (!growStackForCall(vm, needed_top, NULL)) {
                     STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
@@ -2205,6 +2226,7 @@ static InterpretResult run(VM* vm) {
             frame->stack_base   = callee_slot;
             frame->caller_chunk = vm->chunk;
             frame->flags        = 0;
+            frame->arg_count    = arg_count;
 
             vm->current_frame = frame;
             base = callee_slot;
@@ -2342,6 +2364,7 @@ static InterpretResult run(VM* vm) {
         frame->stack_base   = callee_slot;
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
+        frame->arg_count    = REG_Bx(instr);
 
         vm->current_frame = frame;
         base = callee_slot;
@@ -2373,7 +2396,12 @@ static InterpretResult run(VM* vm) {
             ObjClosure*  closure  = AS_CLOSURE(callee);
             ObjFunction* function = closure->function;
 
-            if (arg_count != function->arity) {
+            if (__builtin_expect(function->is_variadic, 0)) {
+                if (arg_count < (uint16_t)function->fixed_arity) {
+                    STORE_IP(); runtimeError(vm, "Expected at least %d arguments but got %u.", function->fixed_arity, arg_count);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+            } else if (arg_count != function->arity) {
                 STORE_IP(); runtimeError(vm, "Expected %d arguments but got %u.", function->arity, arg_count);
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
@@ -2382,6 +2410,9 @@ static InterpretResult run(VM* vm) {
             CallFrame* current_frame = vm->current_frame;
             int frame_base = current_frame->stack_base;
             int needed_top = frame_base + function->max_regs;
+            if (function->is_variadic && arg_count > (uint16_t)function->arity) {
+                needed_top += (arg_count - function->arity);
+            }
 
             // Grow stack if needed
             if (!growStackForCall(vm, needed_top, NULL)) {
@@ -2404,6 +2435,7 @@ static InterpretResult run(VM* vm) {
 
             // Update the frame to point at the new closure
             current_frame->closure = closure;
+            current_frame->arg_count = arg_count;
 
             // Jump into the new function
             vm->chunk = &function->chunk;
@@ -3138,6 +3170,45 @@ static InterpretResult run(VM* vm) {
         dispatcher->overloads[dispatcher->count++] = (Obj*)closure;
         DISPATCH();
     }
+    OP(SET_VARIADIC_FALLBACK) {
+        int a = base + REG_A(instr);
+        Value disp_val = stack[a];
+        Value closure_val = bp[REG_B(instr)];
+        int min_arity = REG_C(instr);
+
+        if (!IS_DISPATCHER(disp_val)) {
+            STORE_IP(); runtimeError(vm, "SET_VARIADIC_FALLBACK requires a dispatcher.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+        }
+
+        ObjDispatcher* dispatcher = AS_DISPATCHER(disp_val);
+        dispatcher->variadic_fallback = AS_OBJ(closure_val);
+        dispatcher->variadic_min_arity = min_arity;
+        DISPATCH();
+    }
+    OP(PACK_REST) {
+        // Ra = rest list register, B = fixed_count (number of fixed params before rest)
+        // Creates a list from stack args [base + 1 + fixed_count .. base + 1 + actual_arg_count - 1]
+        int rest_reg = base + REG_A(instr);
+        int fixed_count = REG_B(instr);
+        int actual_args = vm->current_frame->arg_count;
+        int extra_count = actual_args - fixed_count;
+        if (extra_count < 0) extra_count = 0;
+
+        ObjList* list = newList(vm);
+        RELOAD_STACK();
+        pushTempRoot(vm, (Obj*)list);
+
+        // Append extra args to the list
+        // Args are at stack[base + 1 + fixed_count] through stack[base + actual_args]
+        for (int i = 0; i < extra_count; i++) {
+            writeValueArray(vm, &list->items, stack[base + 1 + fixed_count + i]);
+        }
+
+        stack[rest_reg] = OBJ_VAL(list);
+        popTempRoot(vm);
+        DISPATCH();
+    }
     OP(NEW_STRUCT) {
         int a = base + REG_A(instr);
         int bx = REG_Bx(instr);             // Schema constant index
@@ -3426,6 +3497,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     frame->closure      = closure;
     frame->stack_base   = frame_base;
     frame->flags        = 0;
+    frame->arg_count    = (uint16_t)argCount;
 
     // On return, resume at the API trampoline, not bytecode.
     frame->ip           = vm->api_trampoline.code;

@@ -443,6 +443,9 @@ static void blackenObject(VM* vm, Obj* object) {
             for (int i = 0; i < dispatcher->count; i++) {
                 markObject(vm, (Obj*)dispatcher->overloads[i]);
             }
+            if (dispatcher->variadic_fallback) {
+                markObject(vm, (Obj*)dispatcher->variadic_fallback);
+            }
             break;
         }
 

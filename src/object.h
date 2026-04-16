@@ -96,7 +96,9 @@ typedef struct ObjString {
 
 typedef struct ObjFunction {
     Obj obj;
-    int arity;
+    int arity;          // total param count (including rest param)
+    int fixed_arity;    // number of fixed params before rest param (== arity if not variadic)
+    bool is_variadic;   // true if function has a rest parameter (...args)
     int max_regs;
     Chunk chunk;
     ObjString* name;
@@ -163,6 +165,8 @@ typedef struct {
     Obj obj;
     Obj* overloads[MAX_OVERLOADS];
     int count;
+    Obj* variadic_fallback;     // closure/native for variadic fallback (NULL if none)
+    int variadic_min_arity;     // minimum args required by the variadic fallback
 } ObjDispatcher;
 
 

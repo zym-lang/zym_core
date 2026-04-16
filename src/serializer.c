@@ -60,6 +60,9 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
 
             ObjFunction* fn = AS_FUNCTION(value);
             writeBytes(vm, out, &fn->arity, sizeof(int));
+            writeBytes(vm, out, &fn->fixed_arity, sizeof(int));
+            uint8_t variadic_flag = fn->is_variadic ? 1 : 0;
+            writeBytes(vm, out, &variadic_flag, sizeof(uint8_t));
             writeBytes(vm, out, &fn->max_regs, sizeof(int));
             writeBytes(vm, out, &fn->upvalue_count, sizeof(int));
             if (fn->upvalue_count > 0) {
@@ -229,6 +232,10 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                     } while (0)
 
                 READ_BYTES_OR_FAIL(&fn->arity, sizeof(int));
+                READ_BYTES_OR_FAIL(&fn->fixed_arity, sizeof(int));
+                uint8_t variadic_flag = 0;
+                READ_BYTES_OR_FAIL(&variadic_flag, sizeof(uint8_t));
+                fn->is_variadic = (variadic_flag != 0);
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
                 if (fn->upvalue_count > 0) {

@@ -394,6 +394,8 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         }
         case NEW_DISPATCHER: return reg_instruction_a("NEW_DISPATCHER", instruction, offset);
         case ADD_OVERLOAD:   return reg2_instruction("ADD_OVERLOAD", chunk, offset);
+        case SET_VARIADIC_FALLBACK: return reg_instruction_abc("SET_VAR_FALLBACK", instruction, offset);
+        case PACK_REST:     return reg_instruction_abc("PACK_REST", instruction, offset);
         case NEW_STRUCT: return constantInstruction("NEW_STRUCT", chunk, instruction, offset);
         case STRUCT_SPREAD: return reg2_instruction("STRUCT_SPREAD", chunk, offset);
         case GET_STRUCT_FIELD: return reg_instruction_abc("GET_STRUCT_FIELD", instruction, offset);

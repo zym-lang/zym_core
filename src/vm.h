@@ -48,6 +48,7 @@ struct CallFrame {
     int stack_base;
     Chunk* caller_chunk;
     int flags;
+    uint16_t arg_count;  // actual number of args passed to this call (for variadic PACK_REST)
 };
 typedef struct CallFrame CallFrame;
 

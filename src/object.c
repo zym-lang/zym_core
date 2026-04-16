@@ -74,6 +74,8 @@ ObjFunction* newFunction(VM* vm) {
     ObjFunction* function = (ObjFunction*)allocateObject(vm, sizeof(ObjFunction), OBJ_FUNCTION);
 
     function->arity = 0;
+    function->fixed_arity = 0;
+    function->is_variadic = false;
     function->upvalue_count = 0;
     function->upvalue_capacity = 0;
     function->upvalues = NULL;
@@ -146,6 +148,8 @@ ObjMap* newMap(VM* vm) {
 ObjDispatcher* newDispatcher(VM* vm) {
     ObjDispatcher* dispatcher = ALLOCATE_OBJ(vm, ObjDispatcher, OBJ_DISPATCHER);
     dispatcher->count = 0;
+    dispatcher->variadic_fallback = NULL;
+    dispatcher->variadic_min_arity = 0;
     for (int i = 0; i < MAX_OVERLOADS; i++) {
         dispatcher->overloads[i] = NULL;
     }

@@ -47,6 +47,7 @@
 #define REG_SHIFT_C 24
 
 static char* mangle_name(Compiler* compiler, Token* name, int arity);
+static char* mangle_name_variadic(Compiler* compiler, Token* name, int fixed_count);
 static void declare_function(Compiler* compiler, Stmt* stmt);
 /* static void define_function(Compiler* compiler, Stmt* stmt); */
 static bool compile_statement(Compiler* compiler, Stmt* stmt);
@@ -79,6 +80,19 @@ static inline OpCode get_binary_op_from_compound(Compiler* compiler, TokenType o
     }
 }
 static double parse_number_literal(const char* start, int length);
+
+// Returns true if the last parameter in a param list is a rest parameter (...name)
+static bool params_have_rest(Param* params, int param_count) {
+    return param_count > 0 && params[param_count - 1].is_rest;
+}
+
+// Returns the number of fixed (non-rest) parameters
+static int params_fixed_count(Param* params, int param_count) {
+    if (param_count > 0 && params[param_count - 1].is_rest) {
+        return param_count - 1;
+    }
+    return param_count;
+}
 
 static void emit_instruction(Compiler* compiler, uint32_t instruction, int line) {
     writeInstruction(compiler->vm, compiler->compiling_chunk, instruction, line);
@@ -530,13 +544,20 @@ static int add_upvalue(Compiler* compiler, uint8_t index, bool is_local, ObjStru
 static int single_local_hoisted_arity(Compiler* c, const Token* name) {
     int found = -1;
     bool multiple = false;
+    bool has_variadic = false;
     for (int i = 0; i < c->local_hoisted_count; i++) {
         if (c->local_hoisted[i].name.length == name->length &&
             memcmp(c->local_hoisted[i].name.start, name->start, name->length) == 0) {
+            if (c->local_hoisted[i].is_variadic) {
+                has_variadic = true;
+                continue;
+            }
             if (found == -1) found = c->local_hoisted[i].arity;
             else if (c->local_hoisted[i].arity != found) { multiple = true; break; }
-            }
+        }
     }
+    if (has_variadic && found >= 0) return -2;
+    if (has_variadic && found == -1) return -2;
     if (multiple) return -2;
     return found; // -1: none, >=0: unique arity
 }
@@ -740,6 +761,7 @@ static bool find_hoisted_function(Compiler* c, const Token* name, int arity, Hoi
         case HOISTED_GLOBAL: {
             Compiler* root = root_compiler(c);
             for (int i = 0; i < root->hoisted_count; i++) {
+                if (root->hoisted[i].is_variadic) continue; // skip variadic entries in arity lookup
                 if (root->hoisted[i].arity == arity && tokens_equal(&root->hoisted[i].name, name)) {
                     return true;
                 }
@@ -749,6 +771,7 @@ static bool find_hoisted_function(Compiler* c, const Token* name, int arity, Hoi
 
         case HOISTED_LOCAL: {
             for (int i = 0; i < c->local_hoisted_count; i++) {
+                if (c->local_hoisted[i].is_variadic) continue;
                 if (c->local_hoisted[i].arity == arity && tokens_equal(&c->local_hoisted[i].name, name)) {
                     return true;
                 }
@@ -760,6 +783,7 @@ static bool find_hoisted_function(Compiler* c, const Token* name, int arity, Hoi
             Compiler* enclosing = c->enclosing;
             while (enclosing) {
                 for (int i = 0; i < enclosing->local_hoisted_count; i++) {
+                    if (enclosing->local_hoisted[i].is_variadic) continue;
                     if (enclosing->local_hoisted[i].arity == arity &&
                         tokens_equal(&enclosing->local_hoisted[i].name, name)) {
                         return true;
@@ -785,13 +809,53 @@ static bool is_hoisted_in_enclosing(Compiler* c, const Token* name, int arity) {
     return find_hoisted_function(c, name, arity, HOISTED_ENCLOSING);
 }
 
+// Check if a variadic hoisted function exists for the given base name
+static bool has_variadic_hoisted_global(Compiler* c, const Token* name) {
+    Compiler* root = root_compiler(c);
+    for (int i = 0; i < root->hoisted_count; i++) {
+        if (root->hoisted[i].is_variadic && tokens_equal(&root->hoisted[i].name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_variadic_hoisted_local(Compiler* c, const Token* name) {
+    for (int i = 0; i < c->local_hoisted_count; i++) {
+        if (c->local_hoisted[i].is_variadic && tokens_equal(&c->local_hoisted[i].name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_any_hoisted_global(Compiler* c, const Token* name) {
+    Compiler* root = root_compiler(c);
+    for (int i = 0; i < root->hoisted_count; i++) {
+        if (tokens_equal(&root->hoisted[i].name, name)) return true;
+    }
+    return false;
+}
+
+static bool has_any_hoisted_local(Compiler* c, const Token* name) {
+    for (int i = 0; i < c->local_hoisted_count; i++) {
+        if (tokens_equal(&c->local_hoisted[i].name, name)) return true;
+    }
+    return false;
+}
+
 static int single_hoisted_arity(Compiler* c, const Token* name) {
     Compiler* root = root_compiler(c);
     int found = -1;
     bool multiple_different = false;
+    bool has_variadic = false;
 
     for (int i = 0; i < root->hoisted_count; i++) {
         if (tokens_equal(&root->hoisted[i].name, name)) {
+            if (root->hoisted[i].is_variadic) {
+                has_variadic = true;
+                continue; // don't count variadic in arity matching
+            }
             if (found == -1) {
                 found = root->hoisted[i].arity;        // first arity seen
             } else if (root->hoisted[i].arity != found) {
@@ -801,6 +865,10 @@ static int single_hoisted_arity(Compiler* c, const Token* name) {
         }
     }
 
+    // If we have a variadic + any fixed overload(s), treat as multiple
+    if (has_variadic && found >= 0) return -2;
+    // If only variadic, treat as multiple (needs dispatcher)
+    if (has_variadic && found == -1) return -2;
     if (multiple_different) return -2;
     return found;
 }
@@ -907,21 +975,34 @@ static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_co
     return false;
 }
 
+static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local);
+
 static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, int call_base, int line) {
     int reg = -1;
 
-    // Check for hoisted local functions
+    // 1. Check for hoisted local functions (exact arity match)
     if (is_hoisted_local(compiler, name, arg_count)) {
         ScopedString mangled = scoped_mangle(compiler, name, arg_count);
         Token mangled_token = { .start = mangled.str, .length = (int)strlen(mangled.str), .line = name->line };
         reg = resolve_local(compiler, &mangled_token);
         scoped_string_free(&mangled);
     }
+    // 1b. No exact local match, but local has variadic — needs dispatcher
+    if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
+        emit_dispatcher(compiler, name, call_base, line, true);
+        return;
+    }
 
-    // Check if it's a hoisted global function with this arity (before falling back to plain local)
+    // 2. Check if it's a hoisted global function with this arity (before falling back to plain local)
     if (reg == -1 && is_hoisted_global(compiler, name, arg_count)) {
         // Don't resolve as local; will be handled in the global section
         reg = -1;
+    }
+    // 2b. No exact global match but has variadic global — needs dispatcher
+    else if (reg == -1 && has_any_hoisted_global(compiler, name) && has_variadic_hoisted_global(compiler, name)
+             && !is_hoisted_global(compiler, name, arg_count)) {
+        emit_dispatcher(compiler, name, call_base, line, false);
+        return;
     }
     // Fall back to plain locals or a single "<base>@digits" block-local
     else if (reg == -1) {
@@ -953,9 +1034,13 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
         emit_get_upvalue(compiler, call_base, reg, line);
     } else {
         bool should_mangle = false;
+        bool needs_dispatcher = false;
 
         if (is_hoisted_global(compiler, name, arg_count)) {
             should_mangle = true;
+        } else if (has_variadic_hoisted_global(compiler, name)) {
+            // No exact arity match but variadic exists — emit dispatcher
+            needs_dispatcher = true;
         } else {
             // Check if it's a registered native function
             // Native functions are registered with mangled names (e.g., "print@1")
@@ -970,7 +1055,9 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             scoped_string_free(&mangled);
         }
 
-        if (should_mangle) {
+        if (needs_dispatcher) {
+            emit_dispatcher(compiler, name, call_base, line, false);
+        } else if (should_mangle) {
             ScopedString mangled = scoped_mangle(compiler, name, arg_count);
             ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
             pushTempRoot(compiler->vm, (Obj*)str);
@@ -1013,7 +1100,8 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
 
     // Check if this is a recursive self-call (do this BEFORE compiling the callee)
     bool is_self_call = false;
-    if (callee->type == EXPR_VARIABLE && compiler->function && compiler->function->name) {
+    if (callee->type == EXPR_VARIABLE && compiler->function && compiler->function->name
+            && !compiler->function->is_variadic) {
         Token* name = &callee->as.variable.name;
 
         // Compare the unmangled names - the function name is stored unmangled
@@ -1080,19 +1168,34 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
 static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local) {
     int overload_regs[MAX_OVERLOADS];
     int overload_count = 0;
+    int variadic_reg = -1;
+    int variadic_min_arity = 0;
 
     if (is_local) {
         // Collect local overloads
         for (int i = 0; i < compiler->local_hoisted_count && overload_count < MAX_OVERLOADS; i++) {
             if (tokens_equal(&compiler->local_hoisted[i].name, name)) {
-                // Found an overload - resolve its register
-                ScopedString mangled = scoped_mangle(compiler, name, compiler->local_hoisted[i].arity);
-                Token mtoken = { .start = mangled.str, .length = (int)strlen(mangled.str), .line = name->line };
-                int mreg = resolve_local(compiler, &mtoken);
-                scoped_string_free(&mangled);
+                if (compiler->local_hoisted[i].is_variadic) {
+                    // Variadic fallback - resolve separately
+                    // The arity stored includes the rest param, so fixed = arity - 1
+                    variadic_min_arity = compiler->local_hoisted[i].arity - 1;
+                    char* mangled = mangle_name_variadic(compiler, name, variadic_min_arity);
+                    Token mtoken = { .start = mangled, .length = (int)strlen(mangled), .line = name->line };
+                    int mreg = resolve_local(compiler, &mtoken);
+                    FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+                    if (mreg != -1) {
+                        variadic_reg = mreg;
+                    }
+                } else {
+                    // Fixed-arity overload
+                    ScopedString mangled = scoped_mangle(compiler, name, compiler->local_hoisted[i].arity);
+                    Token mtoken = { .start = mangled.str, .length = (int)strlen(mangled.str), .line = name->line };
+                    int mreg = resolve_local(compiler, &mtoken);
+                    scoped_string_free(&mangled);
 
-                if (mreg != -1) {
-                    overload_regs[overload_count++] = mreg;
+                    if (mreg != -1) {
+                        overload_regs[overload_count++] = mreg;
+                    }
                 }
             }
         }
@@ -1101,28 +1204,48 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
         Compiler* root = root_compiler(compiler);
         for (int i = 0; i < root->hoisted_count && overload_count < MAX_OVERLOADS; i++) {
             if (tokens_equal(&root->hoisted[i].name, name)) {
-                // Found an overload - load it into a temp register
-                ScopedString mangled = scoped_mangle(compiler, name, root->hoisted[i].arity);
-                ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
-                pushTempRoot(compiler->vm, (Obj*)str);
-                int k = make_constant(compiler, OBJ_VAL(str));
-                popTempRoot(compiler->vm);
-                scoped_string_free(&mangled);
+                if (root->hoisted[i].is_variadic) {
+                    // Variadic fallback
+                    variadic_min_arity = root->hoisted[i].arity - 1;
+                    char* mangled = mangle_name_variadic(compiler, name, variadic_min_arity);
+                    ObjString* str = copyString(compiler->vm, mangled, (int)strlen(mangled));
+                    pushTempRoot(compiler->vm, (Obj*)str);
+                    int k = make_constant(compiler, OBJ_VAL(str));
+                    popTempRoot(compiler->vm);
+                    FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
 
-                int temp_reg = alloc_temp(compiler);
-                emit_get_global(compiler, temp_reg, k, line);
-                overload_regs[overload_count++] = temp_reg;
+                    int temp_reg = alloc_temp(compiler);
+                    emit_get_global(compiler, temp_reg, k, line);
+                    variadic_reg = temp_reg;
+                } else {
+                    // Fixed-arity overload
+                    ScopedString mangled = scoped_mangle(compiler, name, root->hoisted[i].arity);
+                    ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
+                    pushTempRoot(compiler->vm, (Obj*)str);
+                    int k = make_constant(compiler, OBJ_VAL(str));
+                    popTempRoot(compiler->vm);
+                    scoped_string_free(&mangled);
+
+                    int temp_reg = alloc_temp(compiler);
+                    emit_get_global(compiler, temp_reg, k, line);
+                    overload_regs[overload_count++] = temp_reg;
+                }
             }
         }
     }
 
-    if (overload_count > 0) {
+    if (overload_count > 0 || variadic_reg != -1) {
         // Create the dispatcher
         emit_instruction(compiler, PACK_ABx(NEW_DISPATCHER, target_reg, 0), line);
 
-        // Add all overloads
+        // Add fixed-arity overloads
         for (int i = 0; i < overload_count; i++) {
             emit_instruction(compiler, PACK_ABC(ADD_OVERLOAD, target_reg, overload_regs[i], 0), line);
+        }
+
+        // Set variadic fallback if present
+        if (variadic_reg != -1) {
+            emit_instruction(compiler, PACK_ABC(SET_VARIADIC_FALLBACK, target_reg, variadic_reg, variadic_min_arity), line);
         }
     }
 }
@@ -1137,11 +1260,22 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
         reg = resolve_local(compiler, &mangled_token);
         FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
     }
+    // 1b. If no exact local match, check if local has variadic — needs dispatcher
+    if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
+        emit_dispatcher(compiler, name, target_reg, line, true);
+        return true;
+    }
 
     // 2. Check if it's a hoisted global function with this arity (before falling back to plain local)
     if (reg == -1 && is_hoisted_global(compiler, name, arg_count)) {
         // Don't resolve as local; will be handled in step 4
         reg = -1;
+    }
+    // 2b. No exact global match but has variadic global — needs dispatcher
+    else if (reg == -1 && has_any_hoisted_global(compiler, name) && has_variadic_hoisted_global(compiler, name)
+             && !is_hoisted_global(compiler, name, arg_count)) {
+        emit_dispatcher(compiler, name, target_reg, line, false);
+        return true;
     }
     // 3. Fall back to plain locals or a single "<base>@digits" block-local
     else if (reg == -1) {
@@ -1184,10 +1318,14 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
     } else {
         // 4. Fall back to global scope
         bool should_mangle = false;
+        bool needs_dispatcher = false;
 
         // Check if it's a hoisted global function
         if (is_hoisted_global(compiler, name, arg_count)) {
             should_mangle = true;
+        } else if (has_variadic_hoisted_global(compiler, name)) {
+            // No exact arity match but variadic exists — emit dispatcher
+            needs_dispatcher = true;
         } else {
             // Check if it's a registered native function
             // Native functions are registered with mangled names (e.g., "native_add@2")
@@ -1202,7 +1340,9 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
         }
 
-        if (should_mangle) {
+        if (needs_dispatcher) {
+            emit_dispatcher(compiler, name, target_reg, line, false);
+        } else if (should_mangle) {
             char* mangled = mangle_name(compiler, name, arg_count);
             ObjString* str = copyString(compiler->vm, mangled, (int)strlen(mangled));
             pushTempRoot(compiler->vm, (Obj*)str);
@@ -1800,8 +1940,11 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             }
 
             // Check if this is a recursive self-call BEFORE loading the callee
+            // Variadic functions cannot use CALL_SELF because the VM handler does not
+            // update frame->arg_count, which PACK_REST relies on.
             bool is_self_call = false;
-            if (callee->type == EXPR_VARIABLE && compiler->function && compiler->function->name) {
+            if (callee->type == EXPR_VARIABLE && compiler->function && compiler->function->name
+                && !compiler->function->is_variadic) {
                 Token* name = &callee->as.variable.name;
 
                 // Compare the unmangled names - the function name is stored unmangled
@@ -2834,13 +2977,20 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         }
         case STMT_FUNC_DECLARATION: {
             FuncDeclStmt* func_stmt = &stmt->as.func_declaration;
+            bool stmt_is_variadic = params_have_rest(func_stmt->params, func_stmt->param_count);
 
             // First, declare a variable for the function in the current scope.
             // This allows a function to refer to itself for recursion.
             int name_ident;
             if (compiler->scope_depth > 0) {
                 // It's a local function. Mangle the name to support local overloading.
-                char* mangled_chars = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                char* mangled_chars;
+                if (stmt_is_variadic) {
+                    int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+                    mangled_chars = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+                } else {
+                    mangled_chars = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                }
                 Token mangled_token = {
                     .start = mangled_chars,
                     .length = (int)strlen(mangled_chars),
@@ -2866,7 +3016,13 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 }
             } else {
                 // It's a global function. We just need the constant for its name.
-                char* mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                char* mangled;
+                if (stmt_is_variadic) {
+                    int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+                    mangled = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+                } else {
+                    mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                }
                 ObjString* str = copyString(compiler->vm, mangled, strlen(mangled));
                 pushTempRoot(compiler->vm, (Obj*)str);
                 name_ident = make_constant(compiler, OBJ_VAL(str));
@@ -2885,7 +3041,8 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 for (int i = 0; i < compiler->hoisted_count; i++) {
                     if (compiler->hoisted[i].name.length == func_stmt->name.length &&
                         memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0 &&
-                        compiler->hoisted[i].arity == func_stmt->param_count) {
+                        compiler->hoisted[i].is_variadic == stmt_is_variadic &&
+                        (stmt_is_variadic || compiler->hoisted[i].arity == func_stmt->param_count)) {
                         compiler->hoisted[i].upvalue_count = function->upvalue_count;
                         break;
                     }
@@ -2895,7 +3052,8 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 for (int i = 0; i < compiler->local_hoisted_count; i++) {
                     if (compiler->local_hoisted[i].name.length == func_stmt->name.length &&
                         memcmp(compiler->local_hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0 &&
-                        compiler->local_hoisted[i].arity == func_stmt->param_count) {
+                        compiler->local_hoisted[i].is_variadic == stmt_is_variadic &&
+                        (stmt_is_variadic || compiler->local_hoisted[i].arity == func_stmt->param_count)) {
                         compiler->local_hoisted[i].upvalue_count = function->upvalue_count;
                         break;
                     }
@@ -2932,7 +3090,14 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     FuncDeclStmt* func_stmt = &block->statements[i]->as.func_declaration;
 
                     // Declare the mangled name
-                    char* mangled_chars = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                    bool blk_variadic = params_have_rest(func_stmt->params, func_stmt->param_count);
+                    char* mangled_chars;
+                    if (blk_variadic) {
+                        int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+                        mangled_chars = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+                    } else {
+                        mangled_chars = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                    }
                     Token mangled_token = {
                         .start = mangled_chars,
                         .length = (int)strlen(mangled_chars),
@@ -3644,24 +3809,47 @@ static char* mangle_name(Compiler* compiler, Token* name, int arity) {
     return buffer;
 }
 
+// Creates a mangled name for variadic functions: "name@v<fixed_count>"
+static char* mangle_name_variadic(Compiler* compiler, Token* name, int fixed_count) {
+    char* buffer = ALLOCATE(compiler->vm, char, name->length + 6); // +1 for '@', +1 for 'v', +3 for digits, +1 for '\0'
+    sprintf(buffer, "%.*s@v%d", name->length, name->start, fixed_count);
+    return buffer;
+}
+
 // --- Pass 1: Declare a function's name (needed for hoisting) ---
 static void declare_function(Compiler* compiler, Stmt* stmt) {
     FuncDeclStmt* func_stmt = &stmt->as.func_declaration;
+    bool is_variadic = params_have_rest(func_stmt->params, func_stmt->param_count);
 
-    // Check if function with same name and arity already exists
+    // Check for duplicates
     for (int i = 0; i < compiler->hoisted_count; i++) {
         if (compiler->hoisted[i].name.length == func_stmt->name.length &&
-            memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0 &&
-            compiler->hoisted[i].arity == func_stmt->param_count) {
-            fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined.\n",
-                    stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
-            exit(1);
+            memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0) {
+            // Variadic: only one variadic per base name
+            if (is_variadic && compiler->hoisted[i].is_variadic) {
+                fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined.\n",
+                        stmt->line, func_stmt->name.length, func_stmt->name.start);
+                exit(1);
+            }
+            // Non-variadic: check same arity
+            if (!is_variadic && !compiler->hoisted[i].is_variadic &&
+                compiler->hoisted[i].arity == func_stmt->param_count) {
+                fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined.\n",
+                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
+                exit(1);
+            }
         }
     }
 
     // For hoisting, we only need to declare a global variable for the function.
     // We'll initialize it to null. The second pass will patch it with the real closure.
-    char* mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+    char* mangled;
+    if (is_variadic) {
+        int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+        mangled = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+    } else {
+        mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+    }
     ObjString* str = copyString(compiler->vm, mangled, strlen(mangled));
     pushTempRoot(compiler->vm, (Obj*)str);
     int name_const = make_constant(compiler, OBJ_VAL(str));
@@ -3678,6 +3866,7 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
     if (compiler->hoisted_count < MAX_HOISTED) {
         compiler->hoisted[compiler->hoisted_count].name = func_stmt->name;
         compiler->hoisted[compiler->hoisted_count].arity = func_stmt->param_count;
+        compiler->hoisted[compiler->hoisted_count].is_variadic = is_variadic;
 
         // Initialize upvalue_count to -1 (will be set when function body is compiled)
         compiler->hoisted[compiler->hoisted_count].upvalue_count = -1;
@@ -3692,21 +3881,30 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
     switch (s->type) {
         case STMT_FUNC_DECLARATION: {
                 FuncDeclStmt* fd = &s->as.func_declaration;
+                bool is_variadic = params_have_rest(fd->params, fd->param_count);
 
-                // Check if local function with same name and arity already exists
+                // Check for duplicates
                 for (int i = 0; i < c->local_hoisted_count; i++) {
                     if (c->local_hoisted[i].name.length == fd->name.length &&
-                        memcmp(c->local_hoisted[i].name.start, fd->name.start, fd->name.length) == 0 &&
-                        c->local_hoisted[i].arity == fd->param_count) {
-                        fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined in this scope.\n",
-                                s->line, fd->name.length, fd->name.start, fd->param_count);
-                        exit(1);
+                        memcmp(c->local_hoisted[i].name.start, fd->name.start, fd->name.length) == 0) {
+                        if (is_variadic && c->local_hoisted[i].is_variadic) {
+                            fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined in this scope.\n",
+                                    s->line, fd->name.length, fd->name.start);
+                            exit(1);
+                        }
+                        if (!is_variadic && !c->local_hoisted[i].is_variadic &&
+                            c->local_hoisted[i].arity == fd->param_count) {
+                            fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined in this scope.\n",
+                                    s->line, fd->name.length, fd->name.start, fd->param_count);
+                            exit(1);
+                        }
                     }
                 }
 
                 if (c->local_hoisted_count < MAX_LOCALS) {
                     c->local_hoisted[c->local_hoisted_count].name  = fd->name;
                     c->local_hoisted[c->local_hoisted_count].arity = fd->param_count;
+                    c->local_hoisted[c->local_hoisted_count].is_variadic = is_variadic;
 
                     // Initialize upvalue_count to -1 (will be set when function body is compiled)
                     c->local_hoisted[c->local_hoisted_count].upvalue_count = -1;
@@ -3908,6 +4106,9 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     // Now safe to modify the function (it's protected via compiler chain)
     function->name = copyString(fn_compiler.vm, stmt->name.start, stmt->name.length);
     function->arity = stmt->param_count;
+    bool is_variadic = params_have_rest(stmt->params, stmt->param_count);
+    function->is_variadic = is_variadic;
+    function->fixed_arity = params_fixed_count(stmt->params, stmt->param_count);
 
     if (stmt->name.length > 9 && memcmp(stmt->name.start, "__module_", 9) == 0) {
         // Case 1: We are compiling a Module Factory.
@@ -3946,6 +4147,15 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         add_local_at_reg(&fn_compiler, stmt->params[i].name, reg);
     }
 
+    // For variadic functions, emit PACK_REST to collect extra args into a list
+    // The rest param register already holds a stack slot; PACK_REST will replace it
+    // with a list containing args[fixed_count .. actual_arg_count]
+    if (is_variadic) {
+        int rest_reg = stmt->param_count; // R0=self, R1..Rn=params, last param is rest
+        int fixed_count = function->fixed_arity;
+        emit_instruction(&fn_compiler, PACK_ABC(PACK_REST, rest_reg, fixed_count, 0), stmt->name.line);
+    }
+
     // --- Multi-Pass Compilation for the function body ---
     BlockStmt* body = &stmt->body->as.block;
 
@@ -3961,7 +4171,14 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
             FuncDeclStmt* func_stmt = &body->statements[i]->as.func_declaration;
 
             // Declare the mangled name
-            char* mangled_chars = mangle_name(&fn_compiler, &func_stmt->name, func_stmt->param_count);
+            bool nested_variadic = params_have_rest(func_stmt->params, func_stmt->param_count);
+            char* mangled_chars;
+            if (nested_variadic) {
+                int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
+                mangled_chars = mangle_name_variadic(&fn_compiler, &func_stmt->name, fixed);
+            } else {
+                mangled_chars = mangle_name(&fn_compiler, &func_stmt->name, func_stmt->param_count);
+            }
             Token mangled_token = {
                 .start = mangled_chars,
                 .length = (int)strlen(mangled_chars),

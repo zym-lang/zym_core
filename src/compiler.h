@@ -42,6 +42,7 @@ typedef struct {
     Token name;
     int arity;
     int upvalue_count;
+    bool is_variadic;
 } HoistedFn;
 
 typedef struct {
