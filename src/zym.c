@@ -243,7 +243,26 @@ ZymStatus zym_defineGlobal(ZymVM* vm, const char* name, ZymValue value) {
     if (IS_OBJ(value)) pushTempRoot(vm, AS_OBJ(value));
     ObjString* nameStr = copyString(vm, name, (int)strlen(name));
     pushTempRoot(vm, (Obj*)nameStr);
-    tableSet(vm, &vm->globals, nameStr, value);
+
+    // GET_GLOBAL/SET_GLOBAL use a slot-based optimization where the
+    // globals table stores a slot index (as DOUBLE_VAL) and the actual
+    // value lives in vm->globalSlots. The direct-value path in vm.c is
+    // reserved for native functions (registered under mangled names like
+    // "print@1") and treats any direct-stored global as non-assignable.
+    // To keep user-defined globals (numbers, strings, lists, maps, ...)
+    // assignable from script, we always route them through globalSlots.
+    Value existing;
+    if (tableGet(&vm->globals, nameStr, &existing) && IS_DOUBLE(existing)) {
+        // Existing slot-based global: update in place (matches SET_GLOBAL).
+        int slot_index = (int)AS_DOUBLE(existing);
+        vm->globalSlots.values[slot_index] = value;
+    } else {
+        // New global: allocate a fresh slot and store the slot index.
+        int slot_index = vm->globalSlots.count;
+        writeValueArray(vm, &vm->globalSlots, value);
+        tableSet(vm, &vm->globals, nameStr, DOUBLE_VAL((double)slot_index));
+    }
+
     popTempRoot(vm);
     if (IS_OBJ(value)) popTempRoot(vm);
 
@@ -555,8 +574,15 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
             ObjEnumSchema* schema = NULL;
             for (int i = 0; i < vm->globals.capacity; i++) {
                 Entry* entry = &vm->globals.entries[i];
-                if (entry->key != NULL && IS_OBJ(entry->value) && IS_ENUM_SCHEMA(entry->value)) {
-                    ObjEnumSchema* candidate = AS_ENUM_SCHEMA(entry->value);
+                if (entry->key == NULL) continue;
+                Value ev = entry->value;
+                if (IS_DOUBLE(ev)) {
+                    int slot = (int)AS_DOUBLE(ev);
+                    if (slot < 0 || slot >= vm->globalSlots.count) continue;
+                    ev = vm->globalSlots.values[slot];
+                }
+                if (IS_OBJ(ev) && IS_ENUM_SCHEMA(ev)) {
+                    ObjEnumSchema* candidate = AS_ENUM_SCHEMA(ev);
                     if (candidate->type_id == type_id) { schema = candidate; break; }
                 }
             }
@@ -1024,8 +1050,15 @@ const char* zym_enumGetName(ZymVM* vm, ZymValue enumVal) {
 
     for (int i = 0; i < vm->globals.capacity; i++) {
         Entry* entry = &vm->globals.entries[i];
-        if (entry->key != NULL && IS_ENUM_SCHEMA(entry->value)) {
-            ObjEnumSchema* schema = AS_ENUM_SCHEMA(entry->value);
+        if (entry->key == NULL) continue;
+        Value v = entry->value;
+        if (IS_DOUBLE(v)) {
+            int slot = (int)AS_DOUBLE(v);
+            if (slot < 0 || slot >= vm->globalSlots.count) continue;
+            v = vm->globalSlots.values[slot];
+        }
+        if (IS_OBJ(v) && IS_ENUM_SCHEMA(v)) {
+            ObjEnumSchema* schema = AS_ENUM_SCHEMA(v);
             if (schema->type_id == type_id) {
                 return schema->name->chars;
             }
@@ -1041,8 +1074,15 @@ const char* zym_enumGetVariant(ZymVM* vm, ZymValue enumVal) {
 
     for (int i = 0; i < vm->globals.capacity; i++) {
         Entry* entry = &vm->globals.entries[i];
-        if (entry->key != NULL && IS_ENUM_SCHEMA(entry->value)) {
-            ObjEnumSchema* schema = AS_ENUM_SCHEMA(entry->value);
+        if (entry->key == NULL) continue;
+        Value v = entry->value;
+        if (IS_DOUBLE(v)) {
+            int slot = (int)AS_DOUBLE(v);
+            if (slot < 0 || slot >= vm->globalSlots.count) continue;
+            v = vm->globalSlots.values[slot];
+        }
+        if (IS_OBJ(v) && IS_ENUM_SCHEMA(v)) {
+            ObjEnumSchema* schema = AS_ENUM_SCHEMA(v);
             if (schema->type_id == type_id) {
                 if (variant >= 0 && variant < schema->variant_count) {
                     return schema->variant_names[variant]->chars;

@@ -312,8 +312,15 @@ static inline int32_t sign_extend_8(uint32_t x) {
 static const char* getEnumNameByTypeId(VM* vm, int type_id, int* out_len) {
     for (int i = 0; i < vm->globals.capacity; i++) {
         Entry* entry = &vm->globals.entries[i];
-        if (entry->key != NULL && IS_OBJ(entry->value) && IS_ENUM_SCHEMA(entry->value)) {
-            ObjEnumSchema* schema = AS_ENUM_SCHEMA(entry->value);
+        if (entry->key == NULL) continue;
+        Value v = entry->value;
+        if (IS_DOUBLE(v)) {
+            int slot = (int)AS_DOUBLE(v);
+            if (slot < 0 || slot >= vm->globalSlots.count) continue;
+            v = vm->globalSlots.values[slot];
+        }
+        if (IS_OBJ(v) && IS_ENUM_SCHEMA(v)) {
+            ObjEnumSchema* schema = AS_ENUM_SCHEMA(v);
             if (schema->type_id == type_id) {
                 *out_len = schema->name->length;
                 return schema->name->chars;
@@ -1205,8 +1212,10 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            // JavaScript behavior: convert to uint32, logical shift with 0-31 mask
-            uint32_t lhs = (uint32_t)AS_DOUBLE(vb);
+            // JavaScript behavior: convert to uint32, logical shift with 0-31 mask.
+            // Go through int32 first; direct double->uint32 saturates negatives
+            // to 0 under wasm's trunc_sat_f64_u, breaking e.g. (-1) >>> 1.
+            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)AS_DOUBLE(vc);
             // Mask shift amount to 0-31 for i32
             uint32_t result = lhs >> (rhs & 0x1F);
@@ -1492,7 +1501,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            uint32_t lhs = (uint32_t)AS_DOUBLE(va);
+            // Go through int32 first to avoid wasm trunc_sat_f64_u saturating negatives to 0.
+            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(va);
             uint32_t result = lhs >> ((int32_t)imm & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1615,7 +1625,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            uint32_t lhs = (uint32_t)AS_DOUBLE(vb);
+            // Go through int32 first to avoid wasm trunc_sat_f64_u saturating negatives to 0.
+            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(vb);
             int32_t rhs = (int32_t)literal;
             uint32_t result = lhs >> (rhs & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);

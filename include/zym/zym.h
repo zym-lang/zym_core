@@ -88,7 +88,7 @@ ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, s
 
 // Native function signature: ZymValue myFunc(ZymVM* vm, ZymValue arg1, ZymValue arg2, ...)
 // Parameters are passed directly (not as an array)
-// Signature format: "funcName(param1, ref param2, slot param3, val param4, clone param5)"
+// Signature format: "funcName(param1, param2, param3, param4, param5)"
 // Returns ZYM_STATUS_OK on success, ZYM_STATUS_COMPILE_ERROR on parse error
 ZymStatus zym_defineNative(ZymVM* vm, const char* signature, void* func_ptr);
 
