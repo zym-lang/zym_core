@@ -470,6 +470,8 @@ static Value resolveOverload(VM* vm, ObjDispatcher* dispatcher, uint16_t arg_cou
             arity = ((ObjClosure*)overload)->function->arity;
         } else if (overload->type == OBJ_NATIVE_CLOSURE) {
             arity = ((ObjNativeClosure*)overload)->arity;
+        } else if (overload->type == OBJ_NATIVE_FUNCTION) {
+            arity = ((ObjNativeFunction*)overload)->arity;
         }
 
         if (arity == arg_count) {
@@ -3288,20 +3290,19 @@ static InterpretResult run(VM* vm) {
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        if (!IS_CLOSURE(closure_val)) {
-            STORE_IP(); runtimeError(vm, "ADD_OVERLOAD requires a closure.");
+        if (!IS_CLOSURE(closure_val) && !IS_NATIVE_FUNCTION(closure_val)) {
+            STORE_IP(); runtimeError(vm, "ADD_OVERLOAD requires a closure or native function.");
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
         ObjDispatcher* dispatcher = AS_DISPATCHER(disp_val);
-        ObjClosure* closure = AS_CLOSURE(closure_val);
 
         if (dispatcher->count >= MAX_OVERLOADS) {
             STORE_IP(); runtimeError(vm, "Too many overloads (max %d).", MAX_OVERLOADS);
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        dispatcher->overloads[dispatcher->count++] = (Obj*)closure;
+        dispatcher->overloads[dispatcher->count++] = AS_OBJ(closure_val);
         DISPATCH();
     }
     OP(SET_VARIADIC_FALLBACK) {
