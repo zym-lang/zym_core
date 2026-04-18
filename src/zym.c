@@ -1145,21 +1145,20 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
 ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
     if (!vm) return ZYM_STATUS_RUNTIME_ERROR;
 
-    int frame_base = vm->stack_top;
-
-    vm->stack[frame_base] = closure;
-
+    // Mirror zym_callv's convention: the host API call frame always starts at
+    // stack slot 0. Using vm->stack_top as the base would leak upward every
+    // invocation (stack_top never shrinks), eventually exhausting the stack.
+    vm->api_stack_top = 0;
+    vm->stack[0] = closure;
     for (int i = 0; i < argc; i++) {
-        vm->stack[frame_base + 1 + i] = argv[i];
+        vm->stack[1 + i] = argv[i];
     }
-    
-    int saved_api_stack_top = vm->api_stack_top;
-    vm->api_stack_top = frame_base + argc;
+    vm->api_stack_top = argc;
 
     InterpretResult result = zym_call_execute(vm, argc);
-    
-    vm->api_stack_top = saved_api_stack_top;
-    
+    // zym_call_execute leaves the result at stack[0] and sets api_stack_top=0
+    // so zym_getCallResult can read it.
+
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
