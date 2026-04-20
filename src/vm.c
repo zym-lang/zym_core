@@ -94,6 +94,9 @@ void initVM(VM* vm) {
     vm->error_callback = NULL;
     vm->error_user_data = NULL;
 
+    sfr_init(&vm->source_files);
+    diagsink_init(&vm->diagnostics);
+
     vm->gc_enabled = true;
     // Recalculate debt: headroom = next_gc - bytes_allocated, clamped to INT32_MAX
     {
@@ -135,6 +138,9 @@ void freeVM(VM* vm) {
     vm->stack = NULL;
     vm->stack_capacity = 0;
     vm->stack_top = 0;
+
+    diagsink_free(vm, &vm->diagnostics);
+    sfr_free(vm, &vm->source_files);
 }
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value) {

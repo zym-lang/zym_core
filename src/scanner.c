@@ -4,11 +4,20 @@
 #include <stdio.h>
 #include <string.h>
 
-void initScanner(Scanner* scanner, const char* source, const LineMap* line_map) {
+void initScanner(Scanner* scanner, const char* source, const LineMap* line_map,
+                 const SourceMap* source_map, ZymFileId file_id) {
+    scanner->base = source;
+    scanner->file_id = file_id;
     scanner->start = source;
     scanner->current = source;
+    scanner->start_byte = 0;
+    scanner->start_line = 1;
+    scanner->start_column = 1;
+    scanner->current_line = 1;
+    scanner->current_column = 1;
     scanner->line = 1;
     scanner->line_map = line_map;
+    scanner->source_map = source_map;
 }
 
 bool isAlpha(char c) {
@@ -23,9 +32,21 @@ static bool isAtEnd(Scanner* scanner) {
     return *scanner->current == '\0';
 }
 
+// advance() moves the cursor by one byte and keeps line/column state in
+// sync. `\n` bumps the line and resets the column to 1. Columns are
+// counted in UTF-8 bytes (§1.4 of core_changes.md) — conversion to UTF-16
+// or UTF-32 code units is a tooling-layer concern, done on demand.
 static char advance(Scanner* scanner) {
+    char c = scanner->current[0];
     scanner->current++;
-    return scanner->current[-1];
+    if (c == '\n') {
+        scanner->current_line++;
+        scanner->current_column = 1;
+    } else {
+        scanner->current_column++;
+    }
+    scanner->line = scanner->current_line;
+    return c;
 }
 
 static char peek(Scanner* scanner) {
@@ -40,8 +61,24 @@ static char peekNext(Scanner* scanner) {
 static bool match(Scanner* scanner, char expected) {
     if (isAtEnd(scanner)) return false;
     if (*scanner->current != expected) return false;
-    scanner->current++;
+    advance(scanner);
     return true;
+}
+
+// Resolves a scanner's current_line through the LineMap (if present) to
+// the corresponding original-source line number. This preserves the
+// pre-1.1 behavior where tokens emitted from preprocessed source report
+// the user's line, not the expanded-buffer line.
+static int mappedLine(const Scanner* scanner, int scanner_line) {
+    if (scanner->line_map == NULL || scanner->line_map->count == 0) {
+        return scanner_line;
+    }
+    int map_index = scanner_line - 1;
+    if (map_index < 0) map_index = 0;
+    if (map_index >= scanner->line_map->count) {
+        map_index = scanner->line_map->count - 1;
+    }
+    return scanner->line_map->lines[map_index];
 }
 
 static Token makeToken(Scanner* scanner, TokenType type) {
@@ -50,15 +87,36 @@ static Token makeToken(Scanner* scanner, TokenType type) {
     token.start = scanner->start;
     token.length = (int)(scanner->current - scanner->start);
 
-    if (scanner->line_map != NULL && scanner->line_map->count > 0) {
-        int map_index = scanner->line - 1;
-        if (map_index < scanner->line_map->count) {
-            token.line = scanner->line_map->lines[map_index];
+    // Legacy `line` field: mapped through the LineMap so existing
+    // diagnostics continue to print the user-source line.
+    token.line = mappedLine(scanner, scanner->start_line);
+
+    // Phase 1.1 canonical span: fileId + byte offset into the preprocessed
+    // buffer the scanner walks.
+    token.fileId = scanner->file_id;
+    token.startByte = scanner->start_byte;
+    token.startLine = scanner->start_line;
+    token.startColumn = scanner->start_column;
+    token.endLine = scanner->current_line;
+    token.endColumn = scanner->current_column;
+
+    // Phase 1.2: resolve origin via SourceMap if present; otherwise
+    // fall back to reporting the scanned file as the origin.
+    if (scanner->source_map != NULL) {
+        const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, scanner->start_byte);
+        if (seg != NULL) {
+            token.originFileId = seg->originFileId;
+            token.originStartByte = seg->originStartByte;
+            token.originLength = seg->originLength;
         } else {
-            token.line = scanner->line_map->lines[scanner->line_map->count - 1];
+            token.originFileId = scanner->file_id;
+            token.originStartByte = scanner->start_byte;
+            token.originLength = token.length;
         }
     } else {
-        token.line = scanner->line;
+        token.originFileId = scanner->file_id;
+        token.originStartByte = scanner->start_byte;
+        token.originLength = token.length;
     }
     return token;
 }
@@ -69,15 +127,32 @@ static Token errorToken(Scanner* scanner, const char* message) {
     token.start = message;
     token.length = (int)strlen(message);
 
-    if (scanner->line_map != NULL && scanner->line_map->count > 0) {
-        int map_index = scanner->line - 1;
-        if (map_index < scanner->line_map->count) {
-            token.line = scanner->line_map->lines[map_index];
+    token.line = mappedLine(scanner, scanner->current_line);
+
+    // Error tokens don't correspond to a contiguous byte range in the
+    // source; we report the current scan position as a zero-length span.
+    token.fileId = scanner->file_id;
+    token.startByte = (int)(scanner->current - scanner->base);
+    token.startLine = scanner->current_line;
+    token.startColumn = scanner->current_column;
+    token.endLine = scanner->current_line;
+    token.endColumn = scanner->current_column;
+
+    if (scanner->source_map != NULL) {
+        const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, token.startByte);
+        if (seg != NULL) {
+            token.originFileId = seg->originFileId;
+            token.originStartByte = seg->originStartByte;
+            token.originLength = 0;
         } else {
-            token.line = scanner->line_map->lines[scanner->line_map->count - 1];
+            token.originFileId = scanner->file_id;
+            token.originStartByte = token.startByte;
+            token.originLength = 0;
         }
     } else {
-        token.line = scanner->line;
+        token.originFileId = scanner->file_id;
+        token.originStartByte = token.startByte;
+        token.originLength = 0;
     }
     return token;
 }
@@ -89,10 +164,7 @@ static void skipWhitespace(Scanner* scanner) {
             case ' ':
             case '\r':
             case '\t':
-                advance(scanner);
-                break;
             case '\n':
-                scanner->line++;
                 advance(scanner);
                 break;
             case '/':
@@ -103,7 +175,6 @@ static void skipWhitespace(Scanner* scanner) {
                     advance(scanner);
                     while (!(peek(scanner) == '*' && peekNext(scanner) == '/')) {
                         if (isAtEnd(scanner)) return;
-                        if (peek(scanner) == '\n') scanner->line++;
                         advance(scanner);
                     }
                     advance(scanner);
@@ -229,9 +300,9 @@ static Token number(Scanner* scanner) {
 
 static Token string(Scanner* scanner) {
     while (peek(scanner) != '"' && !isAtEnd(scanner)) {
-        if (peek(scanner) == '\n') scanner->line++;
         if (peek(scanner) == '\\') {
             advance(scanner);
+            if (isAtEnd(scanner)) break;
         }
         advance(scanner);
     }
@@ -246,6 +317,9 @@ static Token string(Scanner* scanner) {
 Token scanToken(Scanner* scanner) {
     skipWhitespace(scanner);
     scanner->start = scanner->current;
+    scanner->start_byte = (int)(scanner->current - scanner->base);
+    scanner->start_line = scanner->current_line;
+    scanner->start_column = scanner->current_column;
 
     if (isAtEnd(scanner)) return makeToken(scanner, TOKEN_EOF);
 

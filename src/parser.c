@@ -7,6 +7,7 @@
 #include "./memory.h"
 #include "./vm.h"
 #include "./utils.h"
+#include "./diagnostics.h"
 
 typedef struct {
     VM* vm;
@@ -142,62 +143,49 @@ static void error_at_current(Parser* parser, const char* message) {
 
     int line = parser->current.line;
 
-    if (parser->vm->error_callback) {
-        char buf[1280];
-        int pos = 0;
+    // Build the fully formatted message: "[file] line N at 'tok': <msg>"
+    // pushDiagnostic() duplicates the buffer into its own storage and fires
+    // the legacy ErrorCallback for ERROR severity, so embedders that only
+    // listened on the callback continue to work unchanged.
+    char buf[1280];
+    int pos = 0;
 
-        if (parser->current_module_name) {
-            char* decoded = decodeModulePath(&parser->vm->allocator, parser->current_module_name, parser->module_name_length);
-            pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
-            ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
-        } else {
-            pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
-        }
-
-        if (parser->current.type == TOKEN_EOF) {
-            pos += snprintf(buf + pos, sizeof(buf) - pos, " at end");
-        } else if (parser->current.type != TOKEN_ERROR) {
-            if (parser->current.start != NULL && parser->current.length > 0) {
-                const int MAX_TOKEN_DISPLAY = 40;
-                if (parser->current.length <= MAX_TOKEN_DISPLAY) {
-                    pos += snprintf(buf + pos, sizeof(buf) - pos, " at '%.*s'", parser->current.length, parser->current.start);
-                } else {
-                    pos += snprintf(buf + pos, sizeof(buf) - pos, " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
-                }
-            }
-        }
-
-        pos += snprintf(buf + pos, sizeof(buf) - pos, ": %s", message);
-
-        const char* file = NULL;
-        if (parser->current_module_name) {
-            file = parser->current_module_name;
-        }
-        parser->vm->error_callback(parser->vm, ZYM_STATUS_COMPILE_ERROR, file, line, buf, parser->vm->error_user_data);
+    if (parser->current_module_name) {
+        char* decoded = decodeModulePath(&parser->vm->allocator,
+                                         parser->current_module_name,
+                                         parser->module_name_length);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
+        ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
     } else {
-        if (parser->current_module_name) {
-            char* decoded = decodeModulePath(&parser->vm->allocator, parser->current_module_name, parser->module_name_length);
-            fprintf(stderr, "[%s] line %d", decoded, line);
-            ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
-        } else {
-            fprintf(stderr, "[line %d]", line);
-        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
+    }
 
-        if (parser->current.type == TOKEN_EOF) {
-            fprintf(stderr, " at end");
-        } else if (parser->current.type != TOKEN_ERROR) {
-            if (parser->current.start != NULL && parser->current.length > 0) {
-                const int MAX_TOKEN_DISPLAY = 40;
-                if (parser->current.length <= MAX_TOKEN_DISPLAY) {
-                    fprintf(stderr, " at '%.*s'", parser->current.length, parser->current.start);
-                } else {
-                    fprintf(stderr, " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
-                }
+    if (parser->current.type == TOKEN_EOF) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " at end");
+    } else if (parser->current.type != TOKEN_ERROR) {
+        if (parser->current.start != NULL && parser->current.length > 0) {
+            const int MAX_TOKEN_DISPLAY = 40;
+            if (parser->current.length <= MAX_TOKEN_DISPLAY) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                " at '%.*s'", parser->current.length, parser->current.start);
+            } else {
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
             }
         }
-
-        fprintf(stderr, ": %s\n", message);
     }
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos, ": %s", message);
+    (void)pos;
+
+    pushDiagnostic(parser->vm,
+                   ZYM_DIAG_ERROR,
+                   parser->current.fileId,
+                   parser->current.startByte,
+                   parser->current.length,
+                   line,
+                   parser->current.startColumn,
+                   "%s", buf);
 }
 
 static void consume(Parser* parser, TokenType type, const char* message) {
@@ -1294,10 +1282,12 @@ static Stmt* parse_return_statement(Parser* parser) {
     consume_end_of_statement(parser, "Expect ';' after return value.");
     return new_return_stmt(parser->vm, keyword, value);
 }
-AstResult parse(VM* vm, const char* source, const LineMap* line_map, const char* entry_file) {
+AstResult parse(VM* vm, const char* source, const LineMap* line_map,
+                const SourceMap* source_map, const char* entry_file,
+                ZymFileId file_id) {
     Parser parser;
     parser.vm = vm;
-    initScanner(&parser.scanner, source, line_map);
+    initScanner(&parser.scanner, source, line_map, source_map, file_id);
     parser.had_error = false;
     parser.panic_mode = false;
 
@@ -1326,11 +1316,9 @@ AstResult parse(VM* vm, const char* source, const LineMap* line_map, const char*
     }
 
     if (parser.had_error) {
-        if (vm->error_callback) {
-            vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, NULL, -1, "Compilation aborted due to parse errors.", vm->error_user_data);
-        } else {
-            fprintf(stderr, "\nCompilation aborted due to parse errors.\n");
-        }
+        // Per-error diagnostics have already been pushed via pushDiagnostic();
+        // the embedder (CLI, LSP, …) is responsible for rendering the list
+        // and any "compilation aborted" banner.
         for (int i = 0; i < count; i++) free_stmt(vm, statements[i]);
         FREE_ARRAY(vm, Stmt*, statements, capacity);
         return (AstResult){ .statements = NULL, .capacity = 0 };

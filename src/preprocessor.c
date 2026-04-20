@@ -1158,7 +1158,69 @@ static void handle_directive(Preprocessor* pp, const char* after_hash, OutputBuf
 // ===========================================================
 // Public API
 // ===========================================================
+
+// Phase 1.2 helper: builds a table mapping 1-based origin line number
+// -> byte offset of that line's start in `origin_source`. Line N+1 is
+// at table[N]; the final entry points at the NUL terminator so the
+// length of the last line is still derivable. Returns count via out.
+static int* build_origin_line_offsets(VM* vm, const char* origin_source, int* out_count) {
+    int cap = 64;
+    int count = 0;
+    int* offsets = (int*)reallocate(vm, NULL, 0, sizeof(int) * cap);
+    // Line 1 starts at byte 0.
+    offsets[count++] = 0;
+    for (int i = 0; origin_source[i] != '\0'; i++) {
+        if (origin_source[i] == '\n') {
+            if (count + 1 > cap) {
+                int old_cap = cap;
+                cap *= 2;
+                offsets = (int*)reallocate(vm, offsets, sizeof(int) * old_cap, sizeof(int) * cap);
+            }
+            offsets[count++] = i + 1;
+        }
+    }
+    // Sentinel: offset of the NUL terminator, so line-length of the
+    // final line is offsets[line] - offsets[line-1] for any valid line.
+    {
+        int nul_off = 0;
+        while (origin_source[nul_off] != '\0') nul_off++;
+        if (count + 1 > cap) {
+            int old_cap = cap;
+            cap *= 2;
+            offsets = (int*)reallocate(vm, offsets, sizeof(int) * old_cap, sizeof(int) * cap);
+        }
+        offsets[count++] = nul_off;
+    }
+    *out_count = count;
+    return offsets;
+}
+
+static void record_origin_line(VM* vm, SourceMap* source_map, ZymFileId origin_file_id,
+                               const int* origin_line_offsets, int origin_line_count,
+                               int expanded_byte_start, int expanded_byte_length,
+                               int origin_line /* 1-based */) {
+    if (source_map == NULL || origin_file_id == ZYM_FILE_ID_INVALID) return;
+    if (origin_line < 1) origin_line = 1;
+    // Clamp to the last real line if the preprocessor reports a line past
+    // the end (can happen for synthetic content at EOF).
+    int max_line = origin_line_count - 1; // index of sentinel is count-1
+    if (origin_line > max_line) origin_line = max_line > 0 ? max_line : 1;
+    int origin_start = origin_line_offsets[origin_line - 1];
+    int origin_end = origin_line_offsets[origin_line]; // includes the '\n'
+    int origin_length = origin_end - origin_start;
+    appendSourceMapSegment(vm, source_map,
+                           expanded_byte_start, expanded_byte_length,
+                           origin_file_id,
+                           origin_start, origin_length,
+                           origin_line);
+}
+
 char* preprocess(VM* vm, const char* source, LineMap* line_map) {
+    return preprocessEx(vm, source, line_map, NULL, ZYM_FILE_ID_INVALID);
+}
+
+char* preprocessEx(VM* vm, const char* source, LineMap* line_map,
+                   SourceMap* source_map, ZymFileId origin_file_id) {
     if (!source) return NULL;
 
     Preprocessor pp;
@@ -1176,6 +1238,17 @@ char* preprocess(VM* vm, const char* source, LineMap* line_map) {
 
     OutputBuffer out;
     initOutputBuffer(&out);
+
+    // Phase 1.2: precompute line -> byte-offset table for the *original*
+    // (pre-strip) source so origin byte ranges match what the user sees
+    // in their editor. `strip_comments_preserve_newlines` preserves line
+    // count, so origin line numbers line up between `source` and
+    // `stripped`.
+    int* origin_line_offsets = NULL;
+    int origin_line_count = 0;
+    if (source_map != NULL && origin_file_id != ZYM_FILE_ID_INVALID) {
+        origin_line_offsets = build_origin_line_offsets(pp.vm, source, &origin_line_count);
+    }
 
     for (;;) {
         int current_original_line = pp.line;
@@ -1195,19 +1268,37 @@ char* preprocess(VM* vm, const char* source, LineMap* line_map) {
             int buffer_pos_before = out.count;
             expand_and_append(&pp, line, &out);
 
+            int segment_start = buffer_pos_before;
             for (int i = buffer_pos_before; i < out.count; i++) {
                 if (out.buffer[i] == '\n') {
                     addLineMapping(pp.vm, line_map, current_original_line);
+                    record_origin_line(pp.vm, source_map, origin_file_id,
+                                       origin_line_offsets, origin_line_count,
+                                       segment_start, (i + 1) - segment_start,
+                                       current_original_line);
+                    segment_start = i + 1;
                 }
             }
 
             if (out.count > buffer_pos_before && out.buffer[out.count - 1] != '\n') {
+                int synth_nl_start = out.count;
                 appendToOutputBuffer(pp.vm, &out, "\n", 1);
                 addLineMapping(pp.vm, line_map, current_original_line);
+                record_origin_line(pp.vm, source_map, origin_file_id,
+                                   origin_line_offsets, origin_line_count,
+                                   segment_start, (synth_nl_start + 1) - segment_start,
+                                   current_original_line);
             }
         }
 
         xfree_any(pp.vm, line);
+    }
+
+    if (origin_line_offsets != NULL) {
+        // size of last-known capacity is unknown here; pass 0 for the
+        // old size and rely on reallocate(p, 0, 0) to free — matches the
+        // xfree_any contract used elsewhere in this TU.
+        xfree_any(pp.vm, origin_line_offsets);
     }
 
     if (pp.had_error) {
@@ -1217,6 +1308,9 @@ char* preprocess(VM* vm, const char* source, LineMap* line_map) {
         if (pp.active) FREE_ARRAY(vm, char*, pp.active, pp.active_cap);
         freeOutputBuffer(pp.vm, &out);
         xfree_any(pp.vm, stripped);
+        if (source_map != NULL) {
+            freeSourceMap(pp.vm, source_map);
+        }
         return NULL;
     }
 

@@ -16,10 +16,16 @@
 // CORE TYPES
 // =============================================================================
 
+#ifndef ZYM_VM_FWD_DECLARED
+#define ZYM_VM_FWD_DECLARED
 typedef struct VM ZymVM;
+#endif
 typedef struct Chunk ZymChunk;
 typedef struct LineMap ZymLineMap;
 typedef uint64_t ZymValue;
+
+#include "zym/sourcemap.h"
+#include "zym/diagnostics.h"
 
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
 #define ZYM_ERROR ((ZymValue)0x7ff8000000000005ULL)
@@ -75,6 +81,17 @@ void zym_freeLineMap(ZymVM* vm, ZymLineMap* map);
 ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource);
 void zym_freeProcessedSource(ZymVM* vm, const char* processedSource);
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config);
+
+// Phase 1.2 overloads: same as the legacy calls but also thread a
+// SourceMap + origin ZymFileId so the scanner can populate each token's
+// origin{FileId,StartByte,Length} fields. Passing map == NULL or
+// origin_file_id == ZYM_FILE_ID_INVALID is equivalent to the legacy call.
+ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
+                           ZymSourceMap* source_map, ZymFileId origin_file_id,
+                           const char** processedSource);
+ZymStatus zym_compileEx(ZymVM* vm, const char* source, ZymChunk* chunk,
+                        ZymLineMap* line_map, const ZymSourceMap* source_map,
+                        const char* entry_file, ZymCompilerConfig config);
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);

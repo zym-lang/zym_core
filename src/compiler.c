@@ -12,6 +12,7 @@
 #include "./utils.h"
 #include "gc.h"
 #include "./native.h"
+#include "./diagnostics.h"
 
 #define OPCODE(i) ((i) & 0xFF)
 
@@ -132,49 +133,53 @@ static void emit_closure(Compiler* c, int reg, int const_idx, int line) {
 static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
     compiler->has_error = true;
 
+    // Format the user message, then prepend the "[file] line N: " location
+    // prefix that embedders have historically seen. pushDiagnostic() owns the
+    // resulting string and also fires the legacy ErrorCallback for back-compat.
+    char msg_buf[1024];
     va_list args;
     va_start(args, format);
+    vsnprintf(msg_buf, sizeof(msg_buf), format, args);
+    va_end(args);
 
-    if (compiler->vm->error_callback) {
-        char msg_buf[1024];
-        vsnprintf(msg_buf, sizeof(msg_buf), format, args);
-
-        const char* file = NULL;
-        if (compiler->current_module_name) {
-            file = compiler->current_module_name->chars;
-        }
-
-        char full_buf[1280];
-        if (file) {
-            snprintf(full_buf, sizeof(full_buf), "[%s] line %d: %s", file, line, msg_buf);
-        } else {
-            snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
-        }
-
-        compiler->vm->error_callback(compiler->vm, ZYM_STATUS_COMPILE_ERROR, file, line, full_buf, compiler->vm->error_user_data);
+    char full_buf[1280];
+    if (compiler->current_module_name) {
+        snprintf(full_buf, sizeof(full_buf), "[%.*s] line %d: %s",
+                 compiler->current_module_name->length,
+                 compiler->current_module_name->chars,
+                 line, msg_buf);
     } else {
-        if (compiler->current_module_name) {
-            fprintf(stderr, "[%.*s] line %d: ",
-                    compiler->current_module_name->length,
-                    compiler->current_module_name->chars,
-                    line);
-        } else {
-            fprintf(stderr, "[line %d]: ", line);
-        }
-        vfprintf(stderr, format, args);
-        fprintf(stderr, "\n");
+        snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
     }
 
-    va_end(args);
+    pushDiagnostic(compiler->vm,
+                   ZYM_DIAG_ERROR,
+                   ZYM_FILE_ID_INVALID, -1, 0,
+                   line, -1,
+                   "%s", full_buf);
 }
 
-static void compiler_error_and_exit(int line, const char* format, ...) {
-    fprintf(stderr, "Error at line %d: ", line);
+// Records a fatal compiler error through the structured diagnostics sink, then
+// aborts the process. The exit contract is preserved for now — Phase 1.4's
+// error-recovery work replaces the remaining abort paths with proper panic
+// recovery. Routes through pushDiagnostic so no stderr write leaks from the
+// core.
+static void compiler_error_and_exit(Compiler* compiler, int line,
+                                    const char* format, ...) {
+    char msg_buf[1024];
     va_list args;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    vsnprintf(msg_buf, sizeof(msg_buf), format, args);
     va_end(args);
-    fprintf(stderr, "\n");
+
+    if (compiler) {
+        compiler->has_error = true;
+        pushDiagnostic(compiler->vm,
+                       ZYM_DIAG_ERROR,
+                       ZYM_FILE_ID_INVALID, -1, 0,
+                       line, -1,
+                       "Error at line %d: %s", line, msg_buf);
+    }
     exit(1);
 }
 
@@ -1461,7 +1466,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
     // Defensive check: if expr is NULL, report error and emit null constant
     if (expr == NULL) {
         compiler->has_error = true;
-        fprintf(stderr, "Internal compiler error: NULL expression encountered\n");
+        pushDiagnostic(compiler->vm, ZYM_DIAG_ERROR,
+                       ZYM_FILE_ID_INVALID, -1, 0, -1, -1,
+                       "Internal compiler error: NULL expression encountered");
         // Emit a null constant as a safe fallback
         Value null_val = NULL_VAL;
         int const_idx = make_constant(compiler, null_val);
@@ -2595,7 +2602,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error_and_exit(compiler, expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2661,7 +2668,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error_and_exit(compiler, expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2728,7 +2735,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error_and_exit(compiler, expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2797,7 +2804,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error_and_exit(compiler, expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2913,7 +2920,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
     // Defensive check: if stmt is NULL, report error and return
     if (stmt == NULL) {
         compiler->has_error = true;
-        fprintf(stderr, "Internal compiler error: NULL statement encountered\n");
+        pushDiagnostic(compiler->vm, ZYM_DIAG_ERROR,
+                       ZYM_FILE_ID_INVALID, -1, 0, -1, -1,
+                       "Internal compiler error: NULL statement encountered");
         return false;
     }
 
@@ -3926,16 +3935,16 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
             memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0) {
             // Variadic: only one variadic per base name
             if (is_variadic && compiler->hoisted[i].is_variadic) {
-                fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start);
-                exit(1);
+                compiler_error_and_exit(compiler, stmt->line,
+                    "Variadic function '%.*s' is already defined.",
+                    func_stmt->name.length, func_stmt->name.start);
             }
             // Non-variadic: check same arity
             if (!is_variadic && !compiler->hoisted[i].is_variadic &&
                 compiler->hoisted[i].arity == func_stmt->param_count) {
-                fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
-                exit(1);
+                compiler_error_and_exit(compiler, stmt->line,
+                    "Function '%.*s' with %d parameter(s) is already defined.",
+                    func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
             }
         }
     }
@@ -3954,16 +3963,17 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
         Value existing;
         if (tableGet(&compiler->vm->globals, check_str, &existing) &&
             (IS_NATIVE_FUNCTION(existing) || IS_NATIVE_CLOSURE(existing))) {
-            if (is_variadic) {
-                fprintf(stderr, "Error at line %d: Cannot redefine native variadic function '%.*s'.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start);
-            } else {
-                fprintf(stderr, "Error at line %d: Cannot redefine native function '%.*s' with %d parameter(s).\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
-            }
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
-            exit(1);
+            if (is_variadic) {
+                compiler_error_and_exit(compiler, stmt->line,
+                    "Cannot redefine native variadic function '%.*s'.",
+                    func_stmt->name.length, func_stmt->name.start);
+            } else {
+                compiler_error_and_exit(compiler, stmt->line,
+                    "Cannot redefine native function '%.*s' with %d parameter(s).",
+                    func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
+            }
         }
         popTempRoot(compiler->vm);
         FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
@@ -4016,15 +4026,15 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
                     if (c->local_hoisted[i].name.length == fd->name.length &&
                         memcmp(c->local_hoisted[i].name.start, fd->name.start, fd->name.length) == 0) {
                         if (is_variadic && c->local_hoisted[i].is_variadic) {
-                            fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined in this scope.\n",
-                                    s->line, fd->name.length, fd->name.start);
-                            exit(1);
+                            compiler_error_and_exit(c, s->line,
+                                "Variadic function '%.*s' is already defined in this scope.",
+                                fd->name.length, fd->name.start);
                         }
                         if (!is_variadic && !c->local_hoisted[i].is_variadic &&
                             c->local_hoisted[i].arity == fd->param_count) {
-                            fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined in this scope.\n",
-                                    s->line, fd->name.length, fd->name.start, fd->param_count);
-                            exit(1);
+                            compiler_error_and_exit(c, s->line,
+                                "Function '%.*s' with %d parameter(s) is already defined in this scope.",
+                                fd->name.length, fd->name.start, fd->param_count);
                         }
                     }
                 }
@@ -4475,7 +4485,23 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 }
 
 bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, const char* entry_file, CompilerConfig config) {
-    AstResult ast = parse(vm, source, line_map, entry_file);
+    return compileEx(vm, source, chunk, line_map, NULL, entry_file, config);
+}
+
+bool compileEx(VM* vm, const char* source, Chunk* chunk,
+               const LineMap* line_map, const SourceMap* source_map,
+               const char* entry_file, CompilerConfig config) {
+    // Phase 1.1: register the preprocessed source buffer with the VM's
+    // SourceFileRegistry so scanner tokens can refer back to it by
+    // ZymFileId. The registry is reset before this compile starts so each
+    // top-level compile gets a fresh file-id namespace (a later PR may
+    // keep the registry across compiles for module graphs; 1.1 scope is
+    // single-file).
+    sfr_reset(&vm->source_files);
+    size_t source_length = source != NULL ? strlen(source) : 0;
+    ZymFileId file_id = sfr_register(vm, &vm->source_files, entry_file, source, source_length);
+
+    AstResult ast = parse(vm, source, line_map, source_map, entry_file, file_id);
     if (ast.statements == NULL) return false;
 
     // Use init_compiler to set up the top-level compiler correctly.
@@ -4608,17 +4634,11 @@ cleanup_on_error:
         FREE_ARRAY(vm, PendingGoto, compiler.pending_gotos, compiler.pending_goto_capacity);
     }
 
-    // Check if any errors occurred during compilation
+    // Check if any errors occurred during compilation.
+    // Per-error diagnostics have already been pushed via pushDiagnostic();
+    // the embedder (CLI, LSP, …) is responsible for rendering the list and
+    // any "compilation failed" banner.
     bool success = !compiler.has_error;
-
-    // Report compilation status
-    if (!success) {
-        if (vm->error_callback) {
-            vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, NULL, -1, "Compilation failed with errors.", vm->error_user_data);
-        } else {
-            fprintf(stderr, "\nCompilation failed with errors.\n");
-        }
-    }
 
     // NOTE: compiler.function is managed by the GC (it's in vm->objects list)
     // We don't manually free it here - the GC will handle cleanup

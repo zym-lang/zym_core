@@ -10,6 +10,8 @@
 #ifndef ZYM_RUNTIME_ONLY
 #include "./preprocessor.h"
 #include "./compiler.h"
+#include "./sourcemap.h"
+#include "./source_file.h"
 #endif
 #include "./serializer.h"
 #include "./value.h"
@@ -20,6 +22,7 @@
 #include "./memory.h"
 
 #include "zym/zym.h"
+#include "zym/diagnostics.h"
 
 // =============================================================================
 // VM LIFECYCLE
@@ -58,6 +61,26 @@ void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data)
     if (vm == NULL) return;
     vm->error_callback = callback;
     vm->error_user_data = user_data;
+}
+
+// =============================================================================
+// STRUCTURED DIAGNOSTICS (Phase 1.3)
+// =============================================================================
+
+const ZymDiagnostic* zymGetDiagnostics(ZymVM* vm, size_t* count)
+{
+    if (vm == NULL) {
+        if (count) *count = 0;
+        return NULL;
+    }
+    if (count) *count = vm->diagnostics.count;
+    return vm->diagnostics.count == 0 ? NULL : vm->diagnostics.items;
+}
+
+void zymClearDiagnostics(ZymVM* vm)
+{
+    if (vm == NULL) return;
+    diagsink_clear(vm, &vm->diagnostics);
 }
 
 // =============================================================================
@@ -131,6 +154,70 @@ ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap
     bool success = compile(vm, source, chunk, map, entry_file, config);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
+
+// ---- Phase 1.1 / 1.2: SourceFile registry + SourceMap public API ----
+
+ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
+                                 const char* bytes, size_t length)
+{
+    if (vm == NULL) return ZYM_FILE_ID_INVALID;
+    return sfr_register(vm, &vm->source_files, path, bytes, length);
+}
+
+ZymSourceMap* zym_newSourceMap(ZymVM* vm)
+{
+    if (vm == NULL) return NULL;
+    ZymSourceMap* map = (ZymSourceMap*)ZYM_ALLOC(&vm->allocator, sizeof(ZymSourceMap));
+    if (map == NULL) return NULL;
+    initSourceMap(map);
+    return map;
+}
+
+void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map)
+{
+    if (vm == NULL || map == NULL) return;
+    freeSourceMap(vm, map);
+    ZYM_FREE(&vm->allocator, map, sizeof(ZymSourceMap));
+}
+
+ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
+                           ZymSourceMap* source_map, ZymFileId origin_file_id,
+                           const char** processedSource)
+{
+    if (source == NULL || line_map == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
+
+    char* processed = preprocessEx(vm, source, line_map, source_map, origin_file_id);
+    if (processed == NULL) {
+        *processedSource = NULL;
+        return ZYM_STATUS_COMPILE_ERROR;
+    }
+
+    *processedSource = processed;
+    return ZYM_STATUS_OK;
+}
+
+ZymStatus zym_compileEx(ZymVM* vm, const char* source, ZymChunk* chunk,
+                        ZymLineMap* line_map, const ZymSourceMap* source_map,
+                        const char* entry_file, ZymCompilerConfig config)
+{
+    if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    bool success = compileEx(vm, source, chunk, line_map, source_map, entry_file, config);
+    return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
+}
+
+#else
+
+// ZYM_RUNTIME_ONLY stubs — registry/sourcemap are compile-surface only.
+ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
+                                 const char* bytes, size_t length)
+{
+    (void)vm; (void)path; (void)bytes; (void)length;
+    return ZYM_FILE_ID_INVALID;
+}
+
+ZymSourceMap* zym_newSourceMap(ZymVM* vm) { (void)vm; return NULL; }
+void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map) { (void)vm; (void)map; }
+
 #endif
 
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)

@@ -10,8 +10,17 @@ set(CMAKE_C_STANDARD 11)
 
 option(ZYM_RUNTIME_ONLY "Build runtime-only (no compiler)" OFF)
 
+# --- Feature flags (LSP-facing surface gating) -----------------------------
+# Declares ZYM_ENABLE_* options and ZYM_HAS_* compile definitions. See
+# compile-time feature flags for the LSP surface.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/Features.cmake)
+zym_core_declare_features()
+zym_core_configure_feature_header(ZYM_CORE_GENERATED_INCLUDE_DIR)
+
 # --- Runtime sources (always built) ---
 set(ZYM_CORE_SOURCES
+    src/_config_assert.c
+    src/_config_report.c
     src/value.c
     src/chunk.c
     src/vm.c
@@ -24,6 +33,9 @@ set(ZYM_CORE_SOURCES
     src/gc.c
     src/native.c
     src/utf8.c
+    src/source_file.c
+    src/diagnostics.c
+    src/sourcemap.c
     src/modules/core_modules.c
     src/modules/continuation.c
     src/modules/preemption.c
@@ -61,10 +73,15 @@ add_library(zym_core STATIC ${ZYM_CORE_SOURCES})
 target_include_directories(zym_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${ZYM_CORE_GENERATED_INCLUDE_DIR}>
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# Publish ZYM_HAS_* compile definitions on the PUBLIC surface so every TU
+# and every embedder sees identical values.
+zym_core_apply_features(zym_core)
 
 if(ZYM_RUNTIME_ONLY)
     target_compile_definitions(zym_core PUBLIC ZYM_RUNTIME_ONLY)

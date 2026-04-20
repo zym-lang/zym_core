@@ -3,6 +3,7 @@
 #include "./parser.h"
 #include "./chunk.h"
 #include "./linemap.h"
+#include "./sourcemap.h"
 #include "./config.h"
 
 typedef struct VM VM;
@@ -160,3 +161,11 @@ typedef struct Compiler {
 } Compiler;
 
 bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, const char* entry_file, CompilerConfig config);
+
+// Phase 1.2 overload: same as `compile()` but additionally consumes a
+// SourceMap produced by `preprocessEx()`. When non-NULL, each scanner
+// token's origin{FileId,StartByte,Length} is resolved through the map.
+// `compile()` is a thin shim that calls this with `source_map == NULL`.
+bool compileEx(VM* vm, const char* source, Chunk* chunk,
+               const LineMap* line_map, const SourceMap* source_map,
+               const char* entry_file, CompilerConfig config);

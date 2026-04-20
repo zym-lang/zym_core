@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include "./config.h"
 #include "./allocator.h"
+#include "./source_file.h"
+#include "./diagnostics.h"
 
 /*
  * VM Configuration Limits
@@ -138,6 +140,15 @@ typedef struct VM {
     // Error callback (NULL = default fprintf to stderr)
     ErrorCallback error_callback;
     void* error_user_data;
+
+    // Phase 1.1: per-VM registry of source files whose bytes scanner tokens
+    // (and future diagnostics / parse tree / symbol table) reference by id.
+    SourceFileRegistry source_files;
+
+    // Phase 1.3: structured diagnostics sink. Populated by the frontend
+    // (parser/compiler/…) via pushDiagnostic(); drained by embedders via
+    // zymGetDiagnostics() / zymClearDiagnostics().
+    DiagnosticSink diagnostics;
 } VM;
 
 typedef enum {

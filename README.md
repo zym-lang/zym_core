@@ -116,6 +116,21 @@ Include with `#include "zym/zym.h"`, configuration is minimal.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ZYM_RUNTIME_ONLY` | `OFF` | Omit the compiler for a smaller runtime-only build |
+| `ZYM_ENABLE_LSP_SURFACE` | `ON` | Umbrella flag: parse-tree retention + symbol table + native metadata + diagnostic codes. Turn off for minimum-footprint embeds. |
+| `ZYM_ENABLE_PARSE_TREE_RETENTION` | follows umbrella | Retain the AST past codegen so embedders can query it. Required by the symbol table. |
+| `ZYM_ENABLE_SYMBOL_TABLE` | follows umbrella | Run the resolver and expose the symbol-table query API. Implies `ZYM_ENABLE_PARSE_TREE_RETENTION`. |
+| `ZYM_ENABLE_NATIVE_METADATA` | follows umbrella | Store the extended `ZymNativeInfo` fields (`summary`, `docs`, `params`, `since`, `deprecated`). Off strips these strings from rodata. |
+| `ZYM_ENABLE_DIAGNOSTIC_CODES` | follows umbrella | Ship the stable diagnostic-code table and the `code`/`hint` fields on `ZymDiagnostic`. Off keeps severity/message/range only. |
+
+Flags are build-time, not runtime. Turning a flag off removes tooling surface, not language behavior — a script that runs with `ZYM_ENABLE_LSP_SURFACE=ON` runs identically with it off.
+
+Example for a minimum-footprint MCU build:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DZYM_ENABLE_LSP_SURFACE=OFF
+cmake --build build
+```
 
 ## Embedding
 
