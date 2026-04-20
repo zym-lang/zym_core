@@ -103,6 +103,56 @@ ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
                       const char* entry_file, ZymCompilerConfig config,
                       ZymParseTree** out_tree);
 
+#if ZYM_HAS_PARSE_TREE_RETENTION
+// Phase 3 — parse-only entry point (ZYM_COMPILE_PARSE_ONLY).
+//
+// Run scan + preprocess + parse only. No bytecode is produced, no Chunk
+// is touched. On success, `*out_tree` receives a non-NULL ZymParseTree*
+// that the caller owns (release via `zym_freeParseTree`); on parse
+// failure, returns ZYM_STATUS_COMPILE_ERROR, leaves `*out_tree == NULL`,
+// and pushes diagnostics to the VM's sink (drain with
+// `zymGetDiagnostics()`).
+//
+// `source_map` must be the map produced by `zym_preprocess` (or NULL
+// when compiling raw, unpreprocessed text). Semantically equivalent to
+// `zym_compile(...)` up to and including parsing, then stopping before
+// any codegen — so the retained tree, trivia buffer, and all spans are
+// identical to what an EXECUTE-mode compile would hand back.
+//
+// Only declared when ZYM_HAS_PARSE_TREE_RETENTION=1; MCU builds cannot
+// call it (compile error).
+ZymStatus zym_parseOnly(ZymVM* vm, const char* source,
+                        const ZymSourceMap* source_map,
+                        const char* entry_file,
+                        ZymParseTree** out_tree);
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+// Phase 4 — check entry point (ZYM_COMPILE_CHECK).
+//
+// Run scan + preprocess + parse, then the parallel resolver. On success
+// `*out_tree` receives the retained ZymParseTree* and `*out_table`
+// receives the ZymSymbolTable* — both caller-owned. Release them with
+// `zym_freeParseTree` and `zym_freeSymbolTable` respectively.
+//
+// The resolver is a *parallel* pass: it never influences code
+// generation and is never invoked from `zym_compile`. It exists purely
+// for tooling consumers (LSP, docs, outline).
+//
+// 4.1a behavior: the resolver records top-level declarations only
+// (var / func / struct / enum). Lexical scopes, references, and
+// closures arrive in 4.1b / 4.1c.
+//
+// Only declared when ZYM_HAS_SYMBOL_TABLE=1 (which implies
+// ZYM_HAS_PARSE_TREE_RETENTION=1); MCU builds cannot call it (compile
+// error).
+ZymStatus zym_check(ZymVM* vm, const char* source,
+                    const ZymSourceMap* source_map,
+                    const char* entry_file,
+                    ZymParseTree** out_tree,
+                    ZymSymbolTable** out_table);
+#endif
+
 // =============================================================================
 // COOPERATIVE CANCELLATION (Phase 1.5)
 // =============================================================================

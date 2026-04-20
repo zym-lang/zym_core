@@ -63,6 +63,7 @@ if(NOT CONFIG_ZYM_RUNTIME_ONLY)
             ${ZYM_ROOT}/src/parser.c
             ${ZYM_ROOT}/src/parse_tree.c
             ${ZYM_ROOT}/src/node_span.c
+            ${ZYM_ROOT}/src/resolver.c
             ${ZYM_ROOT}/src/trivia.c
             ${ZYM_ROOT}/src/compiler.c
             ${ZYM_ROOT}/src/debug.c

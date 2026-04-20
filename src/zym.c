@@ -203,6 +203,18 @@ ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
 }
 
 #if ZYM_HAS_PARSE_TREE_RETENTION
+ZymStatus zym_parseOnly(ZymVM* vm, const char* source,
+                        const ZymSourceMap* source_map,
+                        const char* entry_file,
+                        ZymParseTree** out_tree)
+{
+    if (out_tree == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    *out_tree = NULL;
+    if (vm == NULL || source == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    bool success = parseOnly(vm, source, source_map, entry_file, out_tree);
+    return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
+}
+
 void zym_freeParseTree(ZymVM* vm, ZymParseTree* tree)
 {
     parse_tree_free(vm, tree);
@@ -503,6 +515,95 @@ int zymTreeFoldingRanges(const ZymParseTree* tree,
         folding_visit(tree->ast.statements[i], &ctx);
     }
     return ctx.total;
+}
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+#include "./resolver.h"
+
+ZymStatus zym_check(ZymVM* vm, const char* source,
+                    const ZymSourceMap* source_map,
+                    const char* entry_file,
+                    ZymParseTree** out_tree,
+                    ZymSymbolTable** out_table)
+{
+    if (out_tree == NULL || out_table == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    *out_tree = NULL;
+    *out_table = NULL;
+    if (vm == NULL || source == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    bool success = checkCompile(vm, source, source_map, entry_file, out_tree, out_table);
+    return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
+}
+
+void zym_freeSymbolTable(ZymVM* vm, ZymSymbolTable* table)
+{
+    symbol_table_free(vm, table);
+}
+
+int zym_symbolTableSymbolCount(const ZymSymbolTable* table)
+{
+    if (table == NULL) return 0;
+    return table->count;
+}
+
+bool zym_symbolTableSymbolAt(const ZymSymbolTable* table, int i,
+                             ZymSymbolInfo* out)
+{
+    if (out == NULL || table == NULL) return false;
+    if (i < 0 || i >= table->count) return false;
+    const Symbol* s = &table->symbols[i];
+    out->kind          = (ZymSymbolKind)s->kind;
+    out->name          = s->name;
+    out->nameLength    = s->name_length;
+    out->nameFileId    = s->name_file_id;
+    out->nameStartByte = s->name_start_byte;
+    out->defSpan       = s->def_span;
+    out->scopeDepth    = s->scope_depth;
+    return true;
+}
+
+int zym_symbolTableReferenceCount(const ZymSymbolTable* table)
+{
+    if (table == NULL) return 0;
+    return table->ref_count;
+}
+
+bool zym_symbolTableReferenceAt(const ZymSymbolTable* table, int i,
+                                ZymReferenceInfo* out)
+{
+    if (out == NULL || table == NULL) return false;
+    if (i < 0 || i >= table->ref_count) return false;
+    const Reference* r = &table->references[i];
+    out->name          = r->name;
+    out->nameLength    = r->name_length;
+    out->nameFileId    = r->name_file_id;
+    out->nameStartByte = r->name_start_byte;
+    out->useSpan       = r->use_span;
+    out->symbolIndex   = r->symbol_index;
+    out->isWrite       = r->is_write ? 1 : 0;
+    return true;
+}
+
+bool zym_symbolTableFindSymbolAt(const ZymSymbolTable* table,
+                                 int fileId, int byteOffset,
+                                 ZymSymbolInfo* out)
+{
+    if (table == NULL || out == NULL) return false;
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* s = &table->symbols[i];
+        if (s->name_file_id != fileId) continue;
+        if (byteOffset < s->name_start_byte) continue;
+        if (byteOffset >= s->name_start_byte + s->name_length) continue;
+        out->kind          = (ZymSymbolKind)s->kind;
+        out->name          = s->name;
+        out->nameLength    = s->name_length;
+        out->nameFileId    = s->name_file_id;
+        out->nameStartByte = s->name_start_byte;
+        out->defSpan       = s->def_span;
+        out->scopeDepth    = s->scope_depth;
+        return true;
+    }
+    return false;
 }
 #endif
 

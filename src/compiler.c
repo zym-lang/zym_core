@@ -4475,6 +4475,82 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     return fn_compiler.function;
 }
 
+#if ZYM_HAS_PARSE_TREE_RETENTION
+// Phase 3 — Parse-only compile mode. Shares the sfr_reset +
+// sfr_register + trivia-alloc + parse() prologue with compile(), then
+// stops before any codegen. No Chunk is touched. On success the AST
+// is handed into a heap-allocated ZymParseTree that the caller owns.
+bool parseOnly(VM* vm, const char* source,
+               const SourceMap* source_map,
+               const char* entry_file,
+               ZymParseTree** out_tree) {
+    if (out_tree == NULL) return false;
+    *out_tree = NULL;
+
+    sfr_reset(&vm->source_files);
+    size_t source_length = source != NULL ? strlen(source) : 0;
+    ZymFileId file_id = sfr_register(vm, &vm->source_files,
+                                     entry_file, source, source_length);
+
+    // Always allocate a trivia buffer in PARSE_ONLY mode — the tree
+    // exists purely for tooling consumption, so trivia is part of the
+    // expected payload.
+    TriviaBuffer* trivia = ALLOCATE(vm, TriviaBuffer, 1);
+    trivia_init(trivia);
+
+    AstResult ast = parse(vm, source, source_map, entry_file, file_id, trivia);
+    if (ast.statements == NULL) {
+        trivia_free(vm, trivia);
+        FREE(vm, TriviaBuffer, trivia);
+        return false;
+    }
+
+    // Cancellation may have fired inside parse(); check and bail out
+    // with a retained diagnostic so hosts can distinguish cancel from
+    // a clean parse.
+    if (vm->compile_cancelled) {
+        pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                       -1, 0, -1, -1, "Compilation cancelled.");
+        for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
+        FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+        trivia_free(vm, trivia);
+        FREE(vm, TriviaBuffer, trivia);
+        return false;
+    }
+
+    *out_tree = parse_tree_new(vm, ast, file_id, trivia);
+    return true;
+}
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+#include "./resolver.h"
+
+bool checkCompile(VM* vm, const char* source,
+                  const SourceMap* source_map,
+                  const char* entry_file,
+                  ZymParseTree** out_tree,
+                  struct ZymSymbolTable** out_table) {
+    if (out_tree == NULL || out_table == NULL) return false;
+    *out_tree = NULL;
+    *out_table = NULL;
+
+    if (!parseOnly(vm, source, source_map, entry_file, out_tree)) {
+        return false;
+    }
+
+    ZymSymbolTable* table = symbol_table_new(vm);
+    if (!resolver_resolve_top_level(vm, *out_tree, table)) {
+        symbol_table_free(vm, table);
+        parse_tree_free(vm, *out_tree);
+        *out_tree = NULL;
+        return false;
+    }
+    *out_table = table;
+    return true;
+}
+#endif
+
 bool compile(VM* vm, const char* source, Chunk* chunk,
              const SourceMap* source_map,
              const char* entry_file, CompilerConfig config,

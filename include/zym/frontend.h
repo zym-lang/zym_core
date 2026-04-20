@@ -226,7 +226,135 @@ int  zymTreeEnclosingBlocks(const ZymParseTree* tree, int byteOffset,
 // walk (parent before children). Returns the real total count.
 int  zymTreeFoldingRanges(const ZymParseTree* tree,
                           ZymNodeInfo* out, int max_out);
+
+// ---------------------------------------------------------------------
+// Phase 3 — Compile modes.
+//
+// `ZymCompileMode` lets a host request less than a full compile. Today:
+//
+//   ZYM_COMPILE_EXECUTE    — today's behavior; produces bytecode into
+//                            a caller-owned Chunk. Always available.
+//                            Reach via zym_compile().
+//   ZYM_COMPILE_PARSE_ONLY — scan + preprocess + parse. Produces a
+//                            retained parse tree via out_tree; never
+//                            touches codegen; never allocates a Chunk.
+//                            Available only when
+//                            ZYM_HAS_PARSE_TREE_RETENTION=1. Reach via
+//                            zym_parseOnly().
+//
+// A future ZYM_COMPILE_CHECK mode (Phase 4) will additionally run the
+// parallel resolver to populate a SymbolTable.
+//
+// The enum itself is always defined so host code can switch on it
+// uniformly across profiles; the PARSE_ONLY *entry point*
+// (`zym_parseOnly`, declared in `zym/zym.h`) is retention-gated.
+// ---------------------------------------------------------------------
+typedef enum {
+    ZYM_COMPILE_EXECUTE = 0,
+    ZYM_COMPILE_PARSE_ONLY = 1,
+    ZYM_COMPILE_CHECK = 2  // Phase 4 — parse + parallel resolver (requires ZYM_HAS_SYMBOL_TABLE)
+} ZymCompileMode;
+
 #endif // ZYM_HAS_PARSE_TREE_RETENTION
+
+// ---------------------------------------------------------------------
+// Phase 4 — Symbol table and parallel resolver.
+//
+// The symbol table is produced by the resolver pass (Phase 4), which
+// walks a retained parse tree and records one entry per declaration
+// keyed by the declaring identifier's span. The resolver is a
+// *parallel* pass — `compiler.c`'s existing name resolution is never
+// rewired to consume this table.
+//
+// 4.1a scope (current): top-level declarations only (var / func /
+// struct / enum). Scope chains, references, and closures arrive in
+// 4.1b / 4.1c.
+//
+// Entire block is gated on ZYM_HAS_SYMBOL_TABLE; on MCU builds the
+// types and functions below are not declared.
+// ---------------------------------------------------------------------
+#if ZYM_HAS_SYMBOL_TABLE
+
+typedef enum {
+    ZYM_SYMBOL_UNKNOWN = 0,
+    ZYM_SYMBOL_VAR,     // top-level var declaration
+    ZYM_SYMBOL_FUNC,    // function declaration (top-level or nested)
+    ZYM_SYMBOL_STRUCT,
+    ZYM_SYMBOL_ENUM,
+    ZYM_SYMBOL_PARAM,   // function parameter (Phase 4.1b)
+    ZYM_SYMBOL_LOCAL    // block-scoped var declaration (Phase 4.1b)
+} ZymSymbolKind;
+
+// A single resolved declaration, copied out of the symbol table by
+// value. `name` points into the source file bytes registered with the
+// VM and is NOT null-terminated; read at most `nameLength` bytes. The
+// pointer is valid for as long as the originating SourceFile stays
+// registered on the VM. May be NULL for synthetic / preprocessor-
+// generated declarations.
+typedef struct {
+    ZymSymbolKind kind;
+    const char*   name;
+    int           nameLength;
+    int           nameFileId;
+    int           nameStartByte;
+    ZymSpan       defSpan;
+    int           scopeDepth;
+} ZymSymbolInfo;
+
+// Opaque handle to a symbol table produced by `zym_check`. Owned by
+// the caller; release via `zym_freeSymbolTable`.
+typedef struct ZymSymbolTable ZymSymbolTable;
+
+// Release a symbol table obtained from `zym_check`. Safe on NULL. Must
+// be called on the same VM that produced the table.
+void zym_freeSymbolTable(ZymVM* vm, ZymSymbolTable* table);
+
+// Total number of symbols recorded in the table. At 4.1a this is the
+// number of top-level declarations; later phases grow this to include
+// locals, params, fields, and variants.
+int  zym_symbolTableSymbolCount(const ZymSymbolTable* table);
+
+// Fill `*out` with the i-th symbol. Returns false (leaving *out
+// untouched) if `i` is out of range or `table`/`out` is NULL.
+bool zym_symbolTableSymbolAt(const ZymSymbolTable* table, int i,
+                             ZymSymbolInfo* out);
+
+// A single identifier-use recorded by the resolver (Phase 4.1b). Each
+// reference is bound (where possible) to the symbol it resolves to via
+// `symbolIndex`. An index of -1 means the use did not resolve — either
+// the name is undeclared, or it's a member access (`obj.field`) whose
+// field name is not yet resolvable until Phase 4.1c supplies struct
+// type information.
+//
+// `name` lifetime matches `ZymSymbolInfo.name` — borrowed from the
+// SourceFile bytes, NOT null-terminated.
+typedef struct {
+    const char* name;
+    int         nameLength;
+    int         nameFileId;
+    int         nameStartByte;
+    ZymSpan     useSpan;
+    int         symbolIndex;   // index into the symbol array, or -1 if unresolved
+    int         isWrite;       // 1 for assignment targets (including ++/-- lvalues), 0 for reads
+} ZymReferenceInfo;
+
+// Total number of identifier-use references recorded by the resolver.
+int  zym_symbolTableReferenceCount(const ZymSymbolTable* table);
+
+// Fill `*out` with the i-th reference. Returns false (leaving *out
+// untouched) if `i` is out of range or `table`/`out` is NULL.
+bool zym_symbolTableReferenceAt(const ZymSymbolTable* table, int i,
+                                ZymReferenceInfo* out);
+
+// Find the symbol whose declaring identifier span covers
+// `(fileId, byteOffset)` and fill `*out`. Returns false if no symbol
+// matches. Useful for "go to definition on click" — the host passes
+// the caret position and gets the enclosing declaration, if any.
+bool zym_symbolTableFindSymbolAt(const ZymSymbolTable* table,
+                                 int fileId, int byteOffset,
+                                 ZymSymbolInfo* out);
+
+#endif // ZYM_HAS_SYMBOL_TABLE
 
 #ifdef __cplusplus
 }

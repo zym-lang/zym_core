@@ -180,3 +180,41 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
              const SourceMap* source_map,
              const char* entry_file, CompilerConfig config,
              ZymParseTree** out_tree);
+
+#if ZYM_HAS_PARSE_TREE_RETENTION
+// Phase 3 — Parse-only compile mode.
+//
+// Runs the same sfr_reset + sfr_register + trivia allocation + parse()
+// steps as compile(), then stops. On success `*out_tree` receives the
+// retained ZymParseTree (caller owns it, must release via
+// parse_tree_free / zym_freeParseTree); no Chunk is touched, no
+// codegen runs. Returns false on parse failure (diagnostics pushed to
+// the VM's sink; *out_tree left NULL).
+//
+// Internal-only; the public entry point is zym_parseOnly() in zym.h.
+bool parseOnly(VM* vm, const char* source,
+               const SourceMap* source_map,
+               const char* entry_file,
+               ZymParseTree** out_tree);
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+// Phase 4 — check compile mode.
+//
+// Runs the full parseOnly() prologue (sfr_reset + sfr_register +
+// trivia alloc + parse) and, on a clean parse, invokes the parallel
+// resolver over the retained tree to produce a ZymSymbolTable. Both
+// artifacts are handed to the caller on success:
+//   *out_tree  — owns the AST + trivia (caller: parse_tree_free)
+//   *out_table — owns the symbol array    (caller: symbol_table_free)
+// On parse failure / cancellation both out-params are set to NULL and
+// any partial artifacts are freed.
+//
+// Internal-only; the public entry point is zym_check() in zym.h.
+struct ZymSymbolTable;
+bool checkCompile(VM* vm, const char* source,
+                  const SourceMap* source_map,
+                  const char* entry_file,
+                  ZymParseTree** out_tree,
+                  struct ZymSymbolTable** out_table);
+#endif

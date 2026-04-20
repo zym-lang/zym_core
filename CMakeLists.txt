@@ -60,6 +60,7 @@ if(NOT ZYM_RUNTIME_ONLY)
         src/parser.c
         src/parse_tree.c
         src/node_span.c
+        src/resolver.c
         src/trivia.c
         src/compiler.c
         src/debug.c
