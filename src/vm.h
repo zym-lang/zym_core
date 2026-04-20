@@ -8,6 +8,7 @@
 #include "./allocator.h"
 #include "./source_file.h"
 #include "./diagnostics.h"
+#include <signal.h> /* sig_atomic_t for compile cancellation flag */
 
 /*
  * VM Configuration Limits
@@ -149,6 +150,16 @@ typedef struct VM {
     // (parser/compiler/…) via pushDiagnostic(); drained by embedders via
     // zymGetDiagnostics() / zymClearDiagnostics().
     DiagnosticSink diagnostics;
+
+    // Phase 1.5: cooperative cancellation flag for the frontend pipeline.
+    // `volatile sig_atomic_t` is the minimum C99 primitive that is safe
+    // to read/write across threads without a full atomics dependency —
+    // the parser and compiler only need to observe a monotonic 0 → 1
+    // transition, never a tearing read. Flipped by zymRequestCancel()
+    // from an arbitrary thread; reset to 0 by zymClearCancel() before
+    // starting a new compile. Parser polls at every declaration boundary;
+    // compiler polls at every statement-emit boundary.
+    volatile sig_atomic_t compile_cancelled;
 } VM;
 
 typedef enum {

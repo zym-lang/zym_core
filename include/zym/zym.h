@@ -92,6 +92,33 @@ ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
 ZymStatus zym_compileEx(ZymVM* vm, const char* source, ZymChunk* chunk,
                         ZymLineMap* line_map, const ZymSourceMap* source_map,
                         const char* entry_file, ZymCompilerConfig config);
+
+// =============================================================================
+// COOPERATIVE CANCELLATION (Phase 1.5)
+// =============================================================================
+//
+// The frontend (parser + compiler) polls vm->compile_cancelled at every
+// statement / declaration boundary. An external thread (e.g. an LSP
+// request that has been superseded) may call zym_requestCancel(vm) at
+// any time to ask an in-flight compile to abort cooperatively. The
+// aborted compile returns ZYM_STATUS_COMPILE_ERROR and pushes a single
+// "Compilation cancelled." diagnostic; the host can distinguish cancel
+// from a genuine compile error by calling zym_wasCancelled(vm).
+//
+// The flag is NOT cleared automatically at the start of a new compile
+// (the API is explicit to avoid hiding a stale cancel). Call
+// zym_clearCancel(vm) before the next compile. Writes from one thread
+// are observed by the compile thread through the underlying
+// `volatile sig_atomic_t`; this is sufficient for the one-way
+// 0 -> 1 signal the parser/compiler need.
+//
+// NOTE: This API only governs the compile pipeline. It does not
+// interrupt bytecode execution; runtime interruption is a separate
+// concern handled by the preemption machinery.
+void zym_requestCancel(ZymVM* vm);
+void zym_clearCancel(ZymVM* vm);
+bool zym_wasCancelled(const ZymVM* vm);
+
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);

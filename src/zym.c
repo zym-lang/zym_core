@@ -84,6 +84,28 @@ void zymClearDiagnostics(ZymVM* vm)
 }
 
 // =============================================================================
+// COOPERATIVE CANCELLATION (Phase 1.5)
+// =============================================================================
+
+void zym_requestCancel(ZymVM* vm)
+{
+    if (vm == NULL) return;
+    vm->compile_cancelled = 1;
+}
+
+void zym_clearCancel(ZymVM* vm)
+{
+    if (vm == NULL) return;
+    vm->compile_cancelled = 0;
+}
+
+bool zym_wasCancelled(const ZymVM* vm)
+{
+    if (vm == NULL) return false;
+    return vm->compile_cancelled != 0;
+}
+
+// =============================================================================
 // COMPILATION AND EXECUTION
 // =============================================================================
 

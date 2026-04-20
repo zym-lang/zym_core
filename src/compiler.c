@@ -4528,6 +4528,15 @@ bool compileEx(VM* vm, const char* source, Chunk* chunk,
     // --- PASS 1: DECLARATION ---
     // Find all function, struct, and enum declarations first to allow for hoisting.
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        // Phase 1.5: cooperative cancellation. Polling at every statement
+        // boundary in the top-level emit loops keeps worst-case
+        // latency bounded by the cost of compiling a single statement.
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type == STMT_FUNC_DECLARATION) {
             declare_function(&compiler, ast.statements[i]);
         } else if (ast.statements[i]->type == STMT_STRUCT_DECLARATION) {
@@ -4545,6 +4554,12 @@ bool compileEx(VM* vm, const char* source, Chunk* chunk,
     // Pass 2a: Compile function definitions and process directives in source order.
     // This ensures directives affect functions that come after them.
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type == STMT_COMPILER_DIRECTIVE) {
             // Process directive immediately to affect subsequent functions
             CompilerDirectiveStmt* dir = &ast.statements[i]->as.compiler_directive;
@@ -4576,6 +4591,12 @@ bool compileEx(VM* vm, const char* source, Chunk* chunk,
     // respecting scope-level directives.
     int last_line = 0;
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type != STMT_FUNC_DECLARATION &&
             ast.statements[i]->type != STMT_COMPILER_DIRECTIVE &&
             ast.statements[i]->type != STMT_STRUCT_DECLARATION &&

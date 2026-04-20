@@ -40,6 +40,14 @@ typedef struct {
     // that don't run through the preprocessor (e.g. module_loader's
     // pre-combined buffers).
     const SourceMap* source_map;
+
+    // Phase 1.5: per-scanner scratch buffer used by scanToken() to format
+    // the "Unexpected character ..." error message. Previously a
+    // function-local `static char[64]` — moving it onto the scanner
+    // removes the last piece of mutable static state from the frontend
+    // and makes the scanner trivially re-entrant across concurrent
+    // instances.
+    char error_buf[64];
 } Scanner;
 
 void initScanner(Scanner* scanner, const char* source, const LineMap* line_map,

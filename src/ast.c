@@ -162,6 +162,13 @@ Expr* new_spread_expr(VM* vm, Expr* expression, Token token) {
     return expr;
 }
 
+Expr* new_error_expr(VM* vm, Token start_token, Token end_token) {
+    Expr* expr = new_expr(vm, EXPR_ERROR, start_token.line);
+    expr->as.error.start_token = start_token;
+    expr->as.error.end_token = end_token;
+    return expr;
+}
+
 Expr* clone_expr(VM* vm, Expr* expr) {
     if (expr == NULL) return NULL;
 
@@ -291,6 +298,7 @@ void free_expr(VM* vm, Expr* expr) {
             break;
         case EXPR_LITERAL:
         case EXPR_VARIABLE:
+        case EXPR_ERROR:
             break;
     }
     FREE(vm, Expr, expr);
@@ -436,6 +444,14 @@ Stmt* new_switch_stmt(VM* vm, Expr* expression, CaseClause* cases, int case_coun
     return stmt;
 }
 
+Stmt* new_error_stmt(VM* vm, Token start_token, Token end_token) {
+    Stmt* stmt = new_stmt(vm, STMT_ERROR, start_token.line);
+    stmt->keyword = start_token;
+    stmt->as.error.start_token = start_token;
+    stmt->as.error.end_token = end_token;
+    return stmt;
+}
+
 void free_stmt(VM* vm, Stmt* stmt) {
     if (stmt == NULL) return;
     switch (stmt->type) {
@@ -500,6 +516,7 @@ void free_stmt(VM* vm, Stmt* stmt) {
             break;
         case STMT_LABEL:
         case STMT_GOTO:
+        case STMT_ERROR:
             break;
         case STMT_SWITCH: {
             free_expr(vm, stmt->as.switch_stmt.expression);

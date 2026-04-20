@@ -96,6 +96,7 @@ void initVM(VM* vm) {
 
     sfr_init(&vm->source_files);
     diagsink_init(&vm->diagnostics);
+    vm->compile_cancelled = 0;
 
     vm->gc_enabled = true;
     // Recalculate debt: headroom = next_gc - bytes_allocated, clamped to INT32_MAX

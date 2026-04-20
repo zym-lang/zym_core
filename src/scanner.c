@@ -398,11 +398,10 @@ Token scanToken(Scanner* scanner) {
         case '"': return string(scanner);
     }
 
-    static char error_buf[64];
     if (c >= 32 && c < 127) {
-        snprintf(error_buf, sizeof(error_buf), "Unexpected character '%c'.", c);
+        snprintf(scanner->error_buf, sizeof(scanner->error_buf), "Unexpected character '%c'.", c);
     } else {
-        snprintf(error_buf, sizeof(error_buf), "Unexpected character (code %d).", (unsigned char)c);
+        snprintf(scanner->error_buf, sizeof(scanner->error_buf), "Unexpected character (code %d).", (unsigned char)c);
     }
-    return errorToken(scanner, error_buf);
+    return errorToken(scanner, scanner->error_buf);
 }

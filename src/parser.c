@@ -1070,13 +1070,14 @@ static Stmt* parse_declaration(Parser* parser) {
     }
 
     if (stmt == NULL && parser->panic_mode) {
+        // Capture the token where the failure started, synchronize to the next
+        // safe boundary, and emit a STMT_ERROR node covering the skipped span.
+        // Keeps the AST complete for retained-tree / LSP consumers in Phase 2;
+        // codegen still bails in parse() because parser->had_error is set.
+        Token err_start = parser->previous;
         synchronize(parser);
-        return new_expression_stmt(parser->vm, new_literal_expr(parser->vm, (Token){
-            .type = TOKEN_NULL,
-            .start = "null",
-            .length = 4,
-            .line = parser->previous.line
-        }));
+        Token err_end = parser->previous;
+        return new_error_stmt(parser->vm, err_start, err_end);
     }
 
     return stmt;
@@ -1306,6 +1307,18 @@ AstResult parse(VM* vm, const char* source, const LineMap* line_map,
     Stmt** statements = ALLOCATE(vm, Stmt*, capacity);
 
     while (!match(&parser, TOKEN_EOF)) {
+        // Phase 1.5: cooperative cancellation. An external thread may
+        // flip vm->compile_cancelled at any time; polling at each
+        // declaration boundary is the coarsest granularity that still
+        // keeps interactive cancellation under a few hundred µs on
+        // realistic scripts.
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1,
+                           "Compilation cancelled.");
+            parser.had_error = true;
+            break;
+        }
         if (count + 1 > capacity) {
             int old_capacity = capacity;
             capacity = GROW_CAPACITY(old_capacity);
