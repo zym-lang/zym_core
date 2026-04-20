@@ -607,8 +607,411 @@ bool zym_symbolTableFindSymbolAt(const ZymSymbolTable* table,
     }
     return false;
 }
-#endif
 
+// ---------------------------------------------------------------------
+// Phase 4.3a — public query API
+// ---------------------------------------------------------------------
+
+static void fill_symbol_info(const Symbol* s, ZymSymbolInfo* out) {
+    out->kind          = (ZymSymbolKind)s->kind;
+    out->name          = s->name;
+    out->nameLength    = s->name_length;
+    out->nameFileId    = s->name_file_id;
+    out->nameStartByte = s->name_start_byte;
+    out->defSpan       = s->def_span;
+    out->scopeDepth    = s->scope_depth;
+    out->parentIndex   = s->parent_index;
+}
+
+bool zymSymbolAtPosition(const ZymSymbolTable* table,
+                         int fileId, int byteOffset,
+                         ZymSymbolInfo* out)
+{
+    if (table == NULL || out == NULL) return false;
+    // Pass 1: declarations (name span).
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* s = &table->symbols[i];
+        if (s->name_file_id != fileId) continue;
+        if (byteOffset < s->name_start_byte) continue;
+        if (byteOffset >= s->name_start_byte + s->name_length) continue;
+        fill_symbol_info(s, out);
+        return true;
+    }
+    // Pass 2: references (use span). Must bind to a real symbol.
+    for (int i = 0; i < table->ref_count; i++) {
+        const Reference* r = &table->references[i];
+        if (r->name_file_id != fileId) continue;
+        if (byteOffset < r->name_start_byte) continue;
+        if (byteOffset >= r->name_start_byte + r->name_length) continue;
+        if (r->symbol_index < 0 || r->symbol_index >= table->count) return false;
+        fill_symbol_info(&table->symbols[r->symbol_index], out);
+        return true;
+    }
+    return false;
+}
+
+int zymSymbolReferences(const ZymSymbolTable* table,
+                        int symbolIndex,
+                        ZymReferenceInfo* out_buf, int max_out)
+{
+    if (table == NULL) return -1;
+    if (symbolIndex < 0 || symbolIndex >= table->count) return -1;
+    int total = 0;
+    for (int i = 0; i < table->ref_count; i++) {
+        const Reference* r = &table->references[i];
+        if (r->symbol_index != symbolIndex) continue;
+        if (out_buf != NULL && total < max_out) {
+            out_buf[total].name          = r->name;
+            out_buf[total].nameLength    = r->name_length;
+            out_buf[total].nameFileId    = r->name_file_id;
+            out_buf[total].nameStartByte = r->name_start_byte;
+            out_buf[total].useSpan       = r->use_span;
+            out_buf[total].symbolIndex   = r->symbol_index;
+            out_buf[total].isWrite       = r->is_write ? 1 : 0;
+        }
+        total++;
+    }
+    return total;
+}
+
+int zymListFileSymbols(const ZymSymbolTable* table,
+                       int fileId,
+                       ZymSymbolInfo* out_buf, int max_out)
+{
+    if (table == NULL) return -1;
+    int total = 0;
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* s = &table->symbols[i];
+        if (s->name_file_id != fileId) continue;
+        if (s->scope_depth != 0) continue;
+        if (s->kind != SYMBOL_KIND_VAR &&
+            s->kind != SYMBOL_KIND_FUNC &&
+            s->kind != SYMBOL_KIND_STRUCT &&
+            s->kind != SYMBOL_KIND_ENUM) continue;
+        if (out_buf != NULL && total < max_out) {
+            fill_symbol_info(s, &out_buf[total]);
+        }
+        total++;
+    }
+    return total;
+}
+
+// Returns true if every byte in [start, end) of `bytes` consists only
+// of ASCII whitespace and/or identifier characters (letters, digits,
+// underscore).
+//
+// The allowance for identifier characters is deliberate: the AST's
+// `nodeSpan(stmt)` sometimes starts at the declaration's *name* token
+// rather than its leading keyword (e.g. `func foo` starts at `foo`),
+// which leaves `func ` sitting between a preceding trivia piece and
+// `def_start`. Treating keywords + identifiers as "gap" content keeps
+// the doc-attachment logic robust to that difference without forcing a
+// nodeSpan refactor.
+//
+// This is safe because any non-whitespace non-identifier byte in the
+// gap (punctuation, braces, operators) would necessarily indicate a
+// real statement sitting between the trivia and the declaration, in
+// which case the trivia shouldn't attach anyway.
+static bool ws_or_keyword_only(const char* bytes, int length,
+                               int start, int end) {
+    if (start < 0 || end > length || start > end) return false;
+    for (int i = start; i < end; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_') continue;
+        return false;
+    }
+    return true;
+}
+
+ZymDocumentationKind zymSymbolDocumentation(const ZymSymbolTable* table,
+                                            const ZymParseTree* tree,
+                                            int symbolIndex,
+                                            int* out_fileId,
+                                            int* out_startByte,
+                                            int* out_length)
+{
+    if (table == NULL || tree == NULL) return ZYM_DOC_NONE;
+    if (symbolIndex < 0 || symbolIndex >= table->count) return ZYM_DOC_NONE;
+    const TriviaBuffer* tb = tree->trivia;
+    if (tb == NULL || tb->count == 0) return ZYM_DOC_NONE;
+
+    const Symbol* s = &table->symbols[symbolIndex];
+    if (s->name == NULL || s->name_length <= 0) return ZYM_DOC_NONE;
+    // Recover source-file base pointer + length. The symbol's name is
+    // borrowed from SourceFile bytes, so bytes == name - name_start_byte.
+    const char* source_bytes = s->name - s->name_start_byte;
+    // Def begins at defSpan.startByte (preferred) or nameStartByte as fallback.
+    int def_start = (s->def_span.fileId == s->name_file_id &&
+                     s->def_span.startByte >= 0)
+                        ? s->def_span.startByte
+                        : s->name_start_byte;
+    int fileId = s->name_file_id;
+
+    // Find the trivia piece immediately before def_start (in this file).
+    // Walk backwards from trivia_lower_bound(def_start); the previous
+    // piece (if any) is the candidate.
+    int lb = trivia_lower_bound(tb, def_start);
+    int last_idx = -1;
+    for (int i = lb - 1; i >= 0; i--) {
+        const TriviaPiece* p = &tb->pieces[i];
+        if (p->fileId != fileId) continue;
+        if (p->startByte + p->length > def_start) continue;
+        last_idx = i;
+        break;
+    }
+    if (last_idx < 0) return ZYM_DOC_NONE;
+    const TriviaPiece* last = &tb->pieces[last_idx];
+
+    // Conservative source length bound: scan from the end of the last
+    // trivia piece up to def_start — must be only whitespace. We don't
+    // know the exact source buffer length here, but since both
+    // last->startByte+length and def_start are valid offsets into the
+    // same source file, we can safely read bytes in that range.
+    int scan_len = def_start; // upper bound for only_whitespace's length guard
+    int gap_start = last->startByte + last->length;
+    if (!ws_or_keyword_only(source_bytes, scan_len, gap_start, def_start))
+        return ZYM_DOC_NONE;
+
+    if (last->kind == TRIVIA_DOC_BLOCK) {
+        if (out_fileId)    *out_fileId = fileId;
+        if (out_startByte) *out_startByte = last->startByte;
+        if (out_length)    *out_length = last->length;
+        return ZYM_DOC_BLOCK;
+    }
+    if (last->kind == TRIVIA_DOC_LINE) {
+        // Walk backwards collecting a contiguous run of DOC_LINE pieces,
+        // each separated from the next only by whitespace.
+        int first_idx = last_idx;
+        for (int i = last_idx - 1; i >= 0; i--) {
+            const TriviaPiece* p = &tb->pieces[i];
+            if (p->fileId != fileId) break;
+            if (p->kind != TRIVIA_DOC_LINE) break;
+            int this_end = p->startByte + p->length;
+            int next_start = tb->pieces[first_idx].startByte;
+            if (this_end > next_start) break;
+            if (!ws_or_keyword_only(source_bytes, scan_len, this_end, next_start)) break;
+            first_idx = i;
+        }
+        const TriviaPiece* first = &tb->pieces[first_idx];
+        int total_len = (last->startByte + last->length) - first->startByte;
+        if (out_fileId)    *out_fileId = fileId;
+        if (out_startByte) *out_startByte = first->startByte;
+        if (out_length)    *out_length = total_len;
+        return ZYM_DOC_LINE;
+    }
+    // last was a plain comment — not a doc comment.
+    return ZYM_DOC_NONE;
+}
+// ---------------------------------------------------------------------
+// Phase 4.3b — zymSemanticTokens
+// ---------------------------------------------------------------------
+#include "./scanner.h"
+#include "./trivia.h"
+static ZymSemanticTokenKind classify_token_type(TokenType t) {
+    switch (t) {
+        // Punctuation.
+        case TOKEN_LEFT_PAREN: case TOKEN_RIGHT_PAREN:
+        case TOKEN_LEFT_BRACE: case TOKEN_RIGHT_BRACE:
+        case TOKEN_LEFT_BRACKET: case TOKEN_RIGHT_BRACKET:
+        case TOKEN_COLON: case TOKEN_COMMA: case TOKEN_SEMICOLON:
+        case TOKEN_DOT: case TOKEN_DOT_DOT_DOT: case TOKEN_AT:
+        case TOKEN_QUESTION:
+            return ZYM_SEMTOK_PUNCTUATION;
+        // Literals.
+        case TOKEN_NUMBER: return ZYM_SEMTOK_NUMBER;
+        case TOKEN_STRING: return ZYM_SEMTOK_STRING;
+        case TOKEN_TRUE: case TOKEN_FALSE: case TOKEN_NULL:
+            return ZYM_SEMTOK_BOOL_NULL;
+        // Keywords.
+        case TOKEN_AND: case TOKEN_BITWISE: case TOKEN_BREAK:
+        case TOKEN_CASE: case TOKEN_CONTINUE: case TOKEN_DEFAULT:
+        case TOKEN_DO: case TOKEN_ELSE: case TOKEN_ENUM:
+        case TOKEN_FOR: case TOKEN_FUNC: case TOKEN_GOTO:
+        case TOKEN_IF: case TOKEN_OR: case TOKEN_RETURN:
+        case TOKEN_STRUCT: case TOKEN_SWITCH: case TOKEN_VAR:
+        case TOKEN_WHILE:
+            return ZYM_SEMTOK_KEYWORD;
+        default:
+            // Everything else (arithmetic, comparison, bitwise,
+            // compound-assign, shifts, arrows, bang, equals) is an
+            // operator.
+            return ZYM_SEMTOK_OPERATOR;
+    }
+}
+static ZymSemanticTokenKind symbol_kind_to_semtok(SymbolKind k) {
+    switch (k) {
+        case SYMBOL_KIND_FUNC:    return ZYM_SEMTOK_FUNCTION;
+        case SYMBOL_KIND_VAR:     return ZYM_SEMTOK_VARIABLE;
+        case SYMBOL_KIND_PARAM:   return ZYM_SEMTOK_PARAMETER;
+        case SYMBOL_KIND_LOCAL:   return ZYM_SEMTOK_LOCAL;
+        case SYMBOL_KIND_UPVALUE: return ZYM_SEMTOK_UPVALUE;
+        case SYMBOL_KIND_STRUCT:  return ZYM_SEMTOK_STRUCT;
+        case SYMBOL_KIND_ENUM:    return ZYM_SEMTOK_ENUM;
+        case SYMBOL_KIND_FIELD:   return ZYM_SEMTOK_FIELD;
+        case SYMBOL_KIND_VARIANT: return ZYM_SEMTOK_VARIANT;
+        default:                  return ZYM_SEMTOK_IDENTIFIER;
+    }
+}
+// Classify an identifier token by looking it up in the symbol table's
+// declaring spans first, then its reference use spans. An identifier
+// that matches neither is left as ZYM_SEMTOK_IDENTIFIER with modifiers
+// == 0 (unresolved — e.g. member of a dynamic receiver, or an
+// undeclared name).
+static void classify_identifier_token(const ZymSymbolTable* table,
+                                      int fileId, int startByte, int length,
+                                      ZymSemanticTokenKind* out_kind,
+                                      unsigned int* out_mods)
+{
+    *out_kind = ZYM_SEMTOK_IDENTIFIER;
+    *out_mods = 0u;
+    // Declaring span first: this caret is on the decl's identifier.
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* s = &table->symbols[i];
+        if (s->name_file_id == fileId &&
+            s->name_start_byte == startByte &&
+            s->name_length == length) {
+            *out_kind = symbol_kind_to_semtok(s->kind);
+            *out_mods |= ZYM_SEMTOK_MOD_DECLARATION;
+            return;
+        }
+    }
+    // Reference use span: a reader or writer of some bound symbol.
+    for (int i = 0; i < table->ref_count; i++) {
+        const Reference* r = &table->references[i];
+        if (r->name_file_id != fileId) continue;
+        if (r->name_start_byte != startByte) continue;
+        if (r->name_length != length) continue;
+        if (r->is_write) *out_mods |= ZYM_SEMTOK_MOD_WRITE;
+        if (r->symbol_index >= 0 && r->symbol_index < table->count) {
+            *out_kind = symbol_kind_to_semtok(table->symbols[r->symbol_index].kind);
+        }
+        return; // unresolved refs stay ZYM_SEMTOK_IDENTIFIER but keep the write bit
+    }
+}
+// Compute end line/column of a trivia piece by walking its bytes. UTF-8
+// bytes map 1:1 onto columns (scanner does the same — Phase 1.1 decision).
+static void trivia_end_linecol(const char* bytes, int fileLen,
+                               const TriviaPiece* p,
+                               int* out_endLine, int* out_endCol)
+{
+    int line = p->startLine;
+    int col  = p->startColumn;
+    int end  = p->startByte + p->length;
+    if (end > fileLen) end = fileLen;
+    for (int i = p->startByte; i < end; i++) {
+        if (bytes[i] == '\n') {
+            line++;
+            col = 1;
+        } else {
+            col++;
+        }
+    }
+    *out_endLine = line;
+    *out_endCol  = col;
+}
+static void emit_trivia(const TriviaPiece* p, const char* bytes, int fileLen,
+                        ZymSemanticTokenInfo* out_buf, int max_out,
+                        int* total)
+{
+    if (out_buf != NULL && *total < max_out) {
+        ZymSemanticTokenInfo* e = &out_buf[*total];
+        e->fileId      = p->fileId;
+        e->startByte   = p->startByte;
+        e->length      = p->length;
+        e->startLine   = p->startLine;
+        e->startColumn = p->startColumn;
+        trivia_end_linecol(bytes, fileLen, p, &e->endLine, &e->endColumn);
+        switch (p->kind) {
+            case TRIVIA_DOC_LINE:
+            case TRIVIA_DOC_BLOCK:
+                e->kind = ZYM_SEMTOK_DOC_COMMENT;
+                break;
+            default:
+                e->kind = ZYM_SEMTOK_COMMENT;
+                break;
+        }
+        e->modifiers = 0u;
+    }
+    (*total)++;
+}
+int zymSemanticTokens(const ZymVM* vm,
+                      const ZymSymbolTable* table,
+                      const ZymParseTree* tree,
+                      int fileId,
+                      ZymSemanticTokenInfo* out_buf, int max_out)
+{
+    if (vm == NULL || table == NULL || tree == NULL) return -1;
+    const SourceFile* sf = sfr_get(&((VM*)vm)->source_files, fileId);
+    if (sf == NULL) return -1;
+    Scanner scanner;
+    initScanner(&scanner, sf->bytes, NULL, fileId);
+    const TriviaBuffer* trivia = tree->trivia;
+    // Skip any trivia pieces that belong to a different file, which can
+    // happen when the parse tree was produced for a multi-file compile.
+    int trivia_idx = 0;
+    if (trivia != NULL) {
+        while (trivia_idx < trivia->count &&
+               trivia->pieces[trivia_idx].fileId != fileId) {
+            trivia_idx++;
+        }
+    }
+    int total = 0;
+    for (;;) {
+        Token tok = scanToken(&scanner);
+        if (tok.type == TOKEN_EOF) break;
+        // Emit all trivia pieces that begin before this token, in byte
+        // order. We only emit pieces for the requested fileId; pieces
+        // belonging to other files are skipped silently.
+        if (trivia != NULL) {
+            while (trivia_idx < trivia->count) {
+                const TriviaPiece* p = &trivia->pieces[trivia_idx];
+                if (p->fileId != fileId) { trivia_idx++; continue; }
+                if (p->startByte >= tok.startByte) break;
+                emit_trivia(p, sf->bytes, (int)sf->length,
+                            out_buf, max_out, &total);
+                trivia_idx++;
+            }
+        }
+        if (tok.type == TOKEN_ERROR) continue;
+        // Classify the scanner token.
+        ZymSemanticTokenKind kind;
+        unsigned int mods = 0u;
+        if (tok.type == TOKEN_IDENTIFIER) {
+            classify_identifier_token(table, fileId, tok.startByte,
+                                      tok.length, &kind, &mods);
+        } else {
+            kind = classify_token_type(tok.type);
+        }
+        if (out_buf != NULL && total < max_out) {
+            ZymSemanticTokenInfo* e = &out_buf[total];
+            e->fileId      = fileId;
+            e->startByte   = tok.startByte;
+            e->length      = tok.length;
+            e->startLine   = tok.startLine;
+            e->startColumn = tok.startColumn;
+            e->endLine     = tok.endLine;
+            e->endColumn   = tok.endColumn;
+            e->kind        = kind;
+            e->modifiers   = mods;
+        }
+        total++;
+    }
+    // Emit any trailing trivia pieces (after the last scanner token).
+    if (trivia != NULL) {
+        while (trivia_idx < trivia->count) {
+            const TriviaPiece* p = &trivia->pieces[trivia_idx];
+            if (p->fileId == fileId) {
+                emit_trivia(p, sf->bytes, (int)sf->length,
+                            out_buf, max_out, &total);
+            }
+            trivia_idx++;
+        }
+    }
+    return total;
+}
+#endif
 #else
 
 // ZYM_RUNTIME_ONLY stubs — registry/sourcemap are compile-surface only.

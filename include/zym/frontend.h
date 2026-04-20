@@ -362,6 +362,161 @@ bool zym_symbolTableFindSymbolAt(const ZymSymbolTable* table,
                                  int fileId, int byteOffset,
                                  ZymSymbolInfo* out);
 
+// ---------------------------------------------------------------------
+// Phase 4.3a — public query API.
+//
+// The four accessors below are thin filters over the data already
+// populated by the resolver; they give LSP-style hosts the operations
+// they actually want (hover, go-to-def, find-references, outline,
+// doc-comment hover) without forcing each host to re-implement array
+// filtering.
+//
+// Note: `zymSymbolDefinition` is intentionally NOT a separate
+// function. Use `ZymSymbolInfo.defSpan` directly — every symbol
+// already carries its def span.
+// ---------------------------------------------------------------------
+
+// Hit-test at a caret position. Matches either a declaring identifier
+// span (the symbol's `nameStart..nameStart+nameLength`) or a reference
+// use span (`useSpan`). Preferred over `zym_symbolTableFindSymbolAt`
+// for hover / go-to-definition because it also resolves clicks on
+// identifier *uses*, not just declarations. When the caret is on a
+// reference whose `symbolIndex == -1` (unresolved — e.g. member of a
+// dynamically-typed receiver), returns false.
+//
+// Fills `*out` with the resolved symbol and returns true on hit;
+// returns false (leaving `*out` untouched) on miss.
+bool zymSymbolAtPosition(const ZymSymbolTable* table,
+                         int fileId, int byteOffset,
+                         ZymSymbolInfo* out);
+
+// Collect up to `max_out` references that resolve to `symbolIndex`
+// (i.e. `ZymReferenceInfo.symbolIndex == symbolIndex`). Writes them to
+// `out_buf[0..min(N, max_out))` and returns the total N (which may
+// exceed `max_out`); callers that care about unbounded results
+// re-invoke with a larger buffer.
+//
+// Returns -1 on bad inputs (NULL table, out-of-range symbolIndex).
+int zymSymbolReferences(const ZymSymbolTable* table,
+                        int symbolIndex,
+                        ZymReferenceInfo* out_buf, int max_out);
+
+// Collect the file-level outline for `fileId`: top-level declarations
+// (kind ∈ {VAR, FUNC, STRUCT, ENUM}, `scopeDepth == 0`) whose
+// declaring identifier lives in that file. Order matches table
+// insertion order, which is source order for top-level declarations.
+//
+// Returns the total count; fills up to `max_out` entries. Returns -1
+// on NULL table.
+int zymListFileSymbols(const ZymSymbolTable* table,
+                       int fileId,
+                       ZymSymbolInfo* out_buf, int max_out);
+
+// Which kind of trivia piece `zymSymbolDocumentation` returned.
+// `ZYM_DOC_NONE` means no doc comment was found and `*out_text` /
+// `*out_len` are left untouched.
+typedef enum {
+    ZYM_DOC_NONE  = 0,
+    ZYM_DOC_LINE  = 1,  // one or more contiguous `///` lines
+    ZYM_DOC_BLOCK = 2   // a single `/** ... */` block
+} ZymDocumentationKind;
+
+// Look up the doc-comment attached to `symbolIndex`: the trivia
+// piece(s) immediately preceding the symbol's `defSpan.startByte` with
+// only whitespace (spaces, tabs, newlines) between.
+//
+// For `///` line comments, a *run* of contiguous doc-line pieces
+// (pieces whose end + whitespace is the next piece's start) is
+// returned as a single span — the caller can slice the source bytes
+// `(tree-registered-source)[*out_start .. *out_start + *out_length)`
+// to recover the raw text. For `/** ... */` blocks, exactly one piece
+// is returned.
+//
+// On no-match (no trivia buffer, no adjacent doc piece, mismatched
+// file, or the gap between trivia and def contains non-whitespace):
+// returns `ZYM_DOC_NONE` and leaves out-params untouched.
+//
+// Signature:
+//   kind          - which flavour of doc comment, or ZYM_DOC_NONE.
+//   *out_fileId   - the file the doc span lives in (same as the symbol's).
+//   *out_startByte- byte offset into that file where the doc comment run begins.
+//   *out_length   - byte length of the doc comment run (includes the
+//                   leading `///` or `/**` markers; host may strip as
+//                   appropriate for presentation).
+ZymDocumentationKind zymSymbolDocumentation(const ZymSymbolTable* table,
+                                            const ZymParseTree* tree,
+                                            int symbolIndex,
+                                            int* out_fileId,
+                                            int* out_startByte,
+                                            int* out_length);
+// ---------------------------------------------------------------------
+// Phase 4.3b — semantic tokens.
+//
+// Classified-token stream for an entire file: every scanner token
+// (keyword, operator, literal, identifier, ...) plus every comment
+// trivia piece, emitted in source byte order with its resolver-derived
+// kind and modifier bitmask.
+//
+// Hosts consume this for semantic highlighting ("this identifier is a
+// function / parameter / struct field"). The public API is byte- and
+// line/column-based; hosts convert to LSP's delta-line / delta-start /
+// relative-token-index form on their side.
+// ---------------------------------------------------------------------
+typedef enum {
+    // Syntactic / non-identifier tokens.
+    ZYM_SEMTOK_KEYWORD       = 0,  // var, func, if, while, return, and, or, ...
+    ZYM_SEMTOK_OPERATOR      = 1,  // +, -, =, ==, <<, &=, ->, ...
+    ZYM_SEMTOK_PUNCTUATION   = 2,  // (, ), {, }, [, ], :, ;, ,, ., ..., @
+    ZYM_SEMTOK_NUMBER        = 3,  // numeric literal
+    ZYM_SEMTOK_STRING        = 4,  // string literal
+    ZYM_SEMTOK_BOOL_NULL     = 5,  // true / false / null
+    ZYM_SEMTOK_COMMENT       = 6,  // // ...  or /* ... */
+    ZYM_SEMTOK_DOC_COMMENT   = 7,  // /// ...  or /** ... */
+    // Identifier tokens classified via the resolver's symbol table.
+    // When an identifier cannot be bound (undeclared use, or a member
+    // name with dynamic receiver), its kind is ZYM_SEMTOK_IDENTIFIER.
+    ZYM_SEMTOK_FUNCTION      = 8,
+    ZYM_SEMTOK_VARIABLE      = 9,  // top-level var
+    ZYM_SEMTOK_PARAMETER     = 10,
+    ZYM_SEMTOK_LOCAL         = 11,
+    ZYM_SEMTOK_UPVALUE       = 12,
+    ZYM_SEMTOK_STRUCT        = 13,
+    ZYM_SEMTOK_ENUM          = 14,
+    ZYM_SEMTOK_FIELD         = 15,
+    ZYM_SEMTOK_VARIANT       = 16,
+    ZYM_SEMTOK_IDENTIFIER    = 17  // unresolved / unknown
+} ZymSemanticTokenKind;
+// Bitmask modifiers on a semantic token. LSP semantic-token modifiers
+// are a superset; hosts pick which bits to project into the LSP list.
+#define ZYM_SEMTOK_MOD_NONE        0u
+#define ZYM_SEMTOK_MOD_DECLARATION 1u  // token is the declaring identifier span of a symbol
+#define ZYM_SEMTOK_MOD_WRITE       2u  // reference use recorded as an assignment target
+typedef struct {
+    int           fileId;
+    int           startByte;
+    int           length;
+    int           startLine;
+    int           startColumn;
+    int           endLine;
+    int           endColumn;
+    ZymSemanticTokenKind kind;
+    unsigned int  modifiers;   // bitmask of ZYM_SEMTOK_MOD_*
+} ZymSemanticTokenInfo;
+// Produce the semantic-token stream for `fileId`: re-scans the file's
+// canonical byte buffer (from the VM's SourceFile registry) and
+// classifies each token via the resolver's symbol table, interleaved
+// with comment trivia pieces recorded on `tree`.
+//
+// Writes up to `max_out` entries into `out_buf` (may be NULL to query
+// the total). Returns the total number of tokens produced; callers
+// that care about unbounded results re-invoke with a larger buffer.
+//
+// Returns -1 on bad inputs (NULL vm/table/tree, unknown fileId).
+int zymSemanticTokens(const ZymVM* vm,
+                      const ZymSymbolTable* table,
+                      const ZymParseTree* tree,
+                      int fileId,
+                      ZymSemanticTokenInfo* out_buf, int max_out);
 #endif // ZYM_HAS_SYMBOL_TABLE
 
 #ifdef __cplusplus
