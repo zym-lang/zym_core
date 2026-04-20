@@ -284,7 +284,10 @@ typedef enum {
     ZYM_SYMBOL_PARAM,   // function parameter (Phase 4.1b)
     ZYM_SYMBOL_LOCAL,   // block-scoped var declaration (Phase 4.1b)
     ZYM_SYMBOL_FIELD,   // struct field (Phase 4.1c) — parentIndex -> enclosing STRUCT
-    ZYM_SYMBOL_VARIANT  // enum variant (Phase 4.1c) — parentIndex -> enclosing ENUM
+    ZYM_SYMBOL_VARIANT, // enum variant (Phase 4.1c) — parentIndex -> enclosing ENUM
+    ZYM_SYMBOL_UPVALUE  // captured binding (Phase 4.1d) — parentIndex -> origin
+                        // symbol (LOCAL / PARAM / another UPVALUE in the
+                        // next enclosing function frame).
 } ZymSymbolKind;
 
 // A single resolved declaration, copied out of the symbol table by

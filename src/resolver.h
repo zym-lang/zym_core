@@ -24,7 +24,16 @@
 //          targets, `GetExpr` / `SetExpr` object walks. Nested func
 //          decls record themselves but their bodies still participate
 //          in the scope chain.
-//   4.1c — Closures, struct fields, enum variants.
+//   4.1c — Struct fields + enum variants.
+//   4.1d — THIS FILE. Closures / upvalue capture. Function boundaries
+//          are now real frames in the scope stack; any identifier use
+//          that crosses a function boundary to a local/param declared
+//          in an outer function becomes a `SYMBOL_KIND_UPVALUE` symbol
+//          emitted into the innermost enclosing function's scope, with
+//          `parent_index` linked back to the ultimate origin symbol.
+//          Transitive captures (2+ function boundaries) produce one
+//          upvalue per intermediate frame, matching `compiler.c`'s
+//          recursive `resolve_upvalue` walk.
 //
 // Entire file is compiled in only when `ZYM_HAS_SYMBOL_TABLE=1`; on
 // `mcu-min` the TU is not linked and the types below do not exist.
@@ -54,7 +63,10 @@ typedef enum {
     SYMBOL_KIND_PARAM,   // function parameter (4.1b)
     SYMBOL_KIND_LOCAL,   // block-scoped var declaration (4.1b)
     SYMBOL_KIND_FIELD,   // struct field (4.1c) — parent_index -> enclosing STRUCT
-    SYMBOL_KIND_VARIANT  // enum variant (4.1c) — parent_index -> enclosing ENUM
+    SYMBOL_KIND_VARIANT, // enum variant (4.1c) — parent_index -> enclosing ENUM
+    SYMBOL_KIND_UPVALUE  // captured binding (4.1d) — parent_index -> origin
+                         // symbol (LOCAL / PARAM / another UPVALUE in the
+                         // next enclosing function frame)
 } SymbolKind;
 
 // A single resolved declaration.

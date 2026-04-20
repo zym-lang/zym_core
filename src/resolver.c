@@ -112,8 +112,17 @@ static const char* lookup_name_bytes(VM* vm, const Token* nm)
 #define MAX_SCOPES 128
 
 typedef struct {
-    int base;    // index into table->symbols of the first symbol in this scope
-    int depth;   // logical depth (top-level == 0)
+    int  base;    // index into table->symbols of the first symbol in this scope
+    int  depth;   // logical depth (top-level == 0)
+    bool is_function_frame; // 4.1d: push at func decl / anon-func body
+    // 4.1d: per-function-frame dedup map. A use inside this frame that
+    // captures an outer binding synthesizes one UPVALUE symbol; every
+    // subsequent capture of the same origin reuses it. Dynamically
+    // allocated for function frames; NULL for plain block scopes.
+    int* upvalue_origins;    // origin symbol indices (LOCAL/PARAM/UPVALUE)
+    int* upvalue_symbols;    // corresponding UPVALUE symbol indices
+    int  upvalue_count;
+    int  upvalue_capacity;
 } Scope;
 
 typedef struct {
@@ -134,8 +143,13 @@ static void ctx_init(Ctx* ctx, VM* vm, ZymSymbolTable* table)
     ctx->vm            = vm;
     ctx->table         = table;
     ctx->scope_count   = 1;
-    ctx->scopes[0].base  = 0;
-    ctx->scopes[0].depth = 0;
+    ctx->scopes[0].base              = 0;
+    ctx->scopes[0].depth             = 0;
+    ctx->scopes[0].is_function_frame = false;
+    ctx->scopes[0].upvalue_origins   = NULL;
+    ctx->scopes[0].upvalue_symbols   = NULL;
+    ctx->scopes[0].upvalue_count     = 0;
+    ctx->scopes[0].upvalue_capacity  = 0;
     ctx->visible_end   = 0;
 }
 
@@ -144,14 +158,40 @@ static int ctx_depth(const Ctx* ctx)
     return ctx->scopes[ctx->scope_count - 1].depth;
 }
 
-static void ctx_push_scope(Ctx* ctx)
+// 4.1d: index in the scopes[] array of the innermost function frame, or
+// -1 when the current scope is not inside any function (top-level).
+static int ctx_innermost_function_scope(const Ctx* ctx)
+{
+    for (int s = ctx->scope_count - 1; s >= 0; s--) {
+        if (ctx->scopes[s].is_function_frame) return s;
+    }
+    return -1;
+}
+
+static void ctx_push_scope_ex(Ctx* ctx, bool is_function_frame)
 {
     if (ctx->scope_count >= MAX_SCOPES) return;  // overflow: flatten into outermost
     int base = ctx->visible_end;
     int depth = ctx->scopes[ctx->scope_count - 1].depth + 1;
-    ctx->scopes[ctx->scope_count].base  = base;
-    ctx->scopes[ctx->scope_count].depth = depth;
+    Scope* sc = &ctx->scopes[ctx->scope_count];
+    sc->base              = base;
+    sc->depth             = depth;
+    sc->is_function_frame = is_function_frame;
+    sc->upvalue_origins   = NULL;
+    sc->upvalue_symbols   = NULL;
+    sc->upvalue_count     = 0;
+    sc->upvalue_capacity  = 0;
     ctx->scope_count++;
+}
+
+static void ctx_push_scope(Ctx* ctx)
+{
+    ctx_push_scope_ex(ctx, /*is_function_frame=*/false);
+}
+
+static void ctx_push_function_frame(Ctx* ctx)
+{
+    ctx_push_scope_ex(ctx, /*is_function_frame=*/true);
 }
 
 static void ctx_pop_scope(Ctx* ctx)
@@ -160,16 +200,26 @@ static void ctx_pop_scope(Ctx* ctx)
     // Roll visibility back so symbols declared in the popped scope are
     // no longer findable by ctx_lookup. The symbols remain in
     // `table->symbols` for consumers to read out after the walk.
-    ctx->visible_end = ctx->scopes[ctx->scope_count - 1].base;
+    Scope* sc = &ctx->scopes[ctx->scope_count - 1];
+    if (sc->is_function_frame && sc->upvalue_origins != NULL) {
+        FREE_ARRAY(ctx->vm, int, sc->upvalue_origins, sc->upvalue_capacity);
+        FREE_ARRAY(ctx->vm, int, sc->upvalue_symbols, sc->upvalue_capacity);
+        sc->upvalue_origins  = NULL;
+        sc->upvalue_symbols  = NULL;
+    }
+    ctx->visible_end = sc->base;
     ctx->scope_count--;
 }
 
 // Innermost-first lookup for an identifier-use: walks scopes from the
 // deepest open scope down to the top-level and scans for a symbol
 // whose `name` matches `nm`. Returns the symbol index, or -1 if no
-// match is in scope.
-static int ctx_lookup(const Ctx* ctx, const Token* nm)
+// match is in scope. When `out_scope_idx` is non-NULL, also yields
+// the scopes[] index where the symbol was found (needed by 4.1d's
+// capture logic to count crossed function frames).
+static int ctx_lookup_ex(const Ctx* ctx, const Token* nm, int* out_scope_idx)
 {
+    if (out_scope_idx) *out_scope_idx = -1;
     if (nm == NULL || nm->length <= 0) return -1;
     const char* nb = lookup_name_bytes(ctx->vm, nm);
     if (nb == NULL) return -1;
@@ -193,11 +243,17 @@ static int ctx_lookup(const Ctx* ctx, const Token* nm)
                 sy->kind == SYMBOL_KIND_VARIANT) continue;
             if (sy->name_length == need && sy->name != NULL &&
                 memcmp(sy->name, nb, (size_t)need) == 0) {
+                if (out_scope_idx) *out_scope_idx = s;
                 return i;
             }
         }
     }
     return -1;
+}
+
+static int ctx_lookup(const Ctx* ctx, const Token* nm)
+{
+    return ctx_lookup_ex(ctx, nm, NULL);
 }
 
 // -----------------------------------------------------------------------------
@@ -243,6 +299,138 @@ static int emit_param(Ctx* ctx, const Token* nm)
     int idx = push_symbol(ctx->vm, ctx->table, s);
     ctx->visible_end = ctx->table->count;
     return idx;
+}
+
+// 4.1d: emit a new UPVALUE symbol into the given function frame scope,
+// with parent_index linking to the origin (either the ultimate
+// LOCAL/PARAM declaration, or the previous-level UPVALUE for transitive
+// captures). Does NOT bump visible_end — upvalues are resolved via the
+// scope's dedup map, not through name-walks. scope_depth is set to the
+// function frame's depth so hosts can tell which function owns the
+// capture.
+static int emit_upvalue_into_scope(Ctx* ctx, int frame_scope_idx,
+                                   const Token* nm, int parent_origin_idx)
+{
+    if (nm == NULL || nm->length <= 0) return -1;
+    Symbol s;
+    s.kind                  = SYMBOL_KIND_UPVALUE;
+    s.name                  = lookup_name_bytes(ctx->vm, nm);
+    s.name_length           = nm->length;
+    s.name_file_id          = nm->fileId;
+    s.name_start_byte       = nm->startByte;
+    s.def_span.fileId       = nm->fileId;
+    s.def_span.startByte    = nm->startByte;
+    s.def_span.length       = nm->length;
+    s.def_span.startLine    = nm->startLine;
+    s.def_span.startColumn  = nm->startColumn;
+    s.def_span.endLine      = nm->endLine;
+    s.def_span.endColumn    = nm->endColumn;
+    s.scope_depth           = ctx->scopes[frame_scope_idx].depth;
+    s.parent_index          = parent_origin_idx;
+    return push_symbol(ctx->vm, ctx->table, s);
+}
+
+// 4.1d: look in frame scope's dedup map for an existing upvalue whose
+// parent_index matches the given origin. Returns the upvalue symbol idx
+// or -1 if not yet synthesized.
+static int find_upvalue_in_frame(const Ctx* ctx, int frame_scope_idx, int origin_idx)
+{
+    const Scope* sc = &ctx->scopes[frame_scope_idx];
+    for (int i = 0; i < sc->upvalue_count; i++) {
+        if (sc->upvalue_origins[i] == origin_idx) {
+            return sc->upvalue_symbols[i];
+        }
+    }
+    return -1;
+}
+
+// 4.1d: record the (origin -> upvalue) mapping in a function frame's
+// dedup map. Grows the map on demand via the VM allocator.
+static void record_upvalue_in_frame(Ctx* ctx, int frame_scope_idx,
+                                    int origin_idx, int upvalue_idx)
+{
+    Scope* sc = &ctx->scopes[frame_scope_idx];
+    if (sc->upvalue_count + 1 > sc->upvalue_capacity) {
+        int old_cap = sc->upvalue_capacity;
+        int new_cap = (old_cap < 4) ? 4 : old_cap * 2;
+        sc->upvalue_origins = GROW_ARRAY(ctx->vm, int, sc->upvalue_origins, old_cap, new_cap);
+        sc->upvalue_symbols = GROW_ARRAY(ctx->vm, int, sc->upvalue_symbols, old_cap, new_cap);
+        sc->upvalue_capacity = new_cap;
+    }
+    sc->upvalue_origins[sc->upvalue_count] = origin_idx;
+    sc->upvalue_symbols[sc->upvalue_count] = upvalue_idx;
+    sc->upvalue_count++;
+}
+
+// 4.1d: given an origin lookup that crossed function frames, synthesize
+// (or reuse) an UPVALUE symbol in each crossed function frame, chaining
+// parent_index from the origin outward to the innermost use site.
+// Mirrors `compiler.c`'s recursive `resolve_upvalue`: the outermost
+// crossed frame captures the origin directly (is_local=true); each
+// inner frame re-captures the previous frame's upvalue
+// (is_local=false). Returns the innermost upvalue symbol index that
+// the use site should bind to; returns `origin_idx` unchanged when no
+// function frames were crossed.
+//
+// `origin_scope_idx` is the scope where the origin lives;
+// `use_scope_idx` is the current (innermost) scope at the use site.
+static int synthesize_upvalue_chain(Ctx* ctx, const Token* nm,
+                                    int origin_idx,
+                                    int origin_scope_idx,
+                                    int use_scope_idx)
+{
+    if (origin_idx < 0) return -1;
+    // Collect the function-frame scopes strictly between origin and use
+    // (i.e. scopes s where origin_scope_idx < s <= use_scope_idx AND
+    // s is a function frame), outermost-first.
+    int frames[MAX_SCOPES];
+    int frame_count = 0;
+    for (int s = origin_scope_idx + 1; s <= use_scope_idx; s++) {
+        if (ctx->scopes[s].is_function_frame) {
+            if (frame_count < MAX_SCOPES) frames[frame_count++] = s;
+        }
+    }
+    if (frame_count == 0) return origin_idx;  // no capture needed
+
+    // Only capturable kinds traverse the upvalue chain. Globals
+    // (VAR/FUNC/STRUCT/ENUM at scope_depth 0) and nested func names
+    // are resolved through ordinary name lookup at the use site;
+    // compiler.c would fall through to global resolution for them.
+    const Symbol* origin = &ctx->table->symbols[origin_idx];
+    if (origin->kind != SYMBOL_KIND_LOCAL &&
+        origin->kind != SYMBOL_KIND_PARAM &&
+        origin->kind != SYMBOL_KIND_UPVALUE) {
+        return origin_idx;
+    }
+
+    int prev_idx = origin_idx;
+    for (int i = 0; i < frame_count; i++) {
+        int frame_sc = frames[i];
+        int existing = find_upvalue_in_frame(ctx, frame_sc, prev_idx);
+        if (existing >= 0) {
+            prev_idx = existing;
+            continue;
+        }
+        int upv = emit_upvalue_into_scope(ctx, frame_sc, nm, prev_idx);
+        if (upv < 0) return origin_idx;  // synthesis failure: fall back
+        record_upvalue_in_frame(ctx, frame_sc, prev_idx, upv);
+        prev_idx = upv;
+    }
+    return prev_idx;
+}
+
+// 4.1d: name resolution for a capturable use site. Looks up the name,
+// and if it crossed function frames to reach a capturable origin,
+// synthesizes/reuses the upvalue chain and returns the innermost
+// upvalue symbol index. Returns the origin directly when no capture
+// is needed (same-frame use, or origin is a global/struct/enum/func).
+static int resolve_name_with_capture(Ctx* ctx, const Token* nm)
+{
+    int origin_scope = -1;
+    int origin_idx = ctx_lookup_ex(ctx, nm, &origin_scope);
+    if (origin_idx < 0) return -1;
+    int use_scope = ctx->scope_count - 1;
+    return synthesize_upvalue_chain(ctx, nm, origin_idx, origin_scope, use_scope);
 }
 
 // Phase 4.1c: emit one FIELD or VARIANT child symbol. Children are
@@ -353,7 +541,7 @@ static void walk_assign_target(Ctx* ctx, const Expr* target)
     switch (target->type) {
         case EXPR_VARIABLE: {
             const Token* nm = &target->as.variable.name;
-            int idx = ctx_lookup(ctx, nm);
+            int idx = resolve_name_with_capture(ctx, nm);
             record_ref(ctx, nm, /*is_write=*/true, idx);
             return;
         }
@@ -380,7 +568,7 @@ static void walk_expr(Ctx* ctx, const Expr* e)
     switch (e->type) {
         case EXPR_VARIABLE: {
             const Token* nm = &e->as.variable.name;
-            int idx = ctx_lookup(ctx, nm);
+            int idx = resolve_name_with_capture(ctx, nm);
             record_ref(ctx, nm, /*is_write=*/false, idx);
             break;
         }
@@ -433,8 +621,9 @@ static void walk_expr(Ctx* ctx, const Expr* e)
             }
             break;
         case EXPR_FUNCTION: {
-            // Anonymous function — params form a new scope.
-            ctx_push_scope(ctx);
+            // Anonymous function — a real function frame so outer
+            // locals captured here become UPVALUE symbols (Phase 4.1d).
+            ctx_push_function_frame(ctx);
             for (int i = 0; i < e->as.function.param_count; i++) {
                 emit_param(ctx, &e->as.function.params[i].name);
             }
@@ -548,11 +737,12 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
             break;
         }
         case STMT_FUNC_DECLARATION: {
-            // The function name is declared in the enclosing scope;
-            // params + body live in a fresh inner scope.
+            // Function name is declared in the enclosing scope; params
+            // + body live in a fresh function frame (Phase 4.1d) so
+            // references to outer locals become UPVALUE symbols.
             SymbolKind fn_kind = SYMBOL_KIND_FUNC;
             emit_decl(ctx, fn_kind, &s->as.func_declaration.name, s);
-            ctx_push_scope(ctx);
+            ctx_push_function_frame(ctx);
             for (int i = 0; i < s->as.func_declaration.param_count; i++) {
                 emit_param(ctx, &s->as.func_declaration.params[i].name);
             }
