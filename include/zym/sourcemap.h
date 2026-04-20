@@ -35,8 +35,24 @@ typedef int ZymFileId;
 ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
                                  const char* bytes, size_t length);
 
+// Read-only view onto a previously registered source file. `path` and
+// `bytes` are borrowed from the registry and remain valid until the
+// corresponding compile completes (after which they may be reset).
+typedef struct ZymSourceFileInfo {
+    ZymFileId   id;
+    const char* path;   // may be NULL for synthetic/unnamed buffers
+    const char* bytes;  // may be NULL if the registry was reset
+    size_t      length;
+} ZymSourceFileInfo;
+
+// Resolves `fileId` back to the registered buffer + path. Returns true on
+// success; returns false (and leaves *out untouched) if the id is invalid
+// or out of range. Primarily used by diagnostic renderers to fetch the
+// source line for a caret display.
+int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out);
+
 // Lifecycle for an opaque SourceMap handle. A SourceMap is populated by
-// `zym_preprocessEx()` and consumed by `zym_compileEx()`; embedders
-// should pair each `zym_newSourceMap` with a `zym_freeSourceMap`.
+// `zym_preprocess()` and consumed by `zym_compile()`; embedders should
+// pair each `zym_newSourceMap` with a `zym_freeSourceMap`.
 ZymSourceMap* zym_newSourceMap(ZymVM* vm);
 void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map);

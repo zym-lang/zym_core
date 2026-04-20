@@ -53,6 +53,7 @@ static Stmt* parse_declaration(Parser* parser);
 static Expr* parse_expression(Parser* parser);
 static const ParseRule* get_rule(TokenType type);
 static void error_at_current(Parser* parser, const char* message);
+static void error_at_previous(Parser* parser, const char* message);
 static void advance(Parser* parser);
 static void consume(Parser* parser, TokenType type, const char* message);
 static bool match(Parser* parser, TokenType type);
@@ -141,49 +142,41 @@ static void error_at_current(Parser* parser, const char* message) {
     parser->panic_mode = true;
     parser->had_error = true;
 
-    int line = parser->current.line;
-
-    // Build the fully formatted message: "[file] line N at 'tok': <msg>"
-    // pushDiagnostic() duplicates the buffer into its own storage.
-    char buf[1280];
-    int pos = 0;
-
-    if (parser->current_module_name) {
-        char* decoded = decodeModulePath(&parser->vm->allocator,
-                                         parser->current_module_name,
-                                         parser->module_name_length);
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "[%s] line %d", decoded, line);
-        ZYM_FREE(&parser->vm->allocator, decoded, parser->module_name_length + 1);
-    } else {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "[line %d]", line);
-    }
-
-    if (parser->current.type == TOKEN_EOF) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, " at end");
-    } else if (parser->current.type != TOKEN_ERROR) {
-        if (parser->current.start != NULL && parser->current.length > 0) {
-            const int MAX_TOKEN_DISPLAY = 40;
-            if (parser->current.length <= MAX_TOKEN_DISPLAY) {
-                pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                " at '%.*s'", parser->current.length, parser->current.start);
-            } else {
-                pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                " at '%.*s...'", MAX_TOKEN_DISPLAY, parser->current.start);
-            }
-        }
-    }
-
-    pos += snprintf(buf + pos, sizeof(buf) - pos, ": %s", message);
-    (void)pos;
-
+    // Phase 1.7: the diagnostic sink already carries fileId, byte span,
+    // line, and column; the presentation layer (CLI / LSP / docs) is
+    // responsible for turning those fields into "[file] line N at 'tok':"
+    // headers or rustc-style carets. The message field is now just the
+    // bare sentence, e.g. "Expect expression.".
     pushDiagnostic(parser->vm,
                    ZYM_DIAG_ERROR,
                    parser->current.fileId,
                    parser->current.startByte,
                    parser->current.length,
-                   line,
+                   parser->current.line,
                    parser->current.startColumn,
-                   "%s", buf);
+                   "%s", message ? message : "");
+}
+
+// Reports a diagnostic at `parser->previous` — used when advance() has
+// already consumed the offending token by the time we discover the error
+// (e.g. the no-prefix-rule path of parse_precedence, where `previous` is
+// the token that cannot begin an expression and `current` is whatever
+// followed it). Using `current` there makes the caret land on the next
+// statement, which is the behavior the recovery fixtures were exhibiting
+// before this helper existed.
+static void error_at_previous(Parser* parser, const char* message) {
+    if (parser->panic_mode) return;
+    parser->panic_mode = true;
+    parser->had_error = true;
+
+    pushDiagnostic(parser->vm,
+                   ZYM_DIAG_ERROR,
+                   parser->previous.fileId,
+                   parser->previous.startByte,
+                   parser->previous.length,
+                   parser->previous.line,
+                   parser->previous.startColumn,
+                   "%s", message ? message : "");
 }
 
 static void consume(Parser* parser, TokenType type, const char* message) {
@@ -273,7 +266,10 @@ static Expr* parse_precedence(Parser* parser, Precedence precedence) {
     advance(parser);
     PrefixParseFn prefix_rule = get_rule(parser->previous.type)->prefix;
     if (prefix_rule == NULL) {
-        error_at_current(parser, "Expect expression.");
+        // advance() already consumed the offending token; report at
+        // `previous` so the caret lands on it rather than on the next
+        // statement's first token.
+        error_at_previous(parser, "Expect expression.");
         return NULL;
     }
     bool can_assign = precedence <= PREC_ASSIGNMENT;
@@ -318,7 +314,10 @@ static Expr* grouping(Parser* parser, bool can_assign) {
 
             return new_function_expr(parser->vm, NULL, 0, 0, body, paren);
         }
-        error_at_current(parser, "Expect expression.");
+        // In `()` not followed by `=>`, `previous` is the `)` we just
+        // consumed; reporting there makes the caret land on the empty
+        // parens rather than on whatever token followed them.
+        error_at_previous(parser, "Expect expression.");
         return NULL;
     }
 

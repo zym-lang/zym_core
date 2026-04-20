@@ -141,6 +141,18 @@ ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
     return sfr_register(vm, &vm->source_files, path, bytes, length);
 }
 
+int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out)
+{
+    if (vm == NULL || out == NULL) return 0;
+    const SourceFile* sf = sfr_get(&vm->source_files, fileId);
+    if (sf == NULL) return 0;
+    out->id     = sf->id;
+    out->path   = sf->path;
+    out->bytes  = sf->bytes;
+    out->length = sf->length;
+    return 1;
+}
+
 ZymSourceMap* zym_newSourceMap(ZymVM* vm)
 {
     if (vm == NULL) return NULL;
@@ -502,6 +514,12 @@ ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
 {
     (void)vm; (void)path; (void)bytes; (void)length;
     return ZYM_FILE_ID_INVALID;
+}
+
+int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out)
+{
+    (void)vm; (void)fileId; (void)out;
+    return 0;
 }
 
 ZymSourceMap* zym_newSourceMap(ZymVM* vm) { (void)vm; return NULL; }

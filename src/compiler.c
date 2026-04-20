@@ -141,18 +141,11 @@ static void compiler_error_emit(Compiler* compiler, const Token* tok, int line,
                                 const char* format, va_list args) {
     compiler->has_error = true;
 
+    // Phase 1.7: the sink carries fileId/byte-span/line/column as fields;
+    // presentation (CLI / LSP) builds "[file] line N: ..." headers from
+    // those. The message is now just the bare sentence.
     char msg_buf[1024];
     vsnprintf(msg_buf, sizeof(msg_buf), format, args);
-
-    char full_buf[1280];
-    if (compiler->current_module_name) {
-        snprintf(full_buf, sizeof(full_buf), "[%.*s] line %d: %s",
-                 compiler->current_module_name->length,
-                 compiler->current_module_name->chars,
-                 line, msg_buf);
-    } else {
-        snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
-    }
 
     ZymFileId fileId = tok ? tok->fileId : ZYM_FILE_ID_INVALID;
     int startByte    = tok ? tok->startByte : -1;
@@ -163,7 +156,7 @@ static void compiler_error_emit(Compiler* compiler, const Token* tok, int line,
                    ZYM_DIAG_ERROR,
                    fileId, startByte, length,
                    line, column,
-                   "%s", full_buf);
+                   "%s", msg_buf);
 }
 
 static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
