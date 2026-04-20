@@ -1,6 +1,7 @@
 #pragma once
 
 #include "./parser.h"
+#include "./parse_tree.h"
 #include "./chunk.h"
 #include "./sourcemap.h"
 #include "./config.h"
@@ -164,6 +165,18 @@ typedef struct Compiler {
 // uses it to resolve each token's mapped line number and origin{FileId,
 // StartByte,Length} fields. Pass `NULL` only when scanning a raw
 // unpreprocessed buffer (tests, debugging).
+//
+// `out_tree` is the Phase 2 retained-parse-tree out-parameter:
+//   - Pass NULL to keep today's behavior: the AST is walked for
+//     codegen and freed at the end of compile().
+//   - When ZYM_HAS_PARSE_TREE_RETENTION is 1 and `out_tree` is
+//     non-NULL, the AST is handed off into a heap-allocated
+//     ZymParseTree that the caller must release via parse_tree_free()
+//     (public: zym_freeParseTree). On failure *out_tree is set to NULL.
+//   - When ZYM_HAS_PARSE_TREE_RETENTION is 0, `out_tree` is ignored
+//     (the parameter still exists for ABI uniformity but the AST is
+//     always freed at the end of compile()).
 bool compile(VM* vm, const char* source, Chunk* chunk,
              const SourceMap* source_map,
-             const char* entry_file, CompilerConfig config);
+             const char* entry_file, CompilerConfig config,
+             ZymParseTree** out_tree);

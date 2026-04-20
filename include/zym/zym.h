@@ -25,6 +25,7 @@ typedef uint64_t ZymValue;
 
 #include "zym/sourcemap.h"
 #include "zym/diagnostics.h"
+#include "zym/frontend.h"
 
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
 #define ZYM_ERROR ((ZymValue)0x7ff8000000000005ULL)
@@ -87,9 +88,20 @@ void zym_freeProcessedSource(ZymVM* vm, const char* processedSource);
 // Compile `source` into `chunk`. `source_map`, when non-NULL, is the
 // per-expanded-line origin table produced by `zym_preprocess`. Pass
 // NULL only when compiling raw unpreprocessed text.
+//
+// `out_tree` is the Phase 2 retained-parse-tree out-parameter.
+// Pass NULL unless you want the AST handed back to you:
+//   - Retention ON (ZYM_HAS_PARSE_TREE_RETENTION=1) + non-NULL out_tree +
+//     compile succeeded: *out_tree receives a ZymParseTree* that the
+//     caller owns and must release via zym_freeParseTree.
+//   - Any other case: *out_tree is set to NULL and today's behavior
+//     (AST freed at end of compile) applies.
+// The parameter is accepted unconditionally so host code compiles
+// against either build profile; pass NULL on MCU builds.
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
                       const ZymSourceMap* source_map,
-                      const char* entry_file, ZymCompilerConfig config);
+                      const char* entry_file, ZymCompilerConfig config,
+                      ZymParseTree** out_tree);
 
 // =============================================================================
 // COOPERATIVE CANCELLATION (Phase 1.5)

@@ -1282,10 +1282,14 @@ static Stmt* parse_return_statement(Parser* parser) {
     return new_return_stmt(parser->vm, keyword, value);
 }
 AstResult parse(VM* vm, const char* source, const SourceMap* source_map,
-                const char* entry_file, ZymFileId file_id) {
+                const char* entry_file, ZymFileId file_id,
+                TriviaBuffer* trivia) {
     Parser parser;
     parser.vm = vm;
     initScanner(&parser.scanner, source, source_map, file_id);
+    if (trivia != NULL) {
+        scannerAttachTrivia(&parser.scanner, vm, trivia);
+    }
     parser.had_error = false;
     parser.panic_mode = false;
 

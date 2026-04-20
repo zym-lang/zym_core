@@ -13,6 +13,8 @@
 #include "gc.h"
 #include "./native.h"
 #include "./diagnostics.h"
+#include "./trivia.h"
+#include "./parse_tree.h"
 
 #define OPCODE(i) ((i) & 0xFF)
 
@@ -4482,7 +4484,9 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
 bool compile(VM* vm, const char* source, Chunk* chunk,
              const SourceMap* source_map,
-             const char* entry_file, CompilerConfig config) {
+             const char* entry_file, CompilerConfig config,
+             ZymParseTree** out_tree) {
+    if (out_tree) *out_tree = NULL;
     // Phase 1.1: register the preprocessed source buffer with the VM's
     // SourceFileRegistry so scanner tokens can refer back to it by
     // ZymFileId. The registry is reset before this compile starts so each
@@ -4493,8 +4497,25 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
     size_t source_length = source != NULL ? strlen(source) : 0;
     ZymFileId file_id = sfr_register(vm, &vm->source_files, entry_file, source, source_length);
 
-    AstResult ast = parse(vm, source, source_map, entry_file, file_id);
-    if (ast.statements == NULL) return false;
+    // Phase 2.3: allocate a trivia side buffer iff the caller asked for
+    // a retained parse tree and the build has PARSE_TREE_RETENTION on.
+    // Otherwise `trivia` stays NULL and the scanner records nothing.
+    TriviaBuffer* trivia = NULL;
+#if ZYM_HAS_PARSE_TREE_RETENTION
+    if (out_tree != NULL) {
+        trivia = ALLOCATE(vm, TriviaBuffer, 1);
+        trivia_init(trivia);
+    }
+#endif
+
+    AstResult ast = parse(vm, source, source_map, entry_file, file_id, trivia);
+    if (ast.statements == NULL) {
+        if (trivia != NULL) {
+            trivia_free(vm, trivia);
+            FREE(vm, TriviaBuffer, trivia);
+        }
+        return false;
+    }
 
     // Use init_compiler to set up the top-level compiler correctly.
     Compiler compiler = {0};  // Zero-initialize to prevent garbage values during GC
@@ -4657,9 +4678,29 @@ cleanup_on_error:
     // We don't manually free it here - the GC will handle cleanup
     // Manually freeing it would cause a double-free during freeVM()
 
-    // Free the AST
-    for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
-    FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+    // AST lifetime (Phase 2.1 / 2.2):
+    //   - Retention ON + caller requested retention + compile succeeded:
+    //       hand the AST off into a heap-allocated ZymParseTree; the
+    //       caller owns the lifetime and must release via
+    //       zym_freeParseTree / parse_tree_free.
+    //   - All other paths (retention disabled at compile time, caller
+    //       passed NULL out_tree, or compile failed): today's behavior —
+    //       walk the AST, free every node, free the root array.
+#if ZYM_HAS_PARSE_TREE_RETENTION
+    if (success && out_tree != NULL) {
+        *out_tree = parse_tree_new(vm, ast, file_id, trivia);
+        trivia = NULL; // ownership transferred to the tree
+    } else
+#endif
+    {
+        for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
+        FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+        if (trivia != NULL) {
+            trivia_free(vm, trivia);
+            FREE(vm, TriviaBuffer, trivia);
+            trivia = NULL;
+        }
+    }
 
     // Deep copy the compiled chunk to the external chunk parameter
     // We compiled into compiler.function->chunk, but caller expects results in chunk parameter

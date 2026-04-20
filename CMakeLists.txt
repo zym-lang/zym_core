@@ -58,6 +58,9 @@ if(NOT ZYM_RUNTIME_ONLY)
         src/preprocessor.c
         src/ast.c
         src/parser.c
+        src/parse_tree.c
+        src/node_span.c
+        src/trivia.c
         src/compiler.c
         src/debug.c
         src/module_loader.c

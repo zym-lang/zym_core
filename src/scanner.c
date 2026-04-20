@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "./trivia.h"
+
 void initScanner(Scanner* scanner, const char* source,
                  const SourceMap* source_map, ZymFileId file_id) {
     scanner->base = source;
@@ -17,6 +19,16 @@ void initScanner(Scanner* scanner, const char* source,
     scanner->current_column = 1;
     scanner->line = 1;
     scanner->source_map = source_map;
+    scanner->trivia = NULL;
+    scanner->vm = NULL;
+}
+
+// Phase 2.3: opt-in trivia capture. Callers that want doc-comments /
+// folding / hover attach a TriviaBuffer (owned by the parse tree). The
+// scanner records into it via trivia_append from skipWhitespace().
+void scannerAttachTrivia(Scanner* scanner, VM* vm, TriviaBuffer* trivia) {
+    scanner->trivia = trivia;
+    scanner->vm = vm;
 }
 
 bool isAlpha(char c) {
@@ -159,6 +171,28 @@ static Token errorToken(Scanner* scanner, const char* message) {
     return token;
 }
 
+// Snapshot the scanner's current position as a starting point for a
+// trivia piece. Used below where a comment begins.
+static void triviaSnapshot(const Scanner* s, int* out_byte, int* out_line, int* out_col) {
+    *out_byte = (int)(s->current - s->base);
+    *out_line = s->current_line;
+    *out_col  = s->current_column;
+}
+
+static void triviaRecord(Scanner* s, TriviaKind kind,
+                         int start_byte, int start_line, int start_col) {
+    if (s->trivia == NULL || s->vm == NULL) return;
+    int end_byte = (int)(s->current - s->base);
+    TriviaPiece p;
+    p.kind = kind;
+    p.fileId = s->file_id;
+    p.startByte = start_byte;
+    p.length = end_byte - start_byte;
+    p.startLine = start_line;
+    p.startColumn = start_col;
+    trivia_append(s->vm, s->trivia, &p);
+}
+
 static void skipWhitespace(Scanner* scanner) {
     for (;;) {
         char c = peek(scanner);
@@ -167,20 +201,54 @@ static void skipWhitespace(Scanner* scanner) {
             case '\r':
             case '\t':
             case '\n':
+                // Whitespace is intentionally not recorded; see trivia.h
+                // for the rationale (reconstructable from adjacent token
+                // gaps, would dominate retained-tree footprint).
                 advance(scanner);
                 break;
             case '/':
                 if (peekNext(scanner) == '/') {
+                    int sb, sl, sc;
+                    triviaSnapshot(scanner, &sb, &sl, &sc);
+                    // consume the two slashes
+                    advance(scanner);
+                    advance(scanner);
+                    // `///` is a doc line comment; `//` is a plain
+                    // comment. `////` (and longer) is treated as a
+                    // plain comment — matches Rust/Swift convention.
+                    TriviaKind kind = TRIVIA_COMMENT_LINE;
+                    if (peek(scanner) == '/' && peekNext(scanner) != '/') {
+                        advance(scanner); // consume the third /
+                        kind = TRIVIA_DOC_LINE;
+                    }
                     while (peek(scanner) != '\n' && !isAtEnd(scanner)) advance(scanner);
+                    triviaRecord(scanner, kind, sb, sl, sc);
                 } else if (peekNext(scanner) == '*') {
-                    advance(scanner);
-                    advance(scanner);
+                    int sb, sl, sc;
+                    triviaSnapshot(scanner, &sb, &sl, &sc);
+                    advance(scanner); // '/'
+                    advance(scanner); // '*'
+                    // `/**` starts a doc block (provided it's not the
+                    // empty `/**/`); `/*` is a plain block comment.
+                    TriviaKind kind = TRIVIA_COMMENT_BLOCK;
+                    if (peek(scanner) == '*' && peekNext(scanner) != '/') {
+                        // Leading '*' belongs to the doc marker; leave
+                        // it in place — downstream trivia consumers
+                        // strip the prefix themselves.
+                        kind = TRIVIA_DOC_BLOCK;
+                    }
                     while (!(peek(scanner) == '*' && peekNext(scanner) == '/')) {
-                        if (isAtEnd(scanner)) return;
+                        if (isAtEnd(scanner)) {
+                            // Unterminated block comment: still record
+                            // what we have so tooling can surface it.
+                            triviaRecord(scanner, kind, sb, sl, sc);
+                            return;
+                        }
                         advance(scanner);
                     }
-                    advance(scanner);
-                    advance(scanner);
+                    advance(scanner); // '*'
+                    advance(scanner); // '/'
+                    triviaRecord(scanner, kind, sb, sl, sc);
                 } else {
                     return;
                 }

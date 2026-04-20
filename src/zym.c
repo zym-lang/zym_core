@@ -9,6 +9,9 @@
 #ifndef ZYM_RUNTIME_ONLY
 #include "./preprocessor.h"
 #include "./compiler.h"
+#include "./parse_tree.h"
+#include "./node_span.h"
+#include "./trivia.h"
 #include "./sourcemap.h"
 #include "./source_file.h"
 #endif
@@ -178,12 +181,318 @@ void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
 
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
                       const ZymSourceMap* source_map,
-                      const char* entry_file, ZymCompilerConfig config)
+                      const char* entry_file, ZymCompilerConfig config,
+                      ZymParseTree** out_tree)
 {
+    if (out_tree) *out_tree = NULL;
     if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
-    bool success = compile(vm, source, chunk, source_map, entry_file, config);
+    bool success = compile(vm, source, chunk, source_map, entry_file, config, out_tree);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
+
+#if ZYM_HAS_PARSE_TREE_RETENTION
+void zym_freeParseTree(ZymVM* vm, ZymParseTree* tree)
+{
+    parse_tree_free(vm, tree);
+}
+
+// Phase 2.3 trivia accessors. `ZymTrivia` / `ZymTriviaKind` are the
+// public mirrors of the internal `TriviaPiece` / `TriviaKind`; the
+// enum values are kept 1:1 so this is a field-wise copy, not a
+// translation.
+static void trivia_piece_to_public(const TriviaPiece* src, ZymTrivia* dst)
+{
+    dst->kind        = (ZymTriviaKind)src->kind;
+    dst->fileId      = src->fileId;
+    dst->startByte   = src->startByte;
+    dst->length      = src->length;
+    dst->startLine   = src->startLine;
+    dst->startColumn = src->startColumn;
+}
+
+int zym_parseTreeTriviaCount(const ZymParseTree* tree)
+{
+    if (tree == NULL || tree->trivia == NULL) return 0;
+    return tree->trivia->count;
+}
+
+bool zym_parseTreeTriviaAt(const ZymParseTree* tree, int i, ZymTrivia* out)
+{
+    if (out == NULL) return false;
+    if (tree == NULL || tree->trivia == NULL) return false;
+    if (i < 0 || i >= tree->trivia->count) return false;
+    trivia_piece_to_public(&tree->trivia->pieces[i], out);
+    return true;
+}
+
+bool zym_parseTreeTriviaFindAt(const ZymParseTree* tree,
+                               int byteOffset, ZymTrivia* out)
+{
+    if (out == NULL) return false;
+    if (tree == NULL || tree->trivia == NULL) return false;
+    const TriviaPiece* p = trivia_find_at(tree->trivia, byteOffset);
+    if (p == NULL) return false;
+    trivia_piece_to_public(p, out);
+    return true;
+}
+
+// Phase 2.4 — top-level node span accessors. Thin wrappers over the
+// internal `nodeSpanOfStmt` helper; the richer query API (Phase 2.5)
+// will expose node spans for arbitrary depths.
+// AstResult stores `capacity` (the backing buffer size) and terminates
+// the valid-stmt range with a NULL sentinel (see parse() in parser.c).
+// We count up to the first NULL to report the *real* number of parsed
+// top-level statements.
+static int parse_tree_real_count(const ZymParseTree* tree)
+{
+    if (tree == NULL || tree->ast.statements == NULL) return 0;
+    int cap = tree->ast.capacity;
+    int n = 0;
+    while (n < cap && tree->ast.statements[n] != NULL) n++;
+    return n;
+}
+
+int zym_parseTreeTopLevelCount(const ZymParseTree* tree)
+{
+    return parse_tree_real_count(tree);
+}
+
+bool zym_parseTreeTopLevelSpan(const ZymParseTree* tree, int i, ZymSpan* out)
+{
+    if (out == NULL || tree == NULL) return false;
+    int n = parse_tree_real_count(tree);
+    if (i < 0 || i >= n) return false;
+    Stmt* stmt = tree->ast.statements[i];
+    *out = nodeSpanOfStmt(stmt);
+    return true;
+}
+// =====================================================================
+// Phase 2.5 — Query API implementation
+// =====================================================================
+static ZymNodeKind stmt_to_node_kind(const Stmt* s)
+{
+    switch (s->type) {
+        case STMT_EXPRESSION:         return ZYM_NODE_EXPRESSION;
+        case STMT_VAR_DECLARATION:    return ZYM_NODE_VAR_DECL;
+        case STMT_BLOCK:              return ZYM_NODE_BLOCK;
+        case STMT_IF:                 return ZYM_NODE_IF;
+        case STMT_WHILE:              return ZYM_NODE_WHILE;
+        case STMT_DO_WHILE:           return ZYM_NODE_DO_WHILE;
+        case STMT_FOR:                return ZYM_NODE_FOR;
+        case STMT_BREAK:              return ZYM_NODE_BREAK;
+        case STMT_CONTINUE:           return ZYM_NODE_CONTINUE;
+        case STMT_FUNC_DECLARATION:   return ZYM_NODE_FUNC_DECL;
+        case STMT_RETURN:             return ZYM_NODE_RETURN;
+        case STMT_COMPILER_DIRECTIVE: return ZYM_NODE_DIRECTIVE;
+        case STMT_STRUCT_DECLARATION: return ZYM_NODE_STRUCT_DECL;
+        case STMT_ENUM_DECLARATION:   return ZYM_NODE_ENUM_DECL;
+        case STMT_LABEL:              return ZYM_NODE_LABEL;
+        case STMT_GOTO:               return ZYM_NODE_GOTO;
+        case STMT_SWITCH:             return ZYM_NODE_SWITCH;
+        case STMT_ERROR:              return ZYM_NODE_ERROR;
+    }
+    return ZYM_NODE_UNKNOWN;
+}
+static void fill_node_info(const Stmt* s, ZymNodeInfo* info)
+{
+    info->kind           = stmt_to_node_kind(s);
+    info->span           = nodeSpanOfStmt(s);
+    info->nameFileId     = -1;
+    info->nameStartByte  = -1;
+    info->nameLength     = 0;
+    const Token* nm = NULL;
+    switch (s->type) {
+        case STMT_FUNC_DECLARATION:   nm = &s->as.func_declaration.name;    break;
+        case STMT_STRUCT_DECLARATION: nm = &s->as.struct_declaration.name;  break;
+        case STMT_ENUM_DECLARATION:   nm = &s->as.enum_declaration.name;    break;
+        case STMT_LABEL:              nm = &s->as.label.label_name;         break;
+        case STMT_VAR_DECLARATION:
+            if (s->as.var_declaration.count > 0) {
+                nm = &s->as.var_declaration.variables[0].name;
+            }
+            break;
+        default: break;
+    }
+    if (nm != NULL && nm->length > 0) {
+        info->nameFileId    = nm->fileId;
+        info->nameStartByte = nm->startByte;
+        info->nameLength    = nm->length;
+    }
+}
+static bool span_contains_offset(const ZymSpan* sp, int byteOffset)
+{
+    if (sp->fileId < 0 || sp->startByte < 0 || sp->length <= 0) return false;
+    return byteOffset >= sp->startByte &&
+           byteOffset <  sp->startByte + sp->length;
+}
+static bool is_block_bearing(StmtType t)
+{
+    switch (t) {
+        case STMT_BLOCK:
+        case STMT_IF:
+        case STMT_WHILE:
+        case STMT_DO_WHILE:
+        case STMT_FOR:
+        case STMT_FUNC_DECLARATION:
+        case STMT_STRUCT_DECLARATION:
+        case STMT_ENUM_DECLARATION:
+        case STMT_SWITCH:
+            return true;
+        default:
+            return false;
+    }
+}
+// Visit every *direct* statement child of `s` in source order.
+typedef void (*stmt_visitor_fn)(const Stmt* child, void* ctx);
+static void for_each_child_stmt(const Stmt* s,
+                                stmt_visitor_fn fn, void* ctx)
+{
+    if (s == NULL) return;
+    switch (s->type) {
+        case STMT_BLOCK:
+            for (int i = 0; i < s->as.block.count; i++) {
+                if (s->as.block.statements[i]) fn(s->as.block.statements[i], ctx);
+            }
+            break;
+        case STMT_IF:
+            if (s->as.if_stmt.then_branch) fn(s->as.if_stmt.then_branch, ctx);
+            if (s->as.if_stmt.else_branch) fn(s->as.if_stmt.else_branch, ctx);
+            break;
+        case STMT_WHILE:
+            if (s->as.while_stmt.body) fn(s->as.while_stmt.body, ctx);
+            break;
+        case STMT_DO_WHILE:
+            if (s->as.do_while_stmt.body) fn(s->as.do_while_stmt.body, ctx);
+            break;
+        case STMT_FOR:
+            if (s->as.for_stmt.initializer) fn(s->as.for_stmt.initializer, ctx);
+            if (s->as.for_stmt.body)        fn(s->as.for_stmt.body, ctx);
+            break;
+        case STMT_FUNC_DECLARATION:
+            if (s->as.func_declaration.body) fn(s->as.func_declaration.body, ctx);
+            break;
+        case STMT_SWITCH:
+            for (int i = 0; i < s->as.switch_stmt.case_count; i++) {
+                const CaseClause* c = &s->as.switch_stmt.cases[i];
+                for (int j = 0; j < c->statement_count; j++) {
+                    if (c->statements[j]) fn(c->statements[j], ctx);
+                }
+            }
+            break;
+        default: break;
+    }
+}
+// --- zymTreeFindNodeAt -------------------------------------------------
+typedef struct { int byteOffset; const Stmt* deepest; } FindCtx;
+static void find_visit(const Stmt* s, void* ctxp)
+{
+    FindCtx* ctx = (FindCtx*)ctxp;
+    ZymSpan sp = nodeSpanOfStmt(s);
+    if (!span_contains_offset(&sp, ctx->byteOffset)) return;
+    ctx->deepest = s;
+    for_each_child_stmt(s, find_visit, ctx);
+}
+bool zymTreeFindNodeAt(const ZymParseTree* tree, int byteOffset,
+                       ZymNodeInfo* out)
+{
+    if (tree == NULL || out == NULL) return false;
+    int n = parse_tree_real_count(tree);
+    FindCtx ctx = { byteOffset, NULL };
+    for (int i = 0; i < n; i++) {
+        find_visit(tree->ast.statements[i], &ctx);
+        if (ctx.deepest != NULL) break;  // top-level spans do not overlap
+    }
+    if (ctx.deepest == NULL) return false;
+    fill_node_info(ctx.deepest, out);
+    return true;
+}
+// --- zymTreeListTopLevelDeclarations -----------------------------------
+int zymTreeListTopLevelDeclarations(const ZymParseTree* tree,
+                                    ZymNodeInfo* out, int max_out)
+{
+    if (tree == NULL) return 0;
+    int n = parse_tree_real_count(tree);
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        const Stmt* s = tree->ast.statements[i];
+        if (s == NULL) continue;
+        switch (s->type) {
+            case STMT_VAR_DECLARATION:
+            case STMT_FUNC_DECLARATION:
+            case STMT_STRUCT_DECLARATION:
+            case STMT_ENUM_DECLARATION:
+                if (out != NULL && total < max_out) {
+                    fill_node_info(s, &out[total]);
+                }
+                total++;
+                break;
+            default: break;
+        }
+    }
+    return total;
+}
+// --- zymTreeEnclosingBlocks --------------------------------------------
+typedef struct {
+    int          byteOffset;
+    ZymNodeInfo* out;
+    int          max_out;
+    int          total;
+} EnclosingCtx;
+static void enclosing_visit(const Stmt* s, void* ctxp)
+{
+    EnclosingCtx* ctx = (EnclosingCtx*)ctxp;
+    ZymSpan sp = nodeSpanOfStmt(s);
+    if (!span_contains_offset(&sp, ctx->byteOffset)) return;
+    if (is_block_bearing(s->type)) {
+        if (ctx->out != NULL && ctx->total < ctx->max_out) {
+            fill_node_info(s, &ctx->out[ctx->total]);
+        }
+        ctx->total++;
+    }
+    for_each_child_stmt(s, enclosing_visit, ctx);
+}
+int zymTreeEnclosingBlocks(const ZymParseTree* tree, int byteOffset,
+                           ZymNodeInfo* out, int max_out)
+{
+    if (tree == NULL) return 0;
+    int n = parse_tree_real_count(tree);
+    EnclosingCtx ctx = { byteOffset, out, max_out, 0 };
+    for (int i = 0; i < n; i++) {
+        enclosing_visit(tree->ast.statements[i], &ctx);
+        if (ctx.total > 0) break;  // top-level spans do not overlap
+    }
+    return ctx.total;
+}
+// --- zymTreeFoldingRanges ----------------------------------------------
+typedef struct {
+    ZymNodeInfo* out;
+    int          max_out;
+    int          total;
+} FoldCtx;
+static void folding_visit(const Stmt* s, void* ctxp)
+{
+    FoldCtx* ctx = (FoldCtx*)ctxp;
+    if (s == NULL) return;
+    if (is_block_bearing(s->type)) {
+        if (ctx->out != NULL && ctx->total < ctx->max_out) {
+            fill_node_info(s, &ctx->out[ctx->total]);
+        }
+        ctx->total++;
+    }
+    for_each_child_stmt(s, folding_visit, ctx);
+}
+int zymTreeFoldingRanges(const ZymParseTree* tree,
+                         ZymNodeInfo* out, int max_out)
+{
+    if (tree == NULL) return 0;
+    int n = parse_tree_real_count(tree);
+    FoldCtx ctx = { out, max_out, 0 };
+    for (int i = 0; i < n; i++) {
+        folding_visit(tree->ast.statements[i], &ctx);
+    }
+    return ctx.total;
+}
+#endif
 
 #else
 
