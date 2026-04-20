@@ -559,6 +559,7 @@ bool zym_symbolTableSymbolAt(const ZymSymbolTable* table, int i,
     out->nameStartByte = s->name_start_byte;
     out->defSpan       = s->def_span;
     out->scopeDepth    = s->scope_depth;
+    out->parentIndex   = s->parent_index;
     return true;
 }
 
@@ -601,6 +602,7 @@ bool zym_symbolTableFindSymbolAt(const ZymSymbolTable* table,
         out->nameStartByte = s->name_start_byte;
         out->defSpan       = s->def_span;
         out->scopeDepth    = s->scope_depth;
+        out->parentIndex   = s->parent_index;
         return true;
     }
     return false;

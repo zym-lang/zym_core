@@ -52,7 +52,9 @@ typedef enum {
     SYMBOL_KIND_STRUCT,
     SYMBOL_KIND_ENUM,
     SYMBOL_KIND_PARAM,   // function parameter (4.1b)
-    SYMBOL_KIND_LOCAL    // block-scoped var declaration (4.1b)
+    SYMBOL_KIND_LOCAL,   // block-scoped var declaration (4.1b)
+    SYMBOL_KIND_FIELD,   // struct field (4.1c) — parent_index -> enclosing STRUCT
+    SYMBOL_KIND_VARIANT  // enum variant (4.1c) — parent_index -> enclosing ENUM
 } SymbolKind;
 
 // A single resolved declaration.
@@ -77,6 +79,10 @@ typedef struct {
     int         name_start_byte;
     ZymSpan     def_span;
     int         scope_depth;
+    // Phase 4.1c: for FIELD/VARIANT symbols, index into `symbols` of
+    // the enclosing STRUCT/ENUM declaration. -1 for all other kinds.
+    // Hosts use this to walk struct→field / enum→variant edges.
+    int         parent_index;
 } Symbol;
 
 // A single resolved (or attempted) identifier use.

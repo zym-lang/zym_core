@@ -282,7 +282,9 @@ typedef enum {
     ZYM_SYMBOL_STRUCT,
     ZYM_SYMBOL_ENUM,
     ZYM_SYMBOL_PARAM,   // function parameter (Phase 4.1b)
-    ZYM_SYMBOL_LOCAL    // block-scoped var declaration (Phase 4.1b)
+    ZYM_SYMBOL_LOCAL,   // block-scoped var declaration (Phase 4.1b)
+    ZYM_SYMBOL_FIELD,   // struct field (Phase 4.1c) — parentIndex -> enclosing STRUCT
+    ZYM_SYMBOL_VARIANT  // enum variant (Phase 4.1c) — parentIndex -> enclosing ENUM
 } ZymSymbolKind;
 
 // A single resolved declaration, copied out of the symbol table by
@@ -299,6 +301,9 @@ typedef struct {
     int           nameStartByte;
     ZymSpan       defSpan;
     int           scopeDepth;
+    // Phase 4.1c: for FIELD/VARIANT kinds, index into the symbol table
+    // of the enclosing STRUCT/ENUM declaration. -1 for all other kinds.
+    int           parentIndex;
 } ZymSymbolInfo;
 
 // Opaque handle to a symbol table produced by `zym_check`. Owned by

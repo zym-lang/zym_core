@@ -184,6 +184,13 @@ static int ctx_lookup(const Ctx* ctx, const Token* nm)
         // most-recently declared symbol wins on redeclaration.
         for (int i = end - 1; i >= base; i--) {
             const Symbol* sy = &table->symbols[i];
+            // Skip struct fields / enum variants: those are looked up
+            // through `find_child_by_name(parent, name)` on member
+            // access, never by a bare identifier. Including them in
+            // the plain scope walk would let e.g. `x` resolve to a
+            // `Point.x` field declared at the same scope depth.
+            if (sy->kind == SYMBOL_KIND_FIELD ||
+                sy->kind == SYMBOL_KIND_VARIANT) continue;
             if (sy->name_length == need && sy->name != NULL &&
                 memcmp(sy->name, nb, (size_t)need) == 0) {
                 return i;
@@ -207,6 +214,7 @@ static int emit_decl(Ctx* ctx, SymbolKind kind, const Token* nm, const Stmt* dec
     s.name_start_byte = nm->startByte;
     s.def_span        = nodeSpanOfStmt(decl);
     s.scope_depth     = ctx_depth(ctx);
+    s.parent_index    = -1;
     int idx = push_symbol(ctx->vm, ctx->table, s);
     ctx->visible_end = ctx->table->count;
     return idx;
@@ -231,9 +239,64 @@ static int emit_param(Ctx* ctx, const Token* nm)
     s.def_span.endLine      = nm->endLine;
     s.def_span.endColumn    = nm->endColumn;
     s.scope_depth           = ctx_depth(ctx);
+    s.parent_index          = -1;
     int idx = push_symbol(ctx->vm, ctx->table, s);
     ctx->visible_end = ctx->table->count;
     return idx;
+}
+
+// Phase 4.1c: emit one FIELD or VARIANT child symbol. Children are
+// recorded with scope_depth matching the parent (they don't push a
+// scope — they're looked up through parent_index, not via the scope
+// stack) and link back to the parent via parent_index. They do NOT
+// bump ctx->visible_end so ordinary name lookups won't resolve
+// `x` to a struct field when `Point.x` is what was intended; field
+// resolution goes through `find_child_by_name`.
+static int emit_child(Ctx* ctx, SymbolKind kind, const Token* nm, int parent_idx)
+{
+    if (nm == NULL || nm->length <= 0) return -1;
+    Symbol s;
+    s.kind                  = kind;
+    s.name                  = lookup_name_bytes(ctx->vm, nm);
+    s.name_length           = nm->length;
+    s.name_file_id          = nm->fileId;
+    s.name_start_byte       = nm->startByte;
+    s.def_span.fileId       = nm->fileId;
+    s.def_span.startByte    = nm->startByte;
+    s.def_span.length       = nm->length;
+    s.def_span.startLine    = nm->startLine;
+    s.def_span.startColumn  = nm->startColumn;
+    s.def_span.endLine      = nm->endLine;
+    s.def_span.endColumn    = nm->endColumn;
+    s.scope_depth           = ctx_depth(ctx);
+    s.parent_index          = parent_idx;
+    // Children are appended to `symbols` but NOT made visible through
+    // the scope stack (we do not advance visible_end). Member access
+    // resolves via find_child_by_name(parent_idx, ...) below.
+    int idx = push_symbol(ctx->vm, ctx->table, s);
+    return idx;
+}
+
+// Scan `symbols[]` for a child whose `parent_index == parent_idx` and
+// whose name matches `nm`. Returns the child's symbol index or -1.
+// O(total_symbols); acceptable today (tables are small) and trivially
+// replaceable with a parent→children side index later.
+static int find_child_by_name(const Ctx* ctx, int parent_idx, const Token* nm)
+{
+    if (parent_idx < 0 || nm == NULL || nm->length <= 0) return -1;
+    const char* nb = lookup_name_bytes(ctx->vm, nm);
+    if (nb == NULL) return -1;
+    int need = nm->length;
+    const ZymSymbolTable* table = ctx->table;
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* sy = &table->symbols[i];
+        if (sy->parent_index != parent_idx) continue;
+        if (sy->name_length == need && sy->name != NULL &&
+            memcmp(sy->name, nb, (size_t)need) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 // -----------------------------------------------------------------------------
@@ -265,10 +328,25 @@ static void record_ref(Ctx* ctx, const Token* nm, bool is_write, int resolved_in
 static void walk_expr(Ctx* ctx, const Expr* e);
 static void walk_stmt(Ctx* ctx, const Stmt* s);
 
+// Phase 4.1c: resolve a member-access name (GetExpr.name / SetExpr.name)
+// when the receiver is a direct VariableExpr whose name resolves to a
+// STRUCT (field lookup) or ENUM (variant lookup). Returns the child
+// symbol index or -1 if the receiver is dynamic / unresolved / not a
+// type-bearing kind.
+static int resolve_member_name(Ctx* ctx, const Expr* object, const Token* member)
+{
+    if (object == NULL || object->type != EXPR_VARIABLE) return -1;
+    int recv = ctx_lookup(ctx, &object->as.variable.name);
+    if (recv < 0) return -1;
+    SymbolKind rk = ctx->table->symbols[recv].kind;
+    if (rk != SYMBOL_KIND_STRUCT && rk != SYMBOL_KIND_ENUM) return -1;
+    return find_child_by_name(ctx, recv, member);
+}
+
 // AssignExpr.target is an Expr*; recognize the common shapes for
 // binding purposes: a VariableExpr means a write-ref to a name; a
-// SetExpr.object/GetExpr chain means a write to a field (field name
-// is unresolved at 4.1b).
+// SetExpr.object/GetExpr chain means a write to a field. Field names
+// are resolved via `resolve_member_name` (Phase 4.1c).
 static void walk_assign_target(Ctx* ctx, const Expr* target)
 {
     if (target == NULL) return;
@@ -281,8 +359,9 @@ static void walk_assign_target(Ctx* ctx, const Expr* target)
         }
         case EXPR_GET: {
             walk_expr(ctx, target->as.get.object);
-            // Field name itself — unresolved at 4.1b.
-            record_ref(ctx, &target->as.get.name, /*is_write=*/true, -1);
+            int midx = resolve_member_name(ctx, target->as.get.object,
+                                           &target->as.get.name);
+            record_ref(ctx, &target->as.get.name, /*is_write=*/true, midx);
             return;
         }
         case EXPR_SUBSCRIPT:
@@ -319,15 +398,19 @@ static void walk_expr(Ctx* ctx, const Expr* e)
                 walk_expr(ctx, e->as.call.args[i]);
             }
             break;
-        case EXPR_GET:
+        case EXPR_GET: {
             walk_expr(ctx, e->as.get.object);
-            record_ref(ctx, &e->as.get.name, /*is_write=*/false, -1);
+            int midx = resolve_member_name(ctx, e->as.get.object, &e->as.get.name);
+            record_ref(ctx, &e->as.get.name, /*is_write=*/false, midx);
             break;
-        case EXPR_SET:
+        }
+        case EXPR_SET: {
             walk_expr(ctx, e->as.set.object);
-            record_ref(ctx, &e->as.set.name, /*is_write=*/true, -1);
+            int midx = resolve_member_name(ctx, e->as.set.object, &e->as.set.name);
+            record_ref(ctx, &e->as.set.name, /*is_write=*/true, midx);
             walk_expr(ctx, e->as.set.value);
             break;
+        }
         case EXPR_UNARY:
             walk_expr(ctx, e->as.unary.right);
             break;
@@ -359,16 +442,27 @@ static void walk_expr(Ctx* ctx, const Expr* e)
             ctx_pop_scope(ctx);
             break;
         }
-        case EXPR_STRUCT_INST:
-            // struct_name is a type reference; field names are
-            // unresolved at 4.1b.
+        case EXPR_STRUCT_INST: {
+            // struct_name is a type reference; when it resolves to a
+            // STRUCT symbol, bind each field_names[i] to the struct's
+            // corresponding field (Phase 4.1c).
+            int struct_idx = ctx_lookup(ctx, &e->as.struct_inst.struct_name);
             record_ref(ctx, &e->as.struct_inst.struct_name,
-                       /*is_write=*/false,
-                       ctx_lookup(ctx, &e->as.struct_inst.struct_name));
+                       /*is_write=*/false, struct_idx);
+            bool receiver_is_struct =
+                (struct_idx >= 0 &&
+                 ctx->table->symbols[struct_idx].kind == SYMBOL_KIND_STRUCT);
             for (int i = 0; i < e->as.struct_inst.field_count; i++) {
+                int fidx = receiver_is_struct
+                    ? find_child_by_name(ctx, struct_idx,
+                                         &e->as.struct_inst.field_names[i])
+                    : -1;
+                record_ref(ctx, &e->as.struct_inst.field_names[i],
+                           /*is_write=*/false, fidx);
                 walk_expr(ctx, e->as.struct_inst.field_values[i]);
             }
             break;
+        }
         case EXPR_TERNARY:
             walk_expr(ctx, e->as.ternary.condition);
             walk_expr(ctx, e->as.ternary.then_expr);
@@ -469,14 +563,28 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
         case STMT_RETURN:
             walk_expr(ctx, s->as.return_stmt.value);
             break;
-        case STMT_STRUCT_DECLARATION:
-            emit_decl(ctx, SYMBOL_KIND_STRUCT,
-                      &s->as.struct_declaration.name, s);
+        case STMT_STRUCT_DECLARATION: {
+            int idx = emit_decl(ctx, SYMBOL_KIND_STRUCT,
+                                &s->as.struct_declaration.name, s);
+            if (idx >= 0) {
+                const StructDeclStmt* sd = &s->as.struct_declaration;
+                for (int i = 0; i < sd->field_count; i++) {
+                    emit_child(ctx, SYMBOL_KIND_FIELD, &sd->fields[i], idx);
+                }
+            }
             break;
-        case STMT_ENUM_DECLARATION:
-            emit_decl(ctx, SYMBOL_KIND_ENUM,
-                      &s->as.enum_declaration.name, s);
+        }
+        case STMT_ENUM_DECLARATION: {
+            int idx = emit_decl(ctx, SYMBOL_KIND_ENUM,
+                                &s->as.enum_declaration.name, s);
+            if (idx >= 0) {
+                const EnumDeclStmt* ed = &s->as.enum_declaration;
+                for (int i = 0; i < ed->variant_count; i++) {
+                    emit_child(ctx, SYMBOL_KIND_VARIANT, &ed->variants[i], idx);
+                }
+            }
             break;
+        }
         case STMT_SWITCH: {
             walk_expr(ctx, s->as.switch_stmt.expression);
             for (int i = 0; i < s->as.switch_stmt.case_count; i++) {
