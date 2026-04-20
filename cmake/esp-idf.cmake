@@ -63,7 +63,6 @@ if(NOT CONFIG_ZYM_RUNTIME_ONLY)
             ${ZYM_ROOT}/src/parser.c
             ${ZYM_ROOT}/src/compiler.c
             ${ZYM_ROOT}/src/debug.c
-            ${ZYM_ROOT}/src/linemap.c
             ${ZYM_ROOT}/src/module_loader.c
     )
 endif()

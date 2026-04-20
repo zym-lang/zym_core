@@ -2,19 +2,24 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "zym/sourcemap.h"
+
+#ifndef ZYM_VM_FWD_DECLARED
+#define ZYM_VM_FWD_DECLARED
 typedef struct VM ZymVM;
-typedef struct LineMap ZymLineMap;
+#endif
 
 typedef struct {
     char* source;
-    ZymLineMap* line_map;
+    ZymSourceMap* source_map;
+    ZymFileId file_id;
 } ModuleReadResult;
 
 typedef ModuleReadResult (*ModuleReadCallback)(const char* path, void* user_data);
 
 typedef struct {
     char* combined_source;
-    ZymLineMap* line_map;
+    ZymSourceMap* source_map;
     char** module_paths;
     int module_count;
     bool has_error;
@@ -24,7 +29,7 @@ typedef struct {
 ModuleLoadResult* loadModules(
     ZymVM* vm,
     const char* entry_source,
-    ZymLineMap* entry_line_map,
+    ZymSourceMap* entry_source_map,
     const char* entry_path,
     ModuleReadCallback read_callback,
     void* user_data,

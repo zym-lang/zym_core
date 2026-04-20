@@ -108,14 +108,6 @@ void pushDiagnosticV(VM* vm,
     if (severity == ZYM_DIAG_ERROR) {
         sink->has_error = true;
     }
-
-    // Fire the legacy ErrorCallback so existing embedders keep working.
-    if (vm->error_callback && severity == ZYM_DIAG_ERROR) {
-        const SourceFile* sf = sfr_get(&vm->source_files, fileId);
-        const char* file = sf ? sf->path : NULL;
-        vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, file, line, message,
-                           vm->error_user_data);
-    }
 }
 
 void pushDiagnostic(VM* vm,

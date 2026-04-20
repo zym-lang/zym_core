@@ -38,23 +38,11 @@ void appendSourceMapSegment(VM* vm, SourceMap* map,
         }
     }
 
-    // Coalesce adjacent segments that share the same origin line/file
-    // and are contiguous in both the expanded and origin buffers. This
-    // keeps the segment list proportional to the number of origin lines
-    // rather than the number of expanded newlines when a single source
-    // line expands to many output lines.
-    if (map->count > 0) {
-        SourceMapSegment* tail = &map->segments[map->count - 1];
-        if (tail->originFileId == originFileId &&
-            tail->originLine == originLine &&
-            tail->expandedStartByte + tail->expandedLength == expandedStartByte &&
-            tail->originStartByte == originStartByte &&
-            tail->originLength == originLength) {
-            tail->expandedLength += expandedLength;
-            return;
-        }
-    }
-
+    // Note: segments are appended one-per-expanded-line and never coalesced.
+    // Keeping per-line granularity lets callers (scanner `mappedLine`,
+    // module_loader combined-source assembly) look up origin by either
+    // byte offset (binary search) or expanded-line index (direct array
+    // indexing) without tracking cumulative line counts on the segments.
     SourceMapSegment* seg = &map->segments[map->count++];
     seg->expandedStartByte = expandedStartByte;
     seg->expandedLength = expandedLength;

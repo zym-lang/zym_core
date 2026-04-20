@@ -144,9 +144,7 @@ static void error_at_current(Parser* parser, const char* message) {
     int line = parser->current.line;
 
     // Build the fully formatted message: "[file] line N at 'tok': <msg>"
-    // pushDiagnostic() duplicates the buffer into its own storage and fires
-    // the legacy ErrorCallback for ERROR severity, so embedders that only
-    // listened on the callback continue to work unchanged.
+    // pushDiagnostic() duplicates the buffer into its own storage.
     char buf[1280];
     int pos = 0;
 
@@ -1283,12 +1281,11 @@ static Stmt* parse_return_statement(Parser* parser) {
     consume_end_of_statement(parser, "Expect ';' after return value.");
     return new_return_stmt(parser->vm, keyword, value);
 }
-AstResult parse(VM* vm, const char* source, const LineMap* line_map,
-                const SourceMap* source_map, const char* entry_file,
-                ZymFileId file_id) {
+AstResult parse(VM* vm, const char* source, const SourceMap* source_map,
+                const char* entry_file, ZymFileId file_id) {
     Parser parser;
     parser.vm = vm;
-    initScanner(&parser.scanner, source, line_map, source_map, file_id);
+    initScanner(&parser.scanner, source, source_map, file_id);
     parser.had_error = false;
     parser.panic_mode = false;
 

@@ -60,7 +60,6 @@ if(NOT ZYM_RUNTIME_ONLY)
         src/parser.c
         src/compiler.c
         src/debug.c
-        src/linemap.c
         src/module_loader.c
     )
 endif()

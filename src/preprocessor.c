@@ -1215,12 +1215,8 @@ static void record_origin_line(VM* vm, SourceMap* source_map, ZymFileId origin_f
                            origin_line);
 }
 
-char* preprocess(VM* vm, const char* source, LineMap* line_map) {
-    return preprocessEx(vm, source, line_map, NULL, ZYM_FILE_ID_INVALID);
-}
-
-char* preprocessEx(VM* vm, const char* source, LineMap* line_map,
-                   SourceMap* source_map, ZymFileId origin_file_id) {
+char* preprocess(VM* vm, const char* source,
+                 SourceMap* source_map, ZymFileId origin_file_id) {
     if (!source) return NULL;
 
     Preprocessor pp;
@@ -1271,7 +1267,6 @@ char* preprocessEx(VM* vm, const char* source, LineMap* line_map,
             int segment_start = buffer_pos_before;
             for (int i = buffer_pos_before; i < out.count; i++) {
                 if (out.buffer[i] == '\n') {
-                    addLineMapping(pp.vm, line_map, current_original_line);
                     record_origin_line(pp.vm, source_map, origin_file_id,
                                        origin_line_offsets, origin_line_count,
                                        segment_start, (i + 1) - segment_start,
@@ -1283,7 +1278,6 @@ char* preprocessEx(VM* vm, const char* source, LineMap* line_map,
             if (out.count > buffer_pos_before && out.buffer[out.count - 1] != '\n') {
                 int synth_nl_start = out.count;
                 appendToOutputBuffer(pp.vm, &out, "\n", 1);
-                addLineMapping(pp.vm, line_map, current_original_line);
                 record_origin_line(pp.vm, source_map, origin_file_id,
                                    origin_line_offsets, origin_line_count,
                                    segment_start, (synth_nl_start + 1) - segment_start,

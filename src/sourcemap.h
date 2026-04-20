@@ -10,14 +10,13 @@
 // that line came from, so the scanner can populate each token's
 // origin{FileId,StartByte,Length} fields.
 //
-// For 1.2 the granularity is per-expanded-line: a token's origin span
-// covers the origin line it was scanned from. Finer (sub-line) origin
-// tracking for macro-synthesized bytes is a Phase 2 concern.
+// Granularity is per-expanded-line (Phase 1.6: LineMap was folded into
+// SourceMap so this is now the sole origin-tracking primitive). A
+// token's origin span covers the origin line it was scanned from; finer
+// (sub-line) origin tracking for macro-synthesized bytes is a Phase 2
+// concern.
 //
-// Related:
-//   - source_file.h  — the ZymFileId registry tokens key off of.
-//   - linemap.h      — the legacy per-line integer origin mapping kept
-//                      alongside SourceMap for existing callers.
+// Related: source_file.h — the ZymFileId registry tokens key off of.
 
 #include <stddef.h>
 

@@ -21,7 +21,6 @@
 typedef struct VM ZymVM;
 #endif
 typedef struct Chunk ZymChunk;
-typedef struct LineMap ZymLineMap;
 typedef uint64_t ZymValue;
 
 #include "zym/sourcemap.h"
@@ -75,23 +74,22 @@ void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data)
 ZymChunk* zym_newChunk(ZymVM* vm);
 void zym_freeChunk(ZymVM* vm, ZymChunk* chunk);
 
-ZymLineMap* zym_newLineMap(ZymVM* vm);
-void zym_freeLineMap(ZymVM* vm, ZymLineMap* map);
-
-ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource);
+// Preprocess `source`, returning the expanded buffer through
+// `processedSource`. If `source_map` is non-NULL and `origin_file_id`
+// is valid, each expanded line is recorded in the map so downstream
+// consumers (scanner, diagnostics, LSP) can translate expanded positions
+// back to user-visible coordinates.
+ZymStatus zym_preprocess(ZymVM* vm, const char* source,
+                         ZymSourceMap* source_map, ZymFileId origin_file_id,
+                         const char** processedSource);
 void zym_freeProcessedSource(ZymVM* vm, const char* processedSource);
-ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config);
 
-// Phase 1.2 overloads: same as the legacy calls but also thread a
-// SourceMap + origin ZymFileId so the scanner can populate each token's
-// origin{FileId,StartByte,Length} fields. Passing map == NULL or
-// origin_file_id == ZYM_FILE_ID_INVALID is equivalent to the legacy call.
-ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
-                           ZymSourceMap* source_map, ZymFileId origin_file_id,
-                           const char** processedSource);
-ZymStatus zym_compileEx(ZymVM* vm, const char* source, ZymChunk* chunk,
-                        ZymLineMap* line_map, const ZymSourceMap* source_map,
-                        const char* entry_file, ZymCompilerConfig config);
+// Compile `source` into `chunk`. `source_map`, when non-NULL, is the
+// per-expanded-line origin table produced by `zym_preprocess`. Pass
+// NULL only when compiling raw unpreprocessed text.
+ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
+                      const ZymSourceMap* source_map,
+                      const char* entry_file, ZymCompilerConfig config);
 
 // =============================================================================
 // COOPERATIVE CANCELLATION (Phase 1.5)

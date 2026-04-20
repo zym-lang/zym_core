@@ -3,7 +3,6 @@
 #include <stdbool.h>
 
 #include "./token.h"
-#include "./linemap.h"
 #include "./sourcemap.h"
 #include "./source_file.h"
 
@@ -32,13 +31,12 @@ typedef struct {
     // still dereference `scanner->line`. Equals current_line.
     int line;
 
-    const LineMap* line_map;
-
-    // Phase 1.2: optional per-expanded-line origin table. When present,
-    // every emitted token's origin{FileId,StartByte,Length} is resolved
-    // via sourcemap_lookup() on the token's startByte. NULL for callers
-    // that don't run through the preprocessor (e.g. module_loader's
-    // pre-combined buffers).
+    // Phase 1.6: SourceMap is the sole origin-tracking primitive. When
+    // present, every emitted token's `line` and origin{FileId,StartByte,
+    // Length} are resolved via sourcemap_lookup() on the token's
+    // startByte. NULL for callers that don't run through the preprocessor
+    // (e.g. scanning of a raw unpreprocessed buffer); in that case the
+    // scanner reports its own expanded-buffer line number verbatim.
     const SourceMap* source_map;
 
     // Phase 1.5: per-scanner scratch buffer used by scanToken() to format
@@ -50,7 +48,7 @@ typedef struct {
     char error_buf[64];
 } Scanner;
 
-void initScanner(Scanner* scanner, const char* source, const LineMap* line_map,
+void initScanner(Scanner* scanner, const char* source,
                  const SourceMap* source_map, ZymFileId file_id);
 Token scanToken(Scanner* scanner);
 bool isAlpha(char c);

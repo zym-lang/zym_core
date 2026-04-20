@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-void initScanner(Scanner* scanner, const char* source, const LineMap* line_map,
+void initScanner(Scanner* scanner, const char* source,
                  const SourceMap* source_map, ZymFileId file_id) {
     scanner->base = source;
     scanner->file_id = file_id;
@@ -16,7 +16,6 @@ void initScanner(Scanner* scanner, const char* source, const LineMap* line_map,
     scanner->current_line = 1;
     scanner->current_column = 1;
     scanner->line = 1;
-    scanner->line_map = line_map;
     scanner->source_map = source_map;
 }
 
@@ -65,20 +64,22 @@ static bool match(Scanner* scanner, char expected) {
     return true;
 }
 
-// Resolves a scanner's current_line through the LineMap (if present) to
-// the corresponding original-source line number. This preserves the
-// pre-1.1 behavior where tokens emitted from preprocessed source report
-// the user's line, not the expanded-buffer line.
-static int mappedLine(const Scanner* scanner, int scanner_line) {
-    if (scanner->line_map == NULL || scanner->line_map->count == 0) {
+// Resolves a scanner's current expanded-buffer byte offset to the
+// corresponding original-source line number via the SourceMap. Preserves
+// the pre-1.6 behavior where tokens emitted from preprocessed source
+// report the user's line, not the expanded-buffer line. Without a map
+// (raw unpreprocessed input) the scanner's own line number is returned.
+static int mappedLine(const Scanner* scanner, int scanner_line, int start_byte) {
+    if (scanner->source_map == NULL || scanner->source_map->count == 0) {
         return scanner_line;
     }
-    int map_index = scanner_line - 1;
-    if (map_index < 0) map_index = 0;
-    if (map_index >= scanner->line_map->count) {
-        map_index = scanner->line_map->count - 1;
+    const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, start_byte);
+    if (seg == NULL) {
+        // Token's byte is past the mapped range (e.g. trailing synthetic
+        // content at EOF) — fall back to the last segment's origin line.
+        seg = &scanner->source_map->segments[scanner->source_map->count - 1];
     }
-    return scanner->line_map->lines[map_index];
+    return seg->originLine;
 }
 
 static Token makeToken(Scanner* scanner, TokenType type) {
@@ -87,9 +88,9 @@ static Token makeToken(Scanner* scanner, TokenType type) {
     token.start = scanner->start;
     token.length = (int)(scanner->current - scanner->start);
 
-    // Legacy `line` field: mapped through the LineMap so existing
+    // Legacy `line` field: mapped through the SourceMap so existing
     // diagnostics continue to print the user-source line.
-    token.line = mappedLine(scanner, scanner->start_line);
+    token.line = mappedLine(scanner, scanner->start_line, scanner->start_byte);
 
     // Phase 1.1 canonical span: fileId + byte offset into the preprocessed
     // buffer the scanner walks.
@@ -127,7 +128,8 @@ static Token errorToken(Scanner* scanner, const char* message) {
     token.start = message;
     token.length = (int)strlen(message);
 
-    token.line = mappedLine(scanner, scanner->current_line);
+    token.line = mappedLine(scanner, scanner->current_line,
+                            (int)(scanner->current - scanner->base));
 
     // Error tokens don't correspond to a contiguous byte range in the
     // source; we report the current scan position as a zero-length span.

@@ -6,7 +6,7 @@
 #include "module_loader.h"
 #include "vm.h"
 #include "memory.h"
-#include "linemap.h"
+#include "sourcemap.h"
 
 static char* normalize_path(ZymAllocator* alloc, const char* path) {
     if (!path) return NULL;
@@ -386,17 +386,23 @@ typedef struct {
     int capacity;
 } StringMap;
 
+// Per-module SourceMap + origin fileId, keyed by module path. The
+// loader keeps these alongside `StringMap` of module sources so the
+// combined-buffer SourceMap can be reconstructed with per-expanded-line
+// granularity (one segment per newline of each module's transformed
+// text).
 typedef struct {
     char* key;
-    LineMap* value;
-} LineMapEntry;
+    SourceMap* source_map;
+    ZymFileId file_id;
+} SourceMapEntry;
 
 typedef struct {
     ZymAllocator* alloc;
-    LineMapEntry* entries;
+    SourceMapEntry* entries;
     int count;
     int capacity;
-} LineMapMap;
+} SourceMapMap;
 
 static void map_init(StringMap* map, ZymAllocator* alloc) {
     map->alloc = alloc;
@@ -445,26 +451,28 @@ static void map_free(StringMap* map) {
     map->capacity = 0;
 }
 
-static void linemap_map_init(LineMapMap* map, ZymAllocator* alloc) {
+static void sourcemap_map_init(SourceMapMap* map, ZymAllocator* alloc) {
     map->alloc = alloc;
     map->capacity = 16;
     map->count = 0;
-    map->entries = (LineMapEntry*)ZYM_ALLOC(alloc, sizeof(LineMapEntry) * map->capacity);
+    map->entries = (SourceMapEntry*)ZYM_ALLOC(alloc, sizeof(SourceMapEntry) * map->capacity);
 }
 
-static LineMap* linemap_map_get(LineMapMap* map, const char* key) {
+static SourceMapEntry* sourcemap_map_get(SourceMapMap* map, const char* key) {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].key, key) == 0) {
-            return map->entries[i].value;
+            return &map->entries[i];
         }
     }
     return NULL;
 }
 
-static void linemap_map_set(LineMapMap* map, const char* key, LineMap* value) {
+static void sourcemap_map_set(SourceMapMap* map, const char* key,
+                              SourceMap* source_map, ZymFileId file_id) {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].key, key) == 0) {
-            map->entries[i].value = value;
+            map->entries[i].source_map = source_map;
+            map->entries[i].file_id = file_id;
             return;
         }
     }
@@ -472,23 +480,26 @@ static void linemap_map_set(LineMapMap* map, const char* key, LineMap* value) {
     if (map->count >= map->capacity) {
         int old = map->capacity;
         map->capacity *= 2;
-        map->entries = (LineMapEntry*)ZYM_REALLOC(map->alloc, map->entries, sizeof(LineMapEntry) * old, sizeof(LineMapEntry) * map->capacity);
+        map->entries = (SourceMapEntry*)ZYM_REALLOC(map->alloc, map->entries,
+            sizeof(SourceMapEntry) * old,
+            sizeof(SourceMapEntry) * map->capacity);
     }
 
     map->entries[map->count].key = zym_strdup(map->alloc, key);
-    map->entries[map->count].value = value;
+    map->entries[map->count].source_map = source_map;
+    map->entries[map->count].file_id = file_id;
     map->count++;
 }
 
-static void linemap_map_free(VM* vm, LineMapMap* map) {
+static void sourcemap_map_free(VM* vm, SourceMapMap* map) {
     for (int i = 0; i < map->count; i++) {
         ZYM_FREE_STR(map->alloc, map->entries[i].key);
-        if (map->entries[i].value) {
-            freeLineMap(vm, map->entries[i].value);
-            ZYM_FREE(map->alloc, map->entries[i].value, sizeof(LineMap));
+        if (map->entries[i].source_map) {
+            freeSourceMap(vm, map->entries[i].source_map);
+            ZYM_FREE(map->alloc, map->entries[i].source_map, sizeof(SourceMap));
         }
     }
-    ZYM_FREE(map->alloc, map->entries, sizeof(LineMapEntry) * map->capacity);
+    ZYM_FREE(map->alloc, map->entries, sizeof(SourceMapEntry) * map->capacity);
     map->entries = NULL;
     map->count = 0;
     map->capacity = 0;
@@ -680,7 +691,7 @@ static bool load_module_recursive(
     StringSet* loaded_modules,
     ImportStack* import_stack,
     StringMap* module_sources,
-    LineMapMap* module_linemaps,
+    SourceMapMap* module_source_maps,
     SymbolMap* symbol_map,
     char** error_msg)
 {
@@ -739,7 +750,8 @@ static bool load_module_recursive(
     }
 
     map_set(module_sources, module_path, read_result.source);
-    linemap_map_set(module_linemaps, module_path, read_result.line_map);
+    sourcemap_map_set(module_source_maps, module_path,
+                      read_result.source_map, read_result.file_id);
     set_add(loaded_modules, module_path);
 
     ModuleQueue deps;
@@ -756,7 +768,7 @@ static bool load_module_recursive(
 
         if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    loaded_modules, import_stack, module_sources,
-                                   module_linemaps, symbol_map, error_msg)) {
+                                   module_source_maps, symbol_map, error_msg)) {
             ZYM_FREE_STR(&vm->allocator, resolved_path);
             ZYM_FREE_STR(&vm->allocator, item.module_path);
             ZYM_FREE_STR(&vm->allocator, item.base_path);
@@ -787,20 +799,80 @@ static int count_newlines(const char* str) {
 }
 #endif
 
-static void add_mapped_lines(VM* vm, const char* text, LineMap* source_linemap, LineMap* combined_linemap, int* source_line_idx) {
-    const char* p = text;
-    while (*p) {
-        if (*p == '\n') {
-            int original_line = 0;
-            if (source_linemap && *source_line_idx < source_linemap->count) {
-                original_line = source_linemap->lines[*source_line_idx];
+// Appends one SourceMap segment per `\n` found in `text`, translating
+// each expanded-buffer line's origin through the per-module source map.
+// `combined_byte_cursor` is the byte offset at which `text` starts in
+// the combined buffer; it is advanced to point past `text` on return.
+// `source_line_idx` is the per-module expanded-line counter used to
+// index the module's source map (post-coalesce-removal, one segment per
+// expanded newline, so direct indexing is valid).
+static void add_mapped_lines(VM* vm,
+                             const char* text,
+                             const SourceMap* source_source_map,
+                             ZymFileId source_file_id,
+                             SourceMap* combined_source_map,
+                             int* combined_byte_cursor,
+                             int* source_line_idx) {
+    int line_start = 0;
+    int i = 0;
+    for (; text[i] != '\0'; i++) {
+        if (text[i] == '\n') {
+            int expanded_start = *combined_byte_cursor + line_start;
+            int expanded_length = (i + 1) - line_start;
+
+            ZymFileId origin_fid = source_file_id;
+            int origin_start = -1;
+            int origin_length = 0;
+            int origin_line = 0;
+            if (source_source_map &&
+                *source_line_idx < source_source_map->count) {
+                const SourceMapSegment* seg =
+                    &source_source_map->segments[*source_line_idx];
+                origin_fid = seg->originFileId;
+                origin_start = seg->originStartByte;
+                origin_length = seg->originLength;
+                origin_line = seg->originLine;
             }
             (*source_line_idx)++;
 
-            addLineMapping(vm, combined_linemap, original_line);
+            appendSourceMapSegment(vm, combined_source_map,
+                                   expanded_start, expanded_length,
+                                   origin_fid, origin_start, origin_length,
+                                   origin_line);
+            line_start = i + 1;
         }
-        p++;
     }
+    *combined_byte_cursor += i;
+}
+
+// Appends `str` to the combined buffer AND emits one synthetic
+// SourceMap segment per `\n` contained in it. Loader-inserted scaffolding
+// (`func __module_...() {`, `var __module_... = ...()\n`, closing
+// braces, etc.) has no originating user source, so each synthetic
+// segment is recorded with originFileId=INVALID and originLine=0; the
+// scanner falls back to its own expanded-buffer line for tokens that
+// land in such a range (rare — none of the synthetic scaffolding
+// parses to anything but whitespace + keywords the user never typed).
+static void sb_append_synth(VM* vm,
+                            StringBuilder* sb,
+                            const char* str,
+                            SourceMap* combined_source_map,
+                            int* combined_byte_cursor) {
+    size_t len = strlen(str);
+    int line_start = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '\n') {
+            int expanded_length = (int)(i + 1) - line_start;
+            appendSourceMapSegment(vm, combined_source_map,
+                                   *combined_byte_cursor, expanded_length,
+                                   ZYM_FILE_ID_INVALID, -1, 0, 0);
+            *combined_byte_cursor += expanded_length;
+            line_start = (int)(i + 1);
+        }
+    }
+    int tail = (int)len - line_start;
+    if (tail > 0) *combined_byte_cursor += tail;
+    sb_append(sb, str);
 }
 
 static bool is_fresh_module(const char* source) {
@@ -978,7 +1050,7 @@ static char* transform_imports(ZymAllocator* alloc, const char* source, const ch
 ModuleLoadResult* loadModules(
     VM* vm,
     const char* entry_source,
-    LineMap* entry_line_map,
+    SourceMap* entry_source_map,
     const char* entry_path,
     ModuleReadCallback read_callback,
     void* user_data,
@@ -989,7 +1061,7 @@ ModuleLoadResult* loadModules(
     ZymAllocator* alloc = &vm->allocator;
     ModuleLoadResult* result = (ModuleLoadResult*)ZYM_ALLOC(alloc, sizeof(ModuleLoadResult));
     result->combined_source = NULL;
-    result->line_map = NULL;
+    result->source_map = NULL;
     result->module_paths = NULL;
     result->module_count = 0;
     result->has_error = false;
@@ -1001,8 +1073,8 @@ ModuleLoadResult* loadModules(
     StringMap module_sources;
     map_init(&module_sources, alloc);
 
-    LineMapMap module_linemaps;
-    linemap_map_init(&module_linemaps, alloc);
+    SourceMapMap module_source_maps;
+    sourcemap_map_init(&module_source_maps, alloc);
 
     ImportStack import_stack;
     stack_init(&import_stack, alloc);
@@ -1030,7 +1102,7 @@ ModuleLoadResult* loadModules(
 
         if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    &loaded_modules, &import_stack, &module_sources,
-                                   &module_linemaps, &symbol_map, &result->error_message)) {
+                                   &module_source_maps, &symbol_map, &result->error_message)) {
             result->has_error = true;
             ZYM_FREE_STR(alloc, resolved_path);
             ZYM_FREE_STR(alloc, item.module_path);
@@ -1049,8 +1121,14 @@ ModuleLoadResult* loadModules(
     StringBuilder combined;
     sb_init(&combined, alloc);
 
-    LineMap* combined_linemap = (LineMap*)ZYM_ALLOC(alloc, sizeof(LineMap));
-    initLineMap(combined_linemap);
+    // Combined-buffer SourceMap: populated in lockstep with `combined`.
+    // Every `\n` appended (whether from module text or loader
+    // scaffolding) produces exactly one segment; per-line granularity
+    // lets the scanner binary-search by byte offset to recover the
+    // originating file/line for any token.
+    SourceMap* combined_source_map = (SourceMap*)ZYM_ALLOC(alloc, sizeof(SourceMap));
+    initSourceMap(combined_source_map);
+    int combined_byte_cursor = 0;
 
     for (int i = 0; i < loaded_modules.count; i++) {
         const char* module_path = loaded_modules.items[i];
@@ -1060,7 +1138,9 @@ ModuleLoadResult* loadModules(
         }
 
         char* source = map_get(&module_sources, module_path);
-        LineMap* source_linemap = linemap_map_get(&module_linemaps, module_path);
+        SourceMapEntry* source_entry = sourcemap_map_get(&module_source_maps, module_path);
+        SourceMap* source_source_map = source_entry ? source_entry->source_map : NULL;
+        ZymFileId source_file_id = source_entry ? source_entry->file_id : ZYM_FILE_ID_INVALID;
         if (!source) continue;
 
         bool is_fresh = is_fresh_module(source);
@@ -1071,12 +1151,12 @@ ModuleLoadResult* loadModules(
         if (debug_names) {
             char* encoded = encode_path_to_identifier(alloc, module_path);
             if (is_fresh) {
-                sb_append(&combined, "func __module_");
-                sb_append(&combined, encoded);
+                sb_append_synth(vm, &combined, "func __module_", combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
             } else {
-                sb_append(&combined, "func __module_");
-                sb_append(&combined, encoded);
-                sb_append(&combined, "_init");
+                sb_append_synth(vm, &combined, "func __module_", combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, "_init", combined_source_map, &combined_byte_cursor);
             }
             ZYM_FREE_STR(alloc, encoded);
         } else {
@@ -1086,56 +1166,62 @@ ModuleLoadResult* loadModules(
             } else {
                 snprintf(hash_str, sizeof(hash_str), "func _%x_init", hash_path(module_path));
             }
-            sb_append(&combined, hash_str);
+            sb_append_synth(vm, &combined, hash_str, combined_source_map, &combined_byte_cursor);
         }
 
-        sb_append(&combined, "() {\n");
-        addLineMapping(vm, combined_linemap, 0);
+        sb_append_synth(vm, &combined, "() {\n", combined_source_map, &combined_byte_cursor);
 
         char* transformed = transform_imports(alloc, source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
         int source_line_idx = 0;
-        add_mapped_lines(vm, transformed, source_linemap, combined_linemap, &source_line_idx);
+        add_mapped_lines(vm, transformed, source_source_map, source_file_id,
+                         combined_source_map, &combined_byte_cursor, &source_line_idx);
 
         sb_append(&combined, transformed);
         ZYM_FREE_STR(alloc, transformed);
 
-        sb_append(&combined, "\n}\n");
-        addLineMapping(vm, combined_linemap, 0);
-        addLineMapping(vm, combined_linemap, 0);
+        sb_append_synth(vm, &combined, "\n}\n", combined_source_map, &combined_byte_cursor);
 
         if (!is_fresh) {
             if (debug_names) {
                 char* encoded = encode_path_to_identifier(alloc, module_path);
-                sb_append(&combined, "var __module_");
-                sb_append(&combined, encoded);
-                sb_append(&combined, " = __module_");
-                sb_append(&combined, encoded);
-                sb_append(&combined, "_init()\n");
+                sb_append_synth(vm, &combined, "var __module_", combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, " = __module_", combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
+                sb_append_synth(vm, &combined, "_init()\n", combined_source_map, &combined_byte_cursor);
                 ZYM_FREE_STR(alloc, encoded);
             } else {
                 char hash_str[64];
                 snprintf(hash_str, sizeof(hash_str), "var _%x = _%x_init()\n",
                          hash_path(module_path), hash_path(module_path));
-                sb_append(&combined, hash_str);
+                sb_append_synth(vm, &combined, hash_str, combined_source_map, &combined_byte_cursor);
             }
-            addLineMapping(vm, combined_linemap, 0);
         }
 
-        sb_append(&combined, "\n");
-        addLineMapping(vm, combined_linemap, 0);
+        sb_append_synth(vm, &combined, "\n", combined_source_map, &combined_byte_cursor);
     }
 
     char* transformed_entry = transform_imports(alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
+    // Resolve entry module's own file_id so the entry SourceMap can be
+    // copied into the combined map with the correct originFileId on
+    // every segment even when the caller passes a NULL `entry_source_map`.
+    ZymFileId entry_file_id = ZYM_FILE_ID_INVALID;
+    {
+        SourceMapEntry* entry_entry = sourcemap_map_get(&module_source_maps, entry_path);
+        if (entry_entry) entry_file_id = entry_entry->file_id;
+    }
+
     int entry_line_idx = 0;
-    add_mapped_lines(vm, transformed_entry, entry_line_map, combined_linemap, &entry_line_idx);
+    add_mapped_lines(vm, transformed_entry, entry_source_map, entry_file_id,
+                     combined_source_map, &combined_byte_cursor, &entry_line_idx);
 
     sb_append(&combined, transformed_entry);
     ZYM_FREE_STR(alloc, transformed_entry);
 
     result->combined_source = combined.buffer;
-    result->line_map = combined_linemap;
+    result->source_map = combined_source_map;
     combined.buffer = NULL;
     sb_free(&combined);
 
@@ -1163,7 +1249,7 @@ ModuleLoadResult* loadModules(
 cleanup:
     set_free(&loaded_modules);
     map_free(&module_sources);
-    linemap_map_free(vm, &module_linemaps);
+    sourcemap_map_free(vm, &module_source_maps);
     stack_free(&import_stack);
     symbolmap_free(&symbol_map);
     set_free(&fresh_modules);
@@ -1177,9 +1263,9 @@ void freeModuleLoadResult(VM* vm, ModuleLoadResult* result) {
 
     ZYM_FREE_STR(alloc, result->combined_source);
 
-    if (result->line_map) {
-        freeLineMap(vm, result->line_map);
-        ZYM_FREE(alloc, result->line_map, sizeof(LineMap));
+    if (result->source_map) {
+        freeSourceMap(vm, result->source_map);
+        ZYM_FREE(alloc, result->source_map, sizeof(SourceMap));
     }
 
     for (int i = 0; i < result->module_count; i++) {

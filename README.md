@@ -134,6 +134,8 @@ cmake --build build
 
 ## Embedding
 
+Compilation and execution are explicit, separate stages — the host keeps full control over native registration, caching, and error surfacing:
+
 ```c
 #include "zym/zym.h"
 
@@ -141,18 +143,41 @@ int main() {
     ZymVM* vm = zym_newVM(NULL);
 
     ZymChunk* chunk = zym_newChunk(vm);
-    ZymLineMap* map = zym_newLineMap(vm);
     ZymCompilerConfig config = { .include_line_info = true };
 
-    zym_compile(vm, "print(\"Hello from Zym!\")", chunk, map, "main", config);
+    zym_compile(vm, "print(\"Hello from Zym!\")", chunk,
+                /* source_map = */ NULL, "main", config);
     zym_runChunk(vm, chunk);
 
     zym_freeChunk(vm, chunk);
-    zym_freeLineMap(vm, map);
     zym_freeVM(vm);
     return 0;
 }
 ```
+
+For a full preprocess → compile → run pipeline with `ZymSourceMap` origin tracking, `zym_registerSourceFile` for diagnostic file ids, and multi-file module loading, see the [Embedding Guide](https://zym-lang.org/docs-embedding.html).
+
+### Structured diagnostics
+
+Compile-time errors (scanner, parser, compiler) are recorded on the VM as `ZymDiagnostic` records — no `stderr` side effects in the core. The host drains them after any non-OK status:
+
+```c
+if (zym_compile(vm, src, chunk, map, "main.zym", cfg) != ZYM_STATUS_OK) {
+    int n = 0;
+    const ZymDiagnostic* diags = zymGetDiagnostics(vm, &n);
+    for (int i = 0; i < n; ++i) {
+        fprintf(stderr, "%s:%d:%d: %s\n",
+                "main.zym", diags[i].line, diags[i].column, diags[i].message);
+    }
+    zymClearDiagnostics(vm);
+}
+```
+
+Diagnostics carry byte-granular spans (`fileId`, `startByte`, `length`) when the originating token is known, making them directly consumable by tooling.
+
+### Cooperative cancellation
+
+An in-flight compile can be aborted from another thread via `zym_requestCancel(vm)` — useful for LSP hosts, REPLs, or compile-time budgets. The compile returns `ZYM_STATUS_COMPILE_ERROR` + a "Compilation cancelled." diagnostic; call `zym_wasCancelled(vm)` to distinguish cancellation from a real error, and `zym_clearCancel(vm)` before the next compile.
 
 ### Extending with native functions
 
@@ -185,12 +210,15 @@ The docs cover:
 
 ```
 zym_core/
-├── include/zym/     Public API headers
-│   ├── zym.h            Core API (VM, values, natives, GC)
-│   ├── debug.h          Disassembly utilities
-│   ├── module_loader.h  Module loading (compiler builds)
-│   └── utf8.h           UTF-8 string utilities
-└── src/             Implementation (internal)
+├── include/zym/       Public API headers
+│   ├── zym.h              Core API (VM lifecycle, compile pipeline, values, natives, GC)
+│   ├── sourcemap.h        ZymFileId + ZymSourceMap (preprocessor origin tracking)
+│   ├── diagnostics.h      ZymDiagnostic + zymGetDiagnostics / zymClearDiagnostics
+│   ├── config.h           Generated at build time — ZYM_HAS_* flag predicates
+│   ├── debug.h            Disassembly utilities
+│   ├── module_loader.h    Multi-file module loading (compiler builds)
+│   └── utf8.h             UTF-8 string utilities
+└── src/               Implementation (internal)
 ```
 
 ## License

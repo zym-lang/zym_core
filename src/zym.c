@@ -6,7 +6,6 @@
 
 #include "./vm.h"
 #include "./chunk.h"
-#include "./linemap.h"
 #ifndef ZYM_RUNTIME_ONLY
 #include "./preprocessor.h"
 #include "./compiler.h"
@@ -124,60 +123,13 @@ void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
 
-ZymLineMap* zym_newLineMap(ZymVM* vm)
-{
 #ifndef ZYM_RUNTIME_ONLY
-    ZymLineMap* map = (ZymLineMap*)ZYM_ALLOC(&vm->allocator, sizeof(ZymLineMap));
-    if (map == NULL) return NULL;
-    initLineMap(map);
-    return map;
-#else
-    (void)vm;
-    return (ZymLineMap*)1;
-#endif
-}
-
-void zym_freeLineMap(ZymVM* vm, ZymLineMap* map)
-{
-#ifndef ZYM_RUNTIME_ONLY
-    if (map == NULL) return;
-    freeLineMap(vm, map);
-    ZYM_FREE(&vm->allocator, map, sizeof(ZymLineMap));
-#else
-    (void)vm;
-    (void)map;
-#endif
-}
-
-#ifndef ZYM_RUNTIME_ONLY
-ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource)
-{
-    if (source == NULL || map == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
-
-    char* processed = preprocess(vm, source, map);
-    if (processed == NULL) {
-        *processedSource = NULL;
-        return ZYM_STATUS_COMPILE_ERROR;
-    }
-
-    *processedSource = processed;
-    return ZYM_STATUS_OK;
-}
-
-void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
-{
-    if (processedSource == NULL) return;
-    ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
-}
-
-ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config)
-{
-    if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
-    bool success = compile(vm, source, chunk, map, entry_file, config);
-    return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
-}
-
-// ---- Phase 1.1 / 1.2: SourceFile registry + SourceMap public API ----
+// ---- Phase 1.1 / 1.2 / 1.6: SourceFile registry + SourceMap public API ----
+//
+// Phase 1.6 collapsed LineMap into SourceMap; the Ex-suffixed variants
+// are gone too (pre-1.0: no transitional shim is kept, per the roadmap's
+// "changelog, not a runway" policy). SourceMap is the sole origin-
+// tracking primitive consumed by the scanner / diagnostics / LSP.
 
 ZymFileId zym_registerSourceFile(ZymVM* vm, const char* path,
                                  const char* bytes, size_t length)
@@ -202,13 +154,13 @@ void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map)
     ZYM_FREE(&vm->allocator, map, sizeof(ZymSourceMap));
 }
 
-ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
-                           ZymSourceMap* source_map, ZymFileId origin_file_id,
-                           const char** processedSource)
+ZymStatus zym_preprocess(ZymVM* vm, const char* source,
+                         ZymSourceMap* source_map, ZymFileId origin_file_id,
+                         const char** processedSource)
 {
-    if (source == NULL || line_map == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
+    if (source == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
 
-    char* processed = preprocessEx(vm, source, line_map, source_map, origin_file_id);
+    char* processed = preprocess(vm, source, source_map, origin_file_id);
     if (processed == NULL) {
         *processedSource = NULL;
         return ZYM_STATUS_COMPILE_ERROR;
@@ -218,12 +170,18 @@ ZymStatus zym_preprocessEx(ZymVM* vm, const char* source, ZymLineMap* line_map,
     return ZYM_STATUS_OK;
 }
 
-ZymStatus zym_compileEx(ZymVM* vm, const char* source, ZymChunk* chunk,
-                        ZymLineMap* line_map, const ZymSourceMap* source_map,
-                        const char* entry_file, ZymCompilerConfig config)
+void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
+{
+    if (processedSource == NULL) return;
+    ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
+}
+
+ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
+                      const ZymSourceMap* source_map,
+                      const char* entry_file, ZymCompilerConfig config)
 {
     if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
-    bool success = compileEx(vm, source, chunk, line_map, source_map, entry_file, config);
+    bool success = compile(vm, source, chunk, source_map, entry_file, config);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 

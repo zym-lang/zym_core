@@ -130,17 +130,17 @@ static void emit_closure(Compiler* c, int reg, int const_idx, int line) {
     emit_instruction(c, PACK_ABx(CLOSURE, reg, const_idx), line);
 }
 
-static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
+// Low-level compiler-diagnostic emitter. If `tok` is non-NULL, its byte span
+// (fileId/startByte/length/startColumn) is attached to the diagnostic so
+// LSP-style range reporting works; otherwise only `line` is carried (legacy
+// "I don't have the originating token" path — kept for diagnostics raised
+// from post-parse stages like register allocation).
+static void compiler_error_emit(Compiler* compiler, const Token* tok, int line,
+                                const char* format, va_list args) {
     compiler->has_error = true;
 
-    // Format the user message, then prepend the "[file] line N: " location
-    // prefix that embedders have historically seen. pushDiagnostic() owns the
-    // resulting string and also fires the legacy ErrorCallback for back-compat.
     char msg_buf[1024];
-    va_list args;
-    va_start(args, format);
     vsnprintf(msg_buf, sizeof(msg_buf), format, args);
-    va_end(args);
 
     char full_buf[1280];
     if (compiler->current_module_name) {
@@ -152,35 +152,31 @@ static void compiler_error(Compiler* compiler, int line, const char* format, ...
         snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
     }
 
+    ZymFileId fileId = tok ? tok->fileId : ZYM_FILE_ID_INVALID;
+    int startByte    = tok ? tok->startByte : -1;
+    int length       = tok ? tok->length : 0;
+    int column       = tok ? tok->startColumn : -1;
+
     pushDiagnostic(compiler->vm,
                    ZYM_DIAG_ERROR,
-                   ZYM_FILE_ID_INVALID, -1, 0,
-                   line, -1,
+                   fileId, startByte, length,
+                   line, column,
                    "%s", full_buf);
 }
 
-// Records a fatal compiler error through the structured diagnostics sink, then
-// aborts the process. The exit contract is preserved for now — Phase 1.4's
-// error-recovery work replaces the remaining abort paths with proper panic
-// recovery. Routes through pushDiagnostic so no stderr write leaks from the
-// core.
-static void compiler_error_and_exit(Compiler* compiler, int line,
-                                    const char* format, ...) {
-    char msg_buf[1024];
+static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    vsnprintf(msg_buf, sizeof(msg_buf), format, args);
+    compiler_error_emit(compiler, NULL, line, format, args);
     va_end(args);
+}
 
-    if (compiler) {
-        compiler->has_error = true;
-        pushDiagnostic(compiler->vm,
-                       ZYM_DIAG_ERROR,
-                       ZYM_FILE_ID_INVALID, -1, 0,
-                       line, -1,
-                       "Error at line %d: %s", line, msg_buf);
-    }
-    exit(1);
+static void compiler_error_at(Compiler* compiler, const Token* tok,
+                              const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    compiler_error_emit(compiler, tok, tok ? tok->line : -1, format, args);
+    va_end(args);
 }
 
 static bool tokens_equal(const Token* a, const Token* b) {
@@ -2194,7 +2190,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             }
 
             if (!schema) {
-                compiler_error(compiler, expr->line, "Undefined struct '%.*s'", struct_expr->struct_name.length, struct_expr->struct_name.start);
+                compiler_error_at(compiler, &struct_expr->struct_name, "Undefined struct '%.*s'", struct_expr->struct_name.length, struct_expr->struct_name.start);
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
                 break;
             }
@@ -2256,7 +2252,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     }
 
                     if (field_index == -1) {
-                        compiler_error(compiler, expr->line, "Unknown field '%.*s' in struct '%.*s'",
+                        compiler_error_at(compiler, &struct_expr->field_names[i], "Unknown field '%.*s' in struct '%.*s'",
                                        struct_expr->field_names[i].length, struct_expr->field_names[i].start,
                                        schema->name->length, schema->name->chars);
                         continue;
@@ -2264,7 +2260,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                     // Check for duplicate field initialization
                     if (field_initialized[field_index]) {
-                        compiler_error(compiler, expr->line, "Duplicate field '%.*s' in struct initialization",
+                        compiler_error_at(compiler, &struct_expr->field_names[i], "Duplicate field '%.*s' in struct initialization",
                                        struct_expr->field_names[i].length, struct_expr->field_names[i].start);
                         continue;
                     }
@@ -2352,7 +2348,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     }
 
                     if (variant_index == -1) {
-                        compiler_error(compiler, expr->line, "Undefined variant '%.*s' in enum '%.*s'",
+                        compiler_error_at(compiler, variant_name, "Undefined variant '%.*s' in enum '%.*s'",
                                      variant_name->length, variant_name->start,
                                      enum_name->length, enum_name->start);
                         restore_temp_top_preserve(compiler, saved_top, target_reg);
@@ -2602,7 +2598,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(compiler, expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2668,7 +2664,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(compiler, expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2735,7 +2731,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(compiler, expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2804,7 +2800,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(compiler, expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -3648,7 +3644,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             // Check if label already exists
             if (find_label(compiler, label_name)) {
-                compiler_error(compiler, stmt->line, "Label '%.*s' already defined", label_name->length, label_name->start);
+                compiler_error_at(compiler, label_name, "Label '%.*s' already defined", label_name->length, label_name->start);
                 break;
             }
 
@@ -3935,14 +3931,14 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
             memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0) {
             // Variadic: only one variadic per base name
             if (is_variadic && compiler->hoisted[i].is_variadic) {
-                compiler_error_and_exit(compiler, stmt->line,
+                compiler_error_at(compiler, &func_stmt->name,
                     "Variadic function '%.*s' is already defined.",
                     func_stmt->name.length, func_stmt->name.start);
             }
             // Non-variadic: check same arity
             if (!is_variadic && !compiler->hoisted[i].is_variadic &&
                 compiler->hoisted[i].arity == func_stmt->param_count) {
-                compiler_error_and_exit(compiler, stmt->line,
+                compiler_error_at(compiler, &func_stmt->name,
                     "Function '%.*s' with %d parameter(s) is already defined.",
                     func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
             }
@@ -3966,11 +3962,11 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
             if (is_variadic) {
-                compiler_error_and_exit(compiler, stmt->line,
+                compiler_error_at(compiler, &func_stmt->name,
                     "Cannot redefine native variadic function '%.*s'.",
                     func_stmt->name.length, func_stmt->name.start);
             } else {
-                compiler_error_and_exit(compiler, stmt->line,
+                compiler_error_at(compiler, &func_stmt->name,
                     "Cannot redefine native function '%.*s' with %d parameter(s).",
                     func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
             }
@@ -4026,13 +4022,13 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
                     if (c->local_hoisted[i].name.length == fd->name.length &&
                         memcmp(c->local_hoisted[i].name.start, fd->name.start, fd->name.length) == 0) {
                         if (is_variadic && c->local_hoisted[i].is_variadic) {
-                            compiler_error_and_exit(c, s->line,
+                            compiler_error_at(c, &fd->name,
                                 "Variadic function '%.*s' is already defined in this scope.",
                                 fd->name.length, fd->name.start);
                         }
                         if (!is_variadic && !c->local_hoisted[i].is_variadic &&
                             c->local_hoisted[i].arity == fd->param_count) {
-                            compiler_error_and_exit(c, s->line,
+                            compiler_error_at(c, &fd->name,
                                 "Function '%.*s' with %d parameter(s) is already defined in this scope.",
                                 fd->name.length, fd->name.start, fd->param_count);
                         }
@@ -4439,7 +4435,7 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         PendingGoto* pending = &fn_compiler.pending_gotos[i];
         if (!pending->is_resolved) {
             Token* target = &pending->target_label;
-            compiler_error(&fn_compiler, target->line, "goto to undefined label '%.*s'", target->length, target->start);
+            compiler_error_at(&fn_compiler, target, "goto to undefined label '%.*s'", target->length, target->start);
         }
     }
 
@@ -4484,13 +4480,9 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     return fn_compiler.function;
 }
 
-bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, const char* entry_file, CompilerConfig config) {
-    return compileEx(vm, source, chunk, line_map, NULL, entry_file, config);
-}
-
-bool compileEx(VM* vm, const char* source, Chunk* chunk,
-               const LineMap* line_map, const SourceMap* source_map,
-               const char* entry_file, CompilerConfig config) {
+bool compile(VM* vm, const char* source, Chunk* chunk,
+             const SourceMap* source_map,
+             const char* entry_file, CompilerConfig config) {
     // Phase 1.1: register the preprocessed source buffer with the VM's
     // SourceFileRegistry so scanner tokens can refer back to it by
     // ZymFileId. The registry is reset before this compile starts so each
@@ -4501,7 +4493,7 @@ bool compileEx(VM* vm, const char* source, Chunk* chunk,
     size_t source_length = source != NULL ? strlen(source) : 0;
     ZymFileId file_id = sfr_register(vm, &vm->source_files, entry_file, source, source_length);
 
-    AstResult ast = parse(vm, source, line_map, source_map, entry_file, file_id);
+    AstResult ast = parse(vm, source, source_map, entry_file, file_id);
     if (ast.statements == NULL) return false;
 
     // Use init_compiler to set up the top-level compiler correctly.
@@ -4627,7 +4619,7 @@ bool compileEx(VM* vm, const char* source, Chunk* chunk,
         PendingGoto* pending = &compiler.pending_gotos[i];
         if (!pending->is_resolved) {
             Token* target = &pending->target_label;
-            compiler_error(&compiler, target->line, "goto to undefined label '%.*s'", target->length, target->start);
+            compiler_error_at(&compiler, target, "goto to undefined label '%.*s'", target->length, target->start);
         }
     }
 
