@@ -20,7 +20,8 @@ static const char kZymConfigSummary[] =
     "PARSE_TREE_RETENTION=" ZYM__STR(ZYM_HAS_PARSE_TREE_RETENTION) ", "
     "SYMBOL_TABLE="         ZYM__STR(ZYM_HAS_SYMBOL_TABLE)         ", "
     "NATIVE_METADATA="      ZYM__STR(ZYM_HAS_NATIVE_METADATA)      ", "
-    "DIAGNOSTIC_CODES="     ZYM__STR(ZYM_HAS_DIAGNOSTIC_CODES);
+    "DIAGNOSTIC_CODES="     ZYM__STR(ZYM_HAS_DIAGNOSTIC_CODES)     ", "
+    "BUILD_TESTING="        ZYM__STR(ZYM_HAS_BUILD_TESTING);
 
 const char* zymConfigSummary(void) {
     return kZymConfigSummary;

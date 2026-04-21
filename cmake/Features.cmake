@@ -52,6 +52,15 @@ function(zym_core_declare_features)
         "Ship stable diagnostic-code table and code/hint fields on ZymDiagnostic"
         ${ZYM_ENABLE_LSP_SURFACE})
 
+    # Test-only: compiler resolution-trace hook used by the Phase 4.5 parity
+    # test. OFF in every shipping profile. When ON, `compiler.c` records
+    # every identifier it classifies (LOCAL/UPVALUE/GLOBAL/PROPERTY) into a
+    # VM-scoped trace buffer that the parity test cross-references against
+    # the resolver's symbol table. Never enable in a production build.
+    option(ZYM_ENABLE_BUILD_TESTING
+        "Expose compiler resolution-trace hook for resolver parity tests (test-only, default OFF)"
+        OFF)
+
     # Enforce: SYMBOL_TABLE on => PARSE_TREE_RETENTION on.
     # The resolver walks a retained parse tree; it cannot run without one.
     if(ZYM_ENABLE_SYMBOL_TABLE AND NOT ZYM_ENABLE_PARSE_TREE_RETENTION)
@@ -67,6 +76,7 @@ function(zym_core_declare_features)
     set(ZYM_ENABLE_SYMBOL_TABLE        ${ZYM_ENABLE_SYMBOL_TABLE}        PARENT_SCOPE)
     set(ZYM_ENABLE_NATIVE_METADATA     ${ZYM_ENABLE_NATIVE_METADATA}     PARENT_SCOPE)
     set(ZYM_ENABLE_DIAGNOSTIC_CODES    ${ZYM_ENABLE_DIAGNOSTIC_CODES}    PARENT_SCOPE)
+    set(ZYM_ENABLE_BUILD_TESTING       ${ZYM_ENABLE_BUILD_TESTING}       PARENT_SCOPE)
 
     message(STATUS "zym_core features:")
     message(STATUS "  ZYM_ENABLE_LSP_SURFACE          = ${ZYM_ENABLE_LSP_SURFACE}")
@@ -74,6 +84,7 @@ function(zym_core_declare_features)
     message(STATUS "  ZYM_ENABLE_SYMBOL_TABLE         = ${ZYM_ENABLE_SYMBOL_TABLE}")
     message(STATUS "  ZYM_ENABLE_NATIVE_METADATA      = ${ZYM_ENABLE_NATIVE_METADATA}")
     message(STATUS "  ZYM_ENABLE_DIAGNOSTIC_CODES     = ${ZYM_ENABLE_DIAGNOSTIC_CODES}")
+    message(STATUS "  ZYM_ENABLE_BUILD_TESTING        = ${ZYM_ENABLE_BUILD_TESTING}")
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -93,7 +104,8 @@ function(zym_core_configure_feature_header out_include_dir_var)
             ZYM_ENABLE_PARSE_TREE_RETENTION
             ZYM_ENABLE_SYMBOL_TABLE
             ZYM_ENABLE_NATIVE_METADATA
-            ZYM_ENABLE_DIAGNOSTIC_CODES)
+            ZYM_ENABLE_DIAGNOSTIC_CODES
+            ZYM_ENABLE_BUILD_TESTING)
         if(${_flag})
             set(_${_flag}_01 1)
         else()
@@ -123,7 +135,8 @@ function(zym_core_apply_features tgt)
             "ZYM_HAS_PARSE_TREE_RETENTION=$<BOOL:${ZYM_ENABLE_PARSE_TREE_RETENTION}>"
             "ZYM_HAS_SYMBOL_TABLE=$<BOOL:${ZYM_ENABLE_SYMBOL_TABLE}>"
             "ZYM_HAS_NATIVE_METADATA=$<BOOL:${ZYM_ENABLE_NATIVE_METADATA}>"
-            "ZYM_HAS_DIAGNOSTIC_CODES=$<BOOL:${ZYM_ENABLE_DIAGNOSTIC_CODES}>")
+            "ZYM_HAS_DIAGNOSTIC_CODES=$<BOOL:${ZYM_ENABLE_DIAGNOSTIC_CODES}>"
+            "ZYM_HAS_BUILD_TESTING=$<BOOL:${ZYM_ENABLE_BUILD_TESTING}>")
         target_compile_definitions(${tgt} PUBLIC ${_pair})
     endforeach()
 endfunction()

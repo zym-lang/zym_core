@@ -63,6 +63,7 @@ if(NOT ZYM_RUNTIME_ONLY)
         src/resolver.c
         src/trivia.c
         src/compiler.c
+        src/compiler_trace.c
         src/debug.c
         src/module_loader.c
     )

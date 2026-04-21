@@ -13,7 +13,8 @@
  || !defined(ZYM_HAS_PARSE_TREE_RETENTION) \
  || !defined(ZYM_HAS_SYMBOL_TABLE)         \
  || !defined(ZYM_HAS_NATIVE_METADATA)      \
- || !defined(ZYM_HAS_DIAGNOSTIC_CODES)
+ || !defined(ZYM_HAS_DIAGNOSTIC_CODES)     \
+ || !defined(ZYM_HAS_BUILD_TESTING)
 # error "zym/config.h did not define all ZYM_HAS_* flags. Regenerate CMake."
 #endif
 
@@ -37,6 +38,8 @@ _Static_assert((ZYM_HAS_NATIVE_METADATA)      == 0 || (ZYM_HAS_NATIVE_METADATA) 
     "ZYM_HAS_NATIVE_METADATA must be 0 or 1.");
 _Static_assert((ZYM_HAS_DIAGNOSTIC_CODES)     == 0 || (ZYM_HAS_DIAGNOSTIC_CODES)     == 1,
     "ZYM_HAS_DIAGNOSTIC_CODES must be 0 or 1.");
+_Static_assert((ZYM_HAS_BUILD_TESTING)        == 0 || (ZYM_HAS_BUILD_TESTING)        == 1,
+    "ZYM_HAS_BUILD_TESTING must be 0 or 1.");
 
 /* Silence -Wempty-translation-unit on strict toolchains (MSVC, some clang
  * configurations) that warn when a TU contains no external declarations. */

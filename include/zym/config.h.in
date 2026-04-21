@@ -33,6 +33,10 @@ extern "C" {
 #define ZYM_HAS_NATIVE_METADATA      @_ZYM_ENABLE_NATIVE_METADATA_01@
 #define ZYM_HAS_DIAGNOSTIC_CODES     @_ZYM_ENABLE_DIAGNOSTIC_CODES_01@
 
+/* Test-only: must remain 0 in every shipping build. Gates the compiler
+ * resolution-trace hook that drives the Phase 4.5 parity test. */
+#define ZYM_HAS_BUILD_TESTING        @_ZYM_ENABLE_BUILD_TESTING_01@
+
 /* ---------------------------------------------------------------------------
  * zymConfigSummary()
  *

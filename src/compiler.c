@@ -15,6 +15,37 @@
 #include "./diagnostics.h"
 #include "./trivia.h"
 #include "./parse_tree.h"
+#include "zym/config.h"
+
+/* Phase 4.5 compiler resolution-trace hook — test-only. When
+ * ZYM_HAS_BUILD_TESTING=1, each classified identifier emits one trace
+ * record; otherwise the macro expands to nothing so shipping builds pay
+ * nothing. See zym/compiler_trace.h for the test API. */
+#if ZYM_HAS_BUILD_TESTING
+#  include "zym/compiler_trace.h"
+void zym_compilerTrace_record(VM* vm,
+                              ZymFileId fileId,
+                              int byteOffset,
+                              int length,
+                              ZymResolutionKind kind,
+                              int slotOrIndex,
+                              int isLocalUpvalue);
+#  define COMPILER_TRACE_TOK(compiler, tok, kind, slot, is_local_upv)           \
+    do {                                                                       \
+        const Token* _ct_t = (tok);                                            \
+        if (_ct_t) {                                                           \
+            zym_compilerTrace_record((compiler)->vm,                           \
+                                     _ct_t->fileId,                            \
+                                     _ct_t->startByte,                         \
+                                     _ct_t->length,                            \
+                                     (kind),                                   \
+                                     (slot),                                   \
+                                     (is_local_upv));                          \
+        }                                                                      \
+    } while (0)
+#else
+#  define COMPILER_TRACE_TOK(compiler, tok, kind, slot, is_local_upv) ((void)0)
+#endif
 
 #define OPCODE(i) ((i) & 0xFF)
 
@@ -112,12 +143,21 @@ static void emit_load_const(Compiler* c, int reg, int const_idx, int line) {
     emit_instruction(c, PACK_ABx(LOAD_CONST, reg, const_idx), line);
 }
 
-static void emit_get_global(Compiler* c, int reg, int name_const, int line) {
+static void emit_get_global(Compiler* c, int reg, int name_const, int line, const Token* tok) {
     emit_instruction(c, PACK_ABx(GET_GLOBAL, reg, name_const), line);
+    /* Phase 4.5 GLOBAL parity: tok is the user-written identifier whose
+     * resolution fell through to the global namespace. Keying on the user
+     * Token's byte range (not the mangled name constant) makes parity
+     * matching with the resolver's ZymReferenceInfo automatic — both sides
+     * index into the same source bytes. Dispatcher/overload expansion may
+     * emit multiple traces for one user identifier; the parity test
+     * tolerates that via find_trace_at. Pass NULL at the function-decl
+     * storage site (resolver emits a DEFINITION, not a reference). */
+    COMPILER_TRACE_TOK(c, tok, ZYM_RES_GLOBAL, name_const, -1);
 }
-
-static void emit_set_global(Compiler* c, int reg, int name_const, int line) {
+static void emit_set_global(Compiler* c, int reg, int name_const, int line, const Token* tok) {
     emit_instruction(c, PACK_ABx(SET_GLOBAL, reg, name_const), line);
+    COMPILER_TRACE_TOK(c, tok, ZYM_RES_GLOBAL, name_const, -1);
 }
 
 static void emit_get_upvalue(Compiler* c, int reg, int upvalue_idx, int line) {
@@ -501,7 +541,7 @@ static int resolve_hoisted_name(Compiler* compiler, Token* name) {
     }
 }
 
-static int resolve_local(Compiler* compiler, Token* name) {
+static int resolve_local_impl(Compiler* compiler, Token* name) {
     for (int i = compiler->local_count - 1; i >= 0; i--) {
         Local* local = &compiler->locals[i];
         if (tokens_equal(name, &local->name)) {
@@ -509,6 +549,17 @@ static int resolve_local(Compiler* compiler, Token* name) {
         }
     }
     return -1;
+}
+
+/* Phase 4.5 tracing wrapper. Internal recursive paths call _impl directly
+ * so intermediate lookups don't produce spurious trace records. Only the
+ * top-level "compile this identifier" callers see the wrapper. */
+static int resolve_local(Compiler* compiler, Token* name) {
+    int r = resolve_local_impl(compiler, name);
+    if (r != -1) {
+        COMPILER_TRACE_TOK(compiler, name, ZYM_RES_LOCAL, r, -1);
+    }
+    return r;
 }
 
 static int add_upvalue(Compiler* compiler, uint8_t index, bool is_local, ObjStructSchema* struct_type) {
@@ -580,10 +631,13 @@ static int resolve_mangled_local_by_base(Compiler* c, const Token* base) {
     return (found_count == 1) ? found_reg : -1;
 }
 
-static int resolve_upvalue(Compiler* compiler, Token* name) {
+static int resolve_upvalue_impl(Compiler* compiler, Token* name) {
     if (compiler->enclosing == NULL) return -1;
 
-    int local = resolve_local(compiler->enclosing, name);
+    /* NOTE: intermediate chain-walk uses resolve_local_impl (no tracing)
+     * so only the outermost user-facing resolve_upvalue wrapper emits one
+     * UPVALUE trace entry for the source identifier. */
+    int local = resolve_local_impl(compiler->enclosing, name);
     if (local != -1) {
         Local* parent_local = get_local_by_reg(compiler->enclosing, local);
         if (parent_local) parent_local->is_captured = true;
@@ -599,13 +653,24 @@ static int resolve_upvalue(Compiler* compiler, Token* name) {
         return add_upvalue(compiler, (uint8_t)mlocal, true, struct_type);
     }
 
-    int up = resolve_upvalue(compiler->enclosing, name);
+    int up = resolve_upvalue_impl(compiler->enclosing, name);
     if (up != -1) {
         ObjStructSchema* struct_type = compiler->enclosing->upvalues[up].struct_type;
         return add_upvalue(compiler, (uint8_t)up, false, struct_type);
     }
 
     return -1;
+}
+
+/* Phase 4.5 tracing wrapper. See `resolve_local` above. */
+static int resolve_upvalue(Compiler* compiler, Token* name) {
+    int r = resolve_upvalue_impl(compiler, name);
+    if (r != -1) {
+        int is_local = (r < compiler->upvalue_count
+                        && compiler->upvalues[r].is_local) ? 1 : 0;
+        COMPILER_TRACE_TOK(compiler, name, ZYM_RES_UPVALUE, r, is_local);
+    }
+    return r;
 }
 
 static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
@@ -1073,7 +1138,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
                 emit_get_upvalue(compiler, call_base, reg, line);
             } else {
                 int name_const = identifier_constant(compiler, name);
-                emit_get_global(compiler, call_base, name_const, line);
+                emit_get_global(compiler, call_base, name_const, line, name);
             }
         }
     } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
@@ -1115,10 +1180,10 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             int name_const = make_constant(compiler, OBJ_VAL(str));
             popTempRoot(compiler->vm);
             scoped_string_free(&mangled);
-            emit_get_global(compiler, call_base, name_const, line);
+            emit_get_global(compiler, call_base, name_const, line, name);
         } else {
             int name_const = identifier_constant(compiler, name);
-            emit_get_global(compiler, call_base, name_const, line);
+            emit_get_global(compiler, call_base, name_const, line, name);
         }
     }
 }
@@ -1266,7 +1331,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
 
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, k, line);
+                    emit_get_global(compiler, temp_reg, k, line, name);
                     variadic_reg = temp_reg;
                 } else {
                     // Fixed-arity overload
@@ -1278,12 +1343,11 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     scoped_string_free(&mangled);
 
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, k, line);
+                    emit_get_global(compiler, temp_reg, k, line, name);
                     overload_regs[overload_count++] = temp_reg;
                 }
             }
         }
-
         // Also collect native functions from vm->globals
         char buf[256 + 8];
         // Native fixed-arity overloads (name@0 .. name@MAX_NATIVE_ARITY)
@@ -1295,7 +1359,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
             if (tableGet(&compiler->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val)) {
                 int k = make_constant(compiler, OBJ_VAL(key));
                 int temp_reg = alloc_temp(compiler);
-                emit_get_global(compiler, temp_reg, k, line);
+                emit_get_global(compiler, temp_reg, k, line, name);
                 overload_regs[overload_count++] = temp_reg;
             }
             popTempRoot(compiler->vm);
@@ -1313,7 +1377,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                         variadic_min_arity = fixed;
                         int k = make_constant(compiler, OBJ_VAL(key));
                         int temp_reg = alloc_temp(compiler);
-                        emit_get_global(compiler, temp_reg, k, line);
+                        emit_get_global(compiler, temp_reg, k, line, name);
                         variadic_reg = temp_reg;
                         popTempRoot(compiler->vm);
                         break;
@@ -1397,7 +1461,7 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             } else {
                 // Treat as global
                 int name_const = identifier_constant(compiler, name);
-                emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+                emit_get_global(compiler, target_reg, name_const, line, name);
                 return true;
             }
         }
@@ -1444,10 +1508,10 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             int name_const = make_constant(compiler, OBJ_VAL(str));
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
-            emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+            emit_get_global(compiler, target_reg, name_const, line, name);
         } else {
             int name_const = identifier_constant(compiler, name);
-            emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+            emit_get_global(compiler, target_reg, name_const, line, name);
         }
         return true;
     }
@@ -1520,14 +1584,14 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     int k = make_constant(compiler, OBJ_VAL(str));
                     popTempRoot(compiler->vm);
                     scoped_string_free(&mangled);
-                    emit_get_global(compiler, target_reg, k, expr->line);
+                    emit_get_global(compiler, target_reg, k, expr->line, &name);
                 } else if (ar == -2) {
                     // Multiple global overloads exist - create a dispatcher
                     emit_dispatcher(compiler, &name, target_reg, expr->line, false);
                 } else {
                     // No overloads found
                     int k = identifier_constant(compiler, &name);
-                    emit_get_global(compiler, target_reg, k, expr->line);
+                    emit_get_global(compiler, target_reg, k, expr->line, &name);
                 }
             }
             break;
@@ -1571,11 +1635,11 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global compound assignment - need to load, modify, store
                     int name_const = identifier_constant(compiler, &name);
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, name_const, expr->line);
+                    emit_get_global(compiler, temp_reg, name_const, expr->line, &name);
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
                     emit_instruction(compiler, PACK_ABC(binary_op, temp_reg, temp_reg, value_reg), expr->line);
-                    emit_set_global(compiler, temp_reg, name_const, expr->line);
+                    emit_set_global(compiler, temp_reg, name_const, expr->line, &name);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, temp_reg, expr->line);
                 }
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
@@ -1635,7 +1699,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
                     int name_const = identifier_constant(compiler, &name);
-                    emit_set_global(compiler, value_reg, name_const, expr->line);
+                    emit_set_global(compiler, value_reg, name_const, expr->line, &name);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
                 }
             }
@@ -1919,11 +1983,16 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 // Look up if this name refers to a struct schema (check current and enclosing scopes)
                 ObjStructSchema* schema = NULL;
+                Compiler* schema_owner = NULL;
+                int schema_depth = 0;
+                (void)schema_owner; (void)schema_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
                 Compiler* search_compiler = compiler;
                 while (search_compiler != NULL && schema == NULL) {
                     for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
                         if (tokens_equal(name, &search_compiler->struct_schemas[i].name)) {
                             schema = search_compiler->struct_schemas[i].schema;
+                            schema_owner = search_compiler;
+                            schema_depth = search_compiler->struct_schemas[i].depth;
                             break;
                         }
                     }
@@ -1932,6 +2001,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 // If it's a struct schema, handle as positional struct instantiation
                 if (schema) {
+                    /* Phase 4.5c HARD parity: schema constant emission matches the
+                     * resolver's classification of the type-name reference.
+                     *   root compiler + depth 0       -> GLOBAL (top-level decl)
+                     *   declared in current frame     -> LOCAL  (nested decl, same fn)
+                     *   declared in ancestor fn frame -> UPVALUE (cross-fn access)
+                     * This mirrors resolve_local/resolve_upvalue for regular
+                     * identifiers; without it, a function-local struct would
+                     * mismatch the resolver's nested STRUCT reference. */
+                    COMPILER_TRACE_TOK(compiler, name,
+                        (schema_owner->enclosing == NULL && schema_depth == 0) ? ZYM_RES_GLOBAL
+                        : (schema_owner == compiler) ? ZYM_RES_LOCAL
+                        : ZYM_RES_UPVALUE, -1, -1);
                     // Validate argument count matches field count
                     if (arg_count != schema->field_count) {
                         compiler_error(compiler, expr->line,
@@ -2059,6 +2140,13 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 } else {
                     COMPILE_REQUIRED(compiler, callee, call_base);
                 }
+            } else {
+                /* Phase 4.5 GLOBAL parity: CALL_SELF optimizes away the global
+                 * load (VM uses the frame's current callee). The resolver
+                 * classifies this identifier as a top-level FUNC reference; record
+                 * a GLOBAL trace at the user Token so the parity test confirms
+                 * classification agreement despite the codegen optimization. */
+                COMPILER_TRACE_TOK(compiler, &callee->as.variable.name, ZYM_RES_GLOBAL, -1, -1);
             }
 
             // Compile arguments - simple pass-by-value
@@ -2173,11 +2261,16 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             // Lookup struct schema (check current and enclosing scopes)
             ObjStructSchema* schema = NULL;
+            Compiler* schema_owner = NULL;
+            int schema_depth = 0;
+            (void)schema_owner; (void)schema_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
             Compiler* search_compiler = compiler;
             while (search_compiler != NULL && schema == NULL) {
                 for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
                     if (tokens_equal(&struct_expr->struct_name, &search_compiler->struct_schemas[i].name)) {
                         schema = search_compiler->struct_schemas[i].schema;
+                        schema_owner = search_compiler;
+                        schema_depth = search_compiler->struct_schemas[i].depth;
                         break;
                     }
                 }
@@ -2189,6 +2282,15 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
                 break;
             }
+
+            /* Phase 4.5c HARD parity: schema constant emission matches the
+             * resolver's classification of the type-name reference (GLOBAL
+             * for root+depth0, LOCAL for current-frame decl, UPVALUE for
+             * ancestor-frame decl). See EXPR_CALL struct-call site for rationale. */
+            COMPILER_TRACE_TOK(compiler, &struct_expr->struct_name,
+                (schema_owner->enclosing == NULL && schema_depth == 0) ? ZYM_RES_GLOBAL
+                : (schema_owner == compiler) ? ZYM_RES_LOCAL
+                : ZYM_RES_UPVALUE, -1, -1);
 
             // Add schema to constants
             int schema_const = make_constant(compiler, OBJ_VAL(schema));
@@ -2324,9 +2426,34 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // First, check if this is actually an enum value access (EnumName.VARIANT)
             if (get_expr->object->type == EXPR_VARIABLE) {
                 Token* enum_name = &get_expr->object->as.variable.name;
-                ObjEnumSchema* enum_schema = get_enum_schema(compiler, enum_name);
+                /* Walk enclosing compilers to locate the declaring frame (needed
+                 * for Phase 4.5c HARD parity trace kind). */
+                ObjEnumSchema* enum_schema = NULL;
+                Compiler* enum_owner = NULL;
+                int enum_depth = 0;
+                (void)enum_owner; (void)enum_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
+                for (Compiler* c = compiler; c != NULL && enum_schema == NULL; c = c->enclosing) {
+                    for (int i = c->enum_schema_count - 1; i >= 0; i--) {
+                        if (tokens_equal(enum_name, &c->enum_schemas[i].name)) {
+                            enum_schema = c->enum_schemas[i].schema;
+                            enum_owner = c;
+                            enum_depth = c->enum_schemas[i].depth;
+                            break;
+                        }
+                    }
+                }
 
                 if (enum_schema) {
+                    /* Phase 4.5c HARD parity: enum value materialization matches
+                     * the resolver's classification of the enum type name
+                     * (GLOBAL for root+depth0, LOCAL for current-frame decl,
+                     * UPVALUE for ancestor-frame decl). The variant name is bound
+                     * to a VARIANT child symbol by the resolver and is currently
+                     * skipped by the parity test (PROPERTY trace follow-up). */
+                    COMPILER_TRACE_TOK(compiler, enum_name,
+                        (enum_owner->enclosing == NULL && enum_depth == 0) ? ZYM_RES_GLOBAL
+                        : (enum_owner == compiler) ? ZYM_RES_LOCAL
+                        : ZYM_RES_UPVALUE, -1, -1);
                     // This is an enum value access, not a property access
                     Token* variant_name = &get_expr->name;
 
@@ -2556,9 +2683,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, increment, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, temp, 0), expr->line);
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, target_reg, name_const), expr->line);
+                    emit_set_global(compiler, target_reg, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
@@ -2621,10 +2748,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, increment, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, temp, 0), expr->line);
                     // POST_INC returns old value, temp now has incremented value
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, temp, name_const), expr->line);
+                    emit_set_global(compiler, temp, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
@@ -2686,9 +2813,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, decrement, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, temp, 0), expr->line);
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, target_reg, name_const), expr->line);
+                    emit_set_global(compiler, target_reg, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]--
@@ -2754,10 +2881,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, decrement, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, temp, 0), expr->line);
                     // POST_DEC returns old value, temp now has decremented value
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, temp, name_const), expr->line);
+                    emit_set_global(compiler, temp, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]--
@@ -3168,7 +3295,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 emit_move(compiler, name_ident, closure_reg, stmt->line);
             } else {
                 // For a global function, update the global variable.
-                emit_set_global(compiler, closure_reg, name_ident, stmt->line);
+                /* Phase 4.5: declaration site — resolver emits a DEFINITION,
+                 * not a reference. Pass NULL to skip GLOBAL trace emission. */
+                emit_set_global(compiler, closure_reg, name_ident, stmt->line, NULL);
             }
             return false;
         }

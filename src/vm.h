@@ -5,6 +5,7 @@
 #include "./table.h"
 #include <stdint.h>
 #include "./config.h"
+#include "zym/config.h" /* ZYM_HAS_* feature flags */
 #include "./allocator.h"
 #include "./source_file.h"
 #include "./diagnostics.h"
@@ -160,6 +161,14 @@ typedef struct VM {
     // starting a new compile. Parser polls at every declaration boundary;
     // compiler polls at every statement-emit boundary.
     volatile sig_atomic_t compile_cancelled;
+
+#if ZYM_HAS_BUILD_TESTING
+    // Phase 4.5: compiler resolution-trace buffer used by the parity test
+    // between `resolver.c` and `compiler.c`. Non-NULL only between
+    // zym_compilerTraceBegin() and zym_compilerTraceEnd(). Shipping builds
+    // do not have this field.
+    struct ZymResolutionTrace* active_trace;
+#endif
 } VM;
 
 typedef enum {

@@ -122,6 +122,9 @@ ZymChunk* zym_newChunk(ZymVM* vm)
 void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
 {
     if (chunk == NULL) return;
+    if (vm->chunk == chunk) {
+        vm->chunk = NULL;
+    }
     freeChunk(vm, chunk);
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
