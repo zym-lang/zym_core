@@ -1238,6 +1238,17 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
             // TCO_AGGRESSIVE: Non-variable callee (e.g., arr[0], obj.method, lambda)
             compile_expression(compiler, callee, call_base);
         }
+    } else {
+        /* Phase 4.5d scope-aware TAIL_CALL_SELF parity: same rationale as
+         * the non-TCO CALL_SELF site — the codegen skips the callee load,
+         * but the resolver classifies the identifier according to where
+         * the self-function was declared. Emit a matching trace so the
+         * parity test sees classification agreement. */
+        COMPILER_TRACE_TOK(compiler, &callee->as.variable.name,
+            is_hoisted_in_enclosing(compiler, &callee->as.variable.name, arg_count)
+                ? ZYM_RES_UPVALUE
+                : ZYM_RES_GLOBAL,
+            -1, -1);
     }
 
     // Compile arguments into temporary registers first to avoid overwriting current parameters
@@ -2141,12 +2152,19 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     COMPILE_REQUIRED(compiler, callee, call_base);
                 }
             } else {
-                /* Phase 4.5 GLOBAL parity: CALL_SELF optimizes away the global
-                 * load (VM uses the frame's current callee). The resolver
-                 * classifies this identifier as a top-level FUNC reference; record
-                 * a GLOBAL trace at the user Token so the parity test confirms
-                 * classification agreement despite the codegen optimization. */
-                COMPILER_TRACE_TOK(compiler, &callee->as.variable.name, ZYM_RES_GLOBAL, -1, -1);
+                /* Phase 4.5d scope-aware CALL_SELF parity: CALL_SELF optimizes
+                 * away the callee load (VM uses the frame's current callee).
+                 * The resolver classifies this identifier based on where the
+                 * self-function was declared — top-level func → GLOBAL, nested
+                 * func (declared inside an enclosing function) → UPVALUE.
+                 * Mirror resolve_and_load_function's decision tree so the
+                 * parity trace matches the resolver even though the codegen
+                 * optimization skipped the actual resolution. */
+                COMPILER_TRACE_TOK(compiler, &callee->as.variable.name,
+                    is_hoisted_in_enclosing(compiler, &callee->as.variable.name, arg_count)
+                        ? ZYM_RES_UPVALUE
+                        : ZYM_RES_GLOBAL,
+                    -1, -1);
             }
 
             // Compile arguments - simple pass-by-value
