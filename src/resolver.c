@@ -230,6 +230,7 @@ static int ctx_lookup_ex(const Ctx* ctx, const Token* nm, int* out_scope_idx)
         int base = ctx->scopes[s].base;
         int end  = (s + 1 < ctx->scope_count) ? ctx->scopes[s + 1].base
                                               : ctx->visible_end;
+        int scope_depth = ctx->scopes[s].depth;
         // innermost-first within a scope: iterate in reverse so the
         // most-recently declared symbol wins on redeclaration.
         for (int i = end - 1; i >= base; i--) {
@@ -249,6 +250,15 @@ static int ctx_lookup_ex(const Ctx* ctx, const Token* nm, int* out_scope_idx)
             if (sy->kind == SYMBOL_KIND_FIELD ||
                 sy->kind == SYMBOL_KIND_VARIANT ||
                 sy->kind == SYMBOL_KIND_UPVALUE) continue;
+            // Phase 4.5c: symbols beyond the current scope's live range
+            // but still occupying indices < visible_end are orphans
+            // from already-popped deeper scopes (the table retains
+            // every symbol for host inspection; we never compact). An
+            // orphan has scope_depth greater than this scope's own
+            // depth — skip it so its popped declaration can't be
+            // re-exposed when a later outer-scope emit bumps
+            // visible_end past it.
+            if (sy->scope_depth > scope_depth) continue;
             if (sy->name_length == need && sy->name != NULL &&
                 memcmp(sy->name, nb, (size_t)need) == 0) {
                 if (out_scope_idx) *out_scope_idx = s;

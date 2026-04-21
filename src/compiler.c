@@ -741,6 +741,7 @@ static ObjEnumSchema* get_enum_schema(Compiler* compiler, const Token* name) {
     return NULL;
 }
 
+
 static void record_global_type(Compiler* compiler, ObjString* var_name, ObjStructSchema* schema) {
     Compiler* root = compiler;
     while (root->enclosing) root = root->enclosing;
