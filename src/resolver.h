@@ -64,9 +64,22 @@ typedef enum {
     SYMBOL_KIND_LOCAL,   // block-scoped var declaration (4.1b)
     SYMBOL_KIND_FIELD,   // struct field (4.1c) — parent_index -> enclosing STRUCT
     SYMBOL_KIND_VARIANT, // enum variant (4.1c) — parent_index -> enclosing ENUM
-    SYMBOL_KIND_UPVALUE  // captured binding (4.1d) — parent_index -> origin
+    SYMBOL_KIND_UPVALUE, // captured binding (4.1d) — parent_index -> origin
                          // symbol (LOCAL / PARAM / another UPVALUE in the
                          // next enclosing function frame)
+    SYMBOL_KIND_NATIVE   // host-registered native function (pre-seeded from
+                         // `vm->globals` at the start of
+                         // `resolver_resolve_top_level`) so bare-name uses
+                         // like `print(...)`, `length(x)`, `assert(...)`
+                         // resolve to a real symbol instead of dropping to
+                         // -1. name points into the `ObjString` of the
+                         // mangled global key (`print@1`, `str@v1`, ...),
+                         // name_length truncated at '@' so consumers see
+                         // only the user-facing name. No def_span, no
+                         // file-backed name span — lookup-by-position
+                         // queries (findSymbolAt, outline) filter natives
+                         // out naturally via `name_file_id ==
+                         // ZYM_FILE_ID_INVALID`.
 } SymbolKind;
 
 // A single resolved declaration.

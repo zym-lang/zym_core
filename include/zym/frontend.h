@@ -285,9 +285,18 @@ typedef enum {
     ZYM_SYMBOL_LOCAL,   // block-scoped var declaration (Phase 4.1b)
     ZYM_SYMBOL_FIELD,   // struct field (Phase 4.1c) — parentIndex -> enclosing STRUCT
     ZYM_SYMBOL_VARIANT, // enum variant (Phase 4.1c) — parentIndex -> enclosing ENUM
-    ZYM_SYMBOL_UPVALUE  // captured binding (Phase 4.1d) — parentIndex -> origin
+    ZYM_SYMBOL_UPVALUE, // captured binding (Phase 4.1d) — parentIndex -> origin
                         // symbol (LOCAL / PARAM / another UPVALUE in the
                         // next enclosing function frame).
+    ZYM_SYMBOL_NATIVE   // host-registered native function (Phase 4.5c) —
+                        // pre-seeded from `vm->globals` so bare-name
+                        // uses like `print(...)` / `length(x)` resolve
+                        // to a real symbol. `nameFileId ==
+                        // ZYM_FILE_ID_INVALID` and `nameStartByte < 0`
+                        // so position-based queries (outline,
+                        // findSymbolAt) filter natives out naturally;
+                        // hover / semantic tokens follow the symbol by
+                        // index like any other.
 } ZymSymbolKind;
 
 // A single resolved declaration, copied out of the symbol table by

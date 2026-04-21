@@ -846,6 +846,7 @@ static ZymSemanticTokenKind classify_token_type(TokenType t) {
 static ZymSemanticTokenKind symbol_kind_to_semtok(SymbolKind k) {
     switch (k) {
         case SYMBOL_KIND_FUNC:    return ZYM_SEMTOK_FUNCTION;
+        case SYMBOL_KIND_NATIVE:  return ZYM_SEMTOK_FUNCTION;
         case SYMBOL_KIND_VAR:     return ZYM_SEMTOK_VARIABLE;
         case SYMBOL_KIND_PARAM:   return ZYM_SEMTOK_PARAMETER;
         case SYMBOL_KIND_LOCAL:   return ZYM_SEMTOK_LOCAL;

@@ -6,6 +6,8 @@
 #include "./ast.h"
 #include "./memory.h"
 #include "./node_span.h"
+#include "./object.h"
+#include "./value.h"
 #include "./vm.h"
 
 #include <stdbool.h>
@@ -123,6 +125,18 @@ typedef struct {
     int* upvalue_symbols;    // corresponding UPVALUE symbol indices
     int  upvalue_count;
     int  upvalue_capacity;
+    // Phase 4: mirrors compiler.c's per-block func pre-declaration
+    // (see the BLOCK handler in compile_statement_impl that walks its
+    // direct `STMT_FUNC_DECLARATION` children before compiling them).
+    // When a scope is pushed for a BLOCK / loop body, we pre-emit the
+    // `SYMBOL_KIND_FUNC` entries for every direct `func` child into
+    // that scope, then set this flag. walk_stmt's STMT_FUNC_DECLARATION
+    // case then skips the redundant emit, leaving body-walk behaviour
+    // (param emit, body traversal) intact. This gives block-local
+    // hoisting (e.g. `helper()` called above `func helper() {...}`
+    // inside a for-loop body) without scoping leakage into the
+    // enclosing function frame.
+    bool funcs_hoisted;
 } Scope;
 
 typedef struct {
@@ -136,6 +150,14 @@ typedef struct {
     // `table->count` so that popped-but-retained symbols (the table
     // never deletes) stop participating in lookups.
     int              visible_end;
+    // Phase 4: two-pass top-level. Mirrors compiler.c's Pass 1 hoist of
+    // `FUNC`/`STRUCT`/`ENUM` declarations so that forward references
+    // inside function bodies (e.g. a call to `hoisted_factory(...)`
+    // above its declaration) bind to the real symbol instead of
+    // silently dropping to -1. The pre-pass sets this flag, then the
+    // full walk guards against re-emitting the same top-level
+    // declaration when `ctx_depth(ctx) == 0`.
+    bool             top_level_hoisted;
 } Ctx;
 
 static void ctx_init(Ctx* ctx, VM* vm, ZymSymbolTable* table)
@@ -150,7 +172,9 @@ static void ctx_init(Ctx* ctx, VM* vm, ZymSymbolTable* table)
     ctx->scopes[0].upvalue_symbols   = NULL;
     ctx->scopes[0].upvalue_count     = 0;
     ctx->scopes[0].upvalue_capacity  = 0;
-    ctx->visible_end   = 0;
+    ctx->scopes[0].funcs_hoisted     = false;
+    ctx->visible_end       = 0;
+    ctx->top_level_hoisted = false;
 }
 
 static int ctx_depth(const Ctx* ctx)
@@ -181,6 +205,7 @@ static void ctx_push_scope_ex(Ctx* ctx, bool is_function_frame)
     sc->upvalue_symbols   = NULL;
     sc->upvalue_count     = 0;
     sc->upvalue_capacity  = 0;
+    sc->funcs_hoisted     = false;
     ctx->scope_count++;
 }
 
@@ -533,6 +558,7 @@ static void record_ref(Ctx* ctx, const Token* nm, bool is_write, int resolved_in
 // -----------------------------------------------------------------------------
 static void walk_expr(Ctx* ctx, const Expr* e);
 static void walk_stmt(Ctx* ctx, const Stmt* s);
+static void hoist_block_funcs(Ctx* ctx, Stmt** statements, int count);
 
 // Phase 4.1c: resolve a member-access name (GetExpr.name / SetExpr.name)
 // when the receiver is a direct VariableExpr whose name resolves to a
@@ -645,6 +671,9 @@ static void walk_expr(Ctx* ctx, const Expr* e)
             for (int i = 0; i < e->as.function.param_count; i++) {
                 emit_param(ctx, &e->as.function.params[i].name);
             }
+            // Body is a STMT_BLOCK whose scope-push handler pre-hoists
+            // direct `func` children, so forward calls to nested funcs
+            // inside the body resolve correctly.
             walk_stmt(ctx, e->as.function.body);
             ctx_pop_scope(ctx);
             break;
@@ -716,6 +745,13 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
         case STMT_BLOCK: {
             ctx_push_scope(ctx);
             const BlockStmt* b = &s->as.block;
+            // Per-block func hoist — mirrors compiler.c's BLOCK handler
+            // which pre-declares direct `STMT_FUNC_DECLARATION` children
+            // in the block scope before compiling body statements. This
+            // is what makes forward calls like `helper()` above its
+            // `func helper()` sibling resolve, whether the block is a
+            // top-level loop body, a function body, or nested.
+            hoist_block_funcs(ctx, b->statements, b->count);
             for (int i = 0; i < b->count; i++) walk_stmt(ctx, b->statements[i]);
             ctx_pop_scope(ctx);
             break;
@@ -758,12 +794,31 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
             // Function name is declared in the enclosing scope; params
             // + body live in a fresh function frame (Phase 4.1d) so
             // references to outer locals become UPVALUE symbols.
+            //
+            // When the pre-pass already hoisted this top-level func
+            // (mirrors compiler.c's Pass 1), skip the redundant
+            // emit_decl to avoid a duplicate SYMBOL_KIND_FUNC entry at
+            // depth 0. Nested (non-top-level) func decls still emit
+            // here normally.
             SymbolKind fn_kind = SYMBOL_KIND_FUNC;
-            emit_decl(ctx, fn_kind, &s->as.func_declaration.name, s);
+            // Skip emit_decl when this name is already present in the
+            // current scope thanks to a pre-pass:
+            //   (a) top-level pre-pass (mirrors compiler.c Pass 1), or
+            //   (b) enclosing BLOCK's per-block pre-hoist (mirrors
+            //       compiler.c's BLOCK handler pre-declaration).
+            // In both cases re-emitting would duplicate the symbol.
+            bool enclosing_hoisted = ctx->scopes[ctx->scope_count - 1].funcs_hoisted;
+            bool top_hoisted = (ctx->top_level_hoisted && ctx_depth(ctx) == 0);
+            if (!top_hoisted && !enclosing_hoisted) {
+                emit_decl(ctx, fn_kind, &s->as.func_declaration.name, s);
+            }
             ctx_push_function_frame(ctx);
             for (int i = 0; i < s->as.func_declaration.param_count; i++) {
                 emit_param(ctx, &s->as.func_declaration.params[i].name);
             }
+            // Body is a STMT_BLOCK whose scope-push handler pre-hoists
+            // direct `func` children, so forward calls to nested funcs
+            // inside the body resolve correctly.
             walk_stmt(ctx, s->as.func_declaration.body);
             ctx_pop_scope(ctx);
             break;
@@ -772,6 +827,9 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
             walk_expr(ctx, s->as.return_stmt.value);
             break;
         case STMT_STRUCT_DECLARATION: {
+            // Top-level structs are fully registered (decl + fields) by
+            // the pre-pass; nothing to walk in the body here.
+            if (ctx->top_level_hoisted && ctx_depth(ctx) == 0) break;
             int idx = emit_decl(ctx, SYMBOL_KIND_STRUCT,
                                 &s->as.struct_declaration.name, s);
             if (idx >= 0) {
@@ -783,6 +841,9 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
             break;
         }
         case STMT_ENUM_DECLARATION: {
+            // Top-level enums are fully registered (decl + variants) by
+            // the pre-pass; nothing to walk in the body here.
+            if (ctx->top_level_hoisted && ctx_depth(ctx) == 0) break;
             int idx = emit_decl(ctx, SYMBOL_KIND_ENUM,
                                 &s->as.enum_declaration.name, s);
             if (idx >= 0) {
@@ -815,6 +876,169 @@ static void walk_stmt(Ctx* ctx, const Stmt* s)
 }
 
 // -----------------------------------------------------------------------------
+// Host-registered natives pre-seed (Phase 4.5c)
+// -----------------------------------------------------------------------------
+// The compiler classifies every bare-name use of a host-registered
+// native (`print`, `length`, `str`, `assert`, ...) as a GLOBAL and
+// emits `GET_GLOBAL` for it. The runtime then resolves the call
+// through the mangled key (`print@<arity>` / `print@v<fixed>`) stored
+// in `vm->globals`.
+//
+// For LSP parity the resolver must do the same classification: a
+// call-site to `print(...)` has to resolve to a real symbol instead
+// of dropping to -1. We pre-seed the top-level scope with one
+// `SYMBOL_KIND_NATIVE` symbol per distinct bare name found in
+// `vm->globals` whose value is an `ObjNativeFunction`.
+//
+// Naming: the stored key is mangled (e.g. "print@1"). We borrow the
+// `ObjString.chars` pointer directly and set `name_length` to the
+// position of the '@' separator so hosts see only the user-facing
+// name. Lifetime is fine — global-table entries are GC roots and
+// their `ObjString`s outlive the resolver call.
+//
+// Span: natives have no editor-visible declaration. `name_file_id =
+// ZYM_FILE_ID_INVALID`, `name_start_byte = -1`, and `def_span` is
+// zeroed so position-keyed queries (`findSymbolAt`, `listFileSymbols`)
+// filter them out naturally.
+//
+// Dedup: multiple arities of the same bare name (e.g. `Random()` and
+// `Random(seed)`) collapse to one NATIVE symbol.
+static int find_native_bare(const ZymSymbolTable* table,
+                            const char* name, int name_length)
+{
+    for (int i = 0; i < table->count; i++) {
+        const Symbol* s = &table->symbols[i];
+        if (s->kind != SYMBOL_KIND_NATIVE) continue;
+        if (s->name_length != name_length) continue;
+        if (s->name == NULL || name == NULL) continue;
+        if (memcmp(s->name, name, (size_t)name_length) == 0) return i;
+    }
+    return -1;
+}
+
+static void seed_natives_from_globals(Ctx* ctx)
+{
+    if (ctx == NULL || ctx->vm == NULL) return;
+    const Table* globals = &ctx->vm->globals;
+    if (globals->entries == NULL) return;
+
+    for (int i = 0; i < globals->capacity; i++) {
+        const Entry* e = &globals->entries[i];
+        if (e->key == NULL) continue;
+        // Slot-based user globals (see zym_defineGlobal) store a
+        // DOUBLE_VAL slot index. Real native bindings store an
+        // ObjNativeFunction; that's our filter.
+        if (!IS_OBJ(e->value)) continue;
+        if (AS_OBJ(e->value)->type != OBJ_NATIVE_FUNCTION) continue;
+
+        const char* chars = e->key->chars;
+        int         len   = e->key->length;
+        if (chars == NULL || len <= 0) continue;
+
+        // Strip the "@<arity>" / "@v<fixed>" suffix.
+        int bare_len = len;
+        for (int j = 0; j < len; j++) {
+            if (chars[j] == '@') { bare_len = j; break; }
+        }
+        if (bare_len <= 0) continue;
+
+        // Dedup: overloaded natives (`Random()` / `Random(seed)`) get
+        // one NATIVE symbol.
+        if (find_native_bare(ctx->table, chars, bare_len) >= 0) continue;
+
+        Symbol s;
+        s.kind                  = SYMBOL_KIND_NATIVE;
+        s.name                  = chars;
+        s.name_length           = bare_len;
+        s.name_file_id          = ZYM_FILE_ID_INVALID;
+        s.name_start_byte       = -1;
+        s.def_span.fileId       = ZYM_FILE_ID_INVALID;
+        s.def_span.startByte    = -1;
+        s.def_span.length       = 0;
+        s.def_span.startLine    = 0;
+        s.def_span.startColumn  = 0;
+        s.def_span.endLine      = 0;
+        s.def_span.endColumn    = 0;
+        s.scope_depth           = 0;
+        s.parent_index          = -1;
+        (void)push_symbol(ctx->vm, ctx->table, s);
+        ctx->visible_end = ctx->table->count;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Per-block func pre-hoist (mirrors compiler.c's BLOCK handler).
+// -----------------------------------------------------------------------------
+// Scans a block's direct statement list for `STMT_FUNC_DECLARATION`
+// children and emits a `SYMBOL_KIND_FUNC` entry for each into the
+// current (top) scope. Does NOT recurse into nested blocks, loop
+// bodies, or if-branches — each such construct pushes its own scope
+// and runs its own per-block hoist on scope entry. Also does not
+// recurse into function bodies (those are separate frames). This
+// uniform per-block model handles every forward-call case the
+// compiler handles: top-level blocks, function bodies, loop bodies,
+// if-branches, and their nestings.
+static void hoist_block_funcs(Ctx* ctx, Stmt** statements, int count)
+{
+    if (statements == NULL) return;
+    for (int i = 0; i < count; i++) {
+        const Stmt* s = statements[i];
+        if (s == NULL) continue;
+        if (s->type == STMT_FUNC_DECLARATION) {
+            emit_decl(ctx, SYMBOL_KIND_FUNC,
+                      &s->as.func_declaration.name, s);
+        }
+    }
+    ctx->scopes[ctx->scope_count - 1].funcs_hoisted = true;
+}
+
+// -----------------------------------------------------------------------------
+// Top-level pre-pass (mirrors compiler.c Pass 1)
+// -----------------------------------------------------------------------------
+// Registers declarations that the compiler hoists so forward references
+// inside later function bodies (e.g. `hoisted_factory(1000)` appearing
+// above `func hoisted_factory(...) {...}`) resolve to the real symbol
+// instead of silently dropping to -1. Only `FUNC`, `STRUCT`, and `ENUM`
+// are hoisted — this matches exactly what `compile()` Pass 1 registers
+// at the top level. Top-level `var`s remain globals that bind by name
+// at runtime, so we don't hoist them here either (matches compiler).
+static void hoist_top_level_decl(Ctx* ctx, const Stmt* s)
+{
+    if (s == NULL) return;
+    switch (s->type) {
+        case STMT_FUNC_DECLARATION:
+            emit_decl(ctx, SYMBOL_KIND_FUNC,
+                      &s->as.func_declaration.name, s);
+            break;
+        case STMT_STRUCT_DECLARATION: {
+            int idx = emit_decl(ctx, SYMBOL_KIND_STRUCT,
+                                &s->as.struct_declaration.name, s);
+            if (idx >= 0) {
+                const StructDeclStmt* sd = &s->as.struct_declaration;
+                for (int i = 0; i < sd->field_count; i++) {
+                    emit_child(ctx, SYMBOL_KIND_FIELD, &sd->fields[i], idx);
+                }
+            }
+            break;
+        }
+        case STMT_ENUM_DECLARATION: {
+            int idx = emit_decl(ctx, SYMBOL_KIND_ENUM,
+                                &s->as.enum_declaration.name, s);
+            if (idx >= 0) {
+                const EnumDeclStmt* ed = &s->as.enum_declaration;
+                for (int i = 0; i < ed->variant_count; i++) {
+                    emit_child(ctx, SYMBOL_KIND_VARIANT,
+                               &ed->variants[i], idx);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------------
 bool resolver_resolve_top_level(VM* vm, const ZymParseTree* tree,
@@ -826,6 +1050,29 @@ bool resolver_resolve_top_level(VM* vm, const ZymParseTree* tree,
     Ctx ctx;
     ctx_init(&ctx, vm, table);
 
+    // Seed host-registered natives into the top-level scope so bare-name
+    // uses like `print(...)` resolve to a real symbol (Phase 4.5c).
+    // Runs before hoisting so user top-level decls with the same name
+    // (e.g. `var print = ...`) shadow the native on innermost-first
+    // lookup, matching how the compiler's slot-based globals supersede
+    // mangled native bindings.
+    seed_natives_from_globals(&ctx);
+
+    // Pre-pass: hoist top-level FUNC/STRUCT/ENUM declarations so
+    // forward references inside function bodies resolve correctly.
+    // Mirrors compiler.c Pass 1 (`declare_function` + early struct/enum
+    // registration). Runs at depth 0 with no body walk, no initializer
+    // walk — just symbol emission.
+    for (int i = 0; i < tree->ast.capacity; i++) {
+        Stmt* s = tree->ast.statements[i];
+        if (s == NULL) break;  // NULL sentinel
+        hoist_top_level_decl(&ctx, s);
+    }
+    ctx.top_level_hoisted = true;
+
+    // Full walk: resolve references and register remaining decls. The
+    // `top_level_hoisted` flag tells `walk_stmt` to skip re-emitting
+    // the symbols the pre-pass already registered at depth 0.
     for (int i = 0; i < tree->ast.capacity; i++) {
         Stmt* s = tree->ast.statements[i];
         if (s == NULL) break;  // NULL sentinel
