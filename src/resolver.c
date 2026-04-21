@@ -239,8 +239,16 @@ static int ctx_lookup_ex(const Ctx* ctx, const Token* nm, int* out_scope_idx)
             // access, never by a bare identifier. Including them in
             // the plain scope walk would let e.g. `x` resolve to a
             // `Point.x` field declared at the same scope depth.
+            // Skip UPVALUE symbols too: they are consumed via the
+            // per-frame dedup map + `parent_index`, never by bare-name
+            // lookup. Leaving them visible here would let an outer-
+            // scope use site re-resolve to a stale UPVALUE synthesized
+            // by a now-popped inner function frame (e.g. writing
+            // `a = 10` in the outer function AFTER an inner closure
+            // captured `a`).
             if (sy->kind == SYMBOL_KIND_FIELD ||
-                sy->kind == SYMBOL_KIND_VARIANT) continue;
+                sy->kind == SYMBOL_KIND_VARIANT ||
+                sy->kind == SYMBOL_KIND_UPVALUE) continue;
             if (sy->name_length == need && sy->name != NULL &&
                 memcmp(sy->name, nb, (size_t)need) == 0) {
                 if (out_scope_idx) *out_scope_idx = s;
