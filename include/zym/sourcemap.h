@@ -15,6 +15,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct SourceMap ZymSourceMap;
 
 #ifndef ZYM_VM_FWD_DECLARED
@@ -56,3 +60,7 @@ int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out);
 // pair each `zym_newSourceMap` with a `zym_freeSourceMap`.
 ZymSourceMap* zym_newSourceMap(ZymVM* vm);
 void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map);
+
+#ifdef __cplusplus
+}
+#endif

@@ -4,6 +4,10 @@
 
 #include "zym/sourcemap.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef ZYM_VM_FWD_DECLARED
 #define ZYM_VM_FWD_DECLARED
 typedef struct VM ZymVM;
@@ -39,3 +43,7 @@ ModuleLoadResult* loadModules(
 );
 
 void freeModuleLoadResult(ZymVM* vm, ModuleLoadResult* result);
+
+#ifdef __cplusplus
+}
+#endif

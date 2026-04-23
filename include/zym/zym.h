@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // =============================================================================
 // CUSTOM ALLOCATOR (defined in allocator.h, shared with internal headers)
 // =============================================================================
@@ -431,4 +435,8 @@ ZymValue zym_peekRoot(ZymVM* vm, int depth);  // 0 = top of root stack
 // Report a runtime error from native code
 // This will print the error and set the VM to error state
 void zym_runtimeError(ZymVM* vm, const char* format, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
