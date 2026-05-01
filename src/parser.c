@@ -147,11 +147,20 @@ static void error_at_current(Parser* parser, const char* message) {
     // responsible for turning those fields into "[file] line N at 'tok':"
     // headers or rustc-style carets. The message field is now just the
     // bare sentence, e.g. "Expect expression.".
+    //
+    // We report the *origin* (pre-preprocess) span: the scanner walks
+    // the post-preprocess combined buffer, but the user only knows
+    // their own files. `Token.line` is already SourceMap-mapped to the
+    // origin file's 1-based line; emitting the origin{FileId,
+    // StartByte,Length} alongside it lets the renderer fetch the
+    // *original* bytes by `d->fileId` so the snippet under the caret
+    // matches the line number — instead of indexing the preprocessed
+    // buffer with an origin-line and printing a misaligned line.
     pushDiagnostic(parser->vm,
                    ZYM_DIAG_ERROR,
-                   parser->current.fileId,
-                   parser->current.startByte,
-                   parser->current.length,
+                   parser->current.originFileId,
+                   parser->current.originStartByte,
+                   parser->current.originLength,
                    parser->current.line,
                    parser->current.startColumn,
                    "%s", message ? message : "");
@@ -171,9 +180,9 @@ static void error_at_previous(Parser* parser, const char* message) {
 
     pushDiagnostic(parser->vm,
                    ZYM_DIAG_ERROR,
-                   parser->previous.fileId,
-                   parser->previous.startByte,
-                   parser->previous.length,
+                   parser->previous.originFileId,
+                   parser->previous.originStartByte,
+                   parser->previous.originLength,
                    parser->previous.line,
                    parser->previous.startColumn,
                    "%s", message ? message : "");
@@ -276,16 +285,40 @@ static Expr* parse_precedence(Parser* parser, Precedence precedence) {
     Expr* left_expr = prefix_rule(parser, can_assign);
 
     while (precedence <= get_rule(parser->current.type)->precedence) {
-        // Don't treat '(' as call operator if it's on a new line
-        if (parser->current.type == TOKEN_LEFT_PAREN &&
-            parser->current.line > parser->previous.line) {
-            break;
+        // ASI restricted productions: certain tokens, when they appear
+        // at the start of a new line, must NOT extend the previous
+        // expression — they begin a new statement instead. This mirrors
+        // ECMA-262's "no LineTerminator before X" restrictions:
+        //
+        //   '('  : `expr␤(args)`     → call vs. parenthesized expression
+        //   '['  : `expr␤[i]`        → subscript vs. list literal stmt
+        //   '++' : `expr␤++ident`    → postfix vs. prefix increment stmt
+        //   '--' : `expr␤--ident`    → postfix vs. prefix decrement stmt
+        //
+        // Without this guard, e.g. `Console.write(ch)␤++col` parses as
+        // `Console.write(ch)++` followed by a stray `col`, surfacing as
+        // a confusing "Expect ';' after expression." on the line that
+        // starts with `++`. The guard only fires inside the infix-
+        // extension loop (we already have a left-hand expression), so
+        // `++i` written as a brand-new statement still parses via the
+        // prefix table and is unaffected.
+        if (parser->current.line > parser->previous.line) {
+            switch (parser->current.type) {
+                case TOKEN_LEFT_PAREN:
+                case TOKEN_LEFT_BRACKET:
+                case TOKEN_PLUS_PLUS:
+                case TOKEN_MINUS_MINUS:
+                    goto end_infix_loop;
+                default:
+                    break;
+            }
         }
 
         advance(parser);
         InfixParseFn infix_rule = get_rule(parser->previous.type)->infix;
         left_expr = infix_rule(parser, left_expr);
     }
+end_infix_loop:;
 
     if (can_assign && match(parser, TOKEN_EQUAL)) {
         error_at_current(parser, "Invalid assignment target.");

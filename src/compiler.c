@@ -187,10 +187,18 @@ static void compiler_error_emit(Compiler* compiler, const Token* tok, int line,
     char msg_buf[1024];
     vsnprintf(msg_buf, sizeof(msg_buf), format, args);
 
-    ZymFileId fileId = tok ? tok->fileId : ZYM_FILE_ID_INVALID;
-    int startByte    = tok ? tok->startByte : -1;
-    int length       = tok ? tok->length : 0;
-    int column       = tok ? tok->startColumn : -1;
+    // Phase 1.7: report the *origin* (pre-preprocess) span. The token's
+    // primary `fileId/startByte/length` track the post-preprocess buffer
+    // the scanner walked; routing those to the diagnostic sink would
+    // make the renderer pull a snippet from the preprocessed buffer
+    // while the SourceMap-mapped `line` belongs to the user-visible
+    // origin file — the two would not align. The `originFileId` is set
+    // to the user's source by the scanner via SourceMap lookup, with a
+    // graceful fallback to the scanned file when no mapping exists.
+    ZymFileId fileId = tok ? tok->originFileId    : ZYM_FILE_ID_INVALID;
+    int startByte    = tok ? tok->originStartByte : -1;
+    int length       = tok ? tok->originLength    : 0;
+    int column       = tok ? tok->startColumn     : -1;
 
     pushDiagnostic(compiler->vm,
                    ZYM_DIAG_ERROR,
@@ -4635,7 +4643,9 @@ bool parseOnly(VM* vm, const char* source,
     if (out_tree == NULL) return false;
     *out_tree = NULL;
 
-    sfr_reset(&vm->source_files);
+    // Phase 1.7: do not wipe the registry — the embedder may have
+    // pre-registered origin source files whose ids the SourceMap's
+    // segments reference. See the matching note in `compile()`.
     size_t source_length = source != NULL ? strlen(source) : 0;
     ZymFileId file_id = sfr_register(vm, &vm->source_files,
                                      entry_file, source, source_length);
@@ -4704,13 +4714,22 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
              const char* entry_file, CompilerConfig config,
              ZymParseTree** out_tree) {
     if (out_tree) *out_tree = NULL;
-    // Phase 1.1: register the preprocessed source buffer with the VM's
-    // SourceFileRegistry so scanner tokens can refer back to it by
-    // ZymFileId. The registry is reset before this compile starts so each
-    // top-level compile gets a fresh file-id namespace (a later PR may
-    // keep the registry across compiles for module graphs; 1.1 scope is
-    // single-file).
-    sfr_reset(&vm->source_files);
+    // Phase 1.1 / 1.7: register the preprocessed source buffer with the
+    // VM's SourceFileRegistry so scanner tokens can refer back to it by
+    // ZymFileId. Embedders that drive the pipeline manually (CLI, LSP,
+    // batch tooling) typically register the *original* user-visible
+    // sources first (entry + each imported module) and pass their ids
+    // into `zym_preprocess`, which stamps every SourceMap segment with
+    // the matching origin id. We must not wipe those registrations here
+    // — the SourceMap segments would point at dead ids, and diagnostic
+    // renderers that look up the snippet via `d->fileId` would fall
+    // back to the post-preprocess buffer, producing the misaligned
+    // "line N from the origin file printed under preprocessed line N"
+    // bug. We therefore append the preprocessed buffer to whatever the
+    // caller already populated. When no caller pre-registered anything
+    // (legacy single-call sites that only invoke `compile`) the
+    // registry is naturally empty and this still gives the preprocessed
+    // buffer fileId 0, matching the pre-1.7 behavior.
     size_t source_length = source != NULL ? strlen(source) : 0;
     ZymFileId file_id = sfr_register(vm, &vm->source_files, entry_file, source, source_length);
 
