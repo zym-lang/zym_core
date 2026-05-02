@@ -3585,7 +3585,19 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     ObjClosure* closure = AS_CLOSURE(callee);
     ObjFunction* function = closure->function;
 
-    if (argCount != function->arity) {
+    // Mirror OP(CALL)'s arity-check logic: variadic closures accept any
+    // arg count >= fixed_arity (the trailing args are packed into the rest
+    // parameter by the callee's prologue). The earlier strict equality check
+    // here rejected legitimate C-API invocations of script-side variadic
+    // closures (e.g., parent `func(...parts)` invoked via `zym_callClosurev`).
+    if (function->is_variadic) {
+        if (argCount < function->fixed_arity) {
+            runtimeError(vm, "Expected at least %d arguments but got %d.",
+                         function->fixed_arity, argCount);
+            vm->api_stack_top = frame_base;
+            return INTERPRET_RUNTIME_ERROR;
+        }
+    } else if (argCount != function->arity) {
         runtimeError(vm, "Expected %d arguments but got %d.", function->arity, argCount);
         vm->api_stack_top = frame_base;
         return INTERPRET_RUNTIME_ERROR;
@@ -3598,7 +3610,11 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     }
 
     // Calculate required stack size for this call
+    // Mirror OP(CALL): variadic functions with extra args need additional slots.
     int needed_top = frame_base + function->max_regs;
+    if (function->is_variadic && argCount > function->arity) {
+        needed_top += (argCount - function->arity);
+    }
 
     // Grow stack if needed (same logic as OP(CALL))
     if (needed_top > vm->stack_capacity) {
