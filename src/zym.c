@@ -2156,20 +2156,57 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
 
 ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
     if (!vm) return ZYM_STATUS_RUNTIME_ERROR;
+    if (argc < 0) argc = 0;
 
-    // Mirror zym_callv's convention: the host API call frame always starts at
-    // stack slot 0. Using vm->stack_top as the base would leak upward every
-    // invocation (stack_top never shrinks), eventually exhausting the stack.
-    vm->api_stack_top = 0;
-    vm->stack[0] = closure;
-    for (int i = 0; i < argc; i++) {
-        vm->stack[1 + i] = argv[i];
+    // Re-entrancy safety: the parent VM may be mid-evaluation when this is
+    // called (e.g., a child VM running a parent native trampoline that
+    // invokes a parent closure). Hardcoding the frame base to slot 0 would
+    // clobber the in-flight bytecode register state. Instead, place the
+    // frame above the current high-water `stack_top` so we don't trample
+    // anything live, then run; `zym_call_execute` writes the result back at
+    // `frame_base` and sets `api_stack_top = frame_base`, so subsequent
+    // `zym_getCallResult` finds it at the right slot.
+    int frame_base = vm->stack_top;
+
+    // Reserve room for closure + args. zym_call_execute will grow further
+    // for the callee's locals if needed; we only need enough to place args.
+    int needed = frame_base + 1 + argc;
+    if (needed > vm->stack_capacity) {
+        if (needed > STACK_MAX) return ZYM_STATUS_RUNTIME_ERROR;
+        int new_capacity = vm->stack_capacity;
+        while (new_capacity < needed) {
+            new_capacity *= 2;
+            if (new_capacity > STACK_MAX) new_capacity = STACK_MAX;
+        }
+        Value* old_stack = vm->stack;
+        Value* new_stack = (Value*)reallocate((VM*)vm, vm->stack,
+                                              sizeof(Value) * vm->stack_capacity,
+                                              sizeof(Value) * new_capacity);
+        for (int i = vm->stack_capacity; i < new_capacity; i++) new_stack[i] = NULL_VAL;
+        vm->stack = new_stack;
+        vm->stack_capacity = new_capacity;
+        updateStackReferences((VM*)vm, old_stack, new_stack);
     }
-    vm->api_stack_top = argc;
+
+    vm->stack[frame_base] = closure;
+    for (int i = 0; i < argc; i++) {
+        vm->stack[frame_base + 1 + i] = argv[i];
+    }
+    vm->api_stack_top = frame_base + argc;
+    if (vm->stack_top < frame_base + 1 + argc) {
+        vm->stack_top = frame_base + 1 + argc;
+    }
 
     InterpretResult result = zym_call_execute(vm, argc);
-    // zym_call_execute leaves the result at stack[0] and sets api_stack_top=0
-    // so zym_getCallResult can read it.
+    // zym_call_execute leaves the result at stack[frame_base] and sets
+    // api_stack_top=frame_base so zym_getCallResult can read it.
+
+    // Shrink stack_top back down to release any stale callee frame slots
+    // that grew the high-water mark. Keep the result slot live (one slot)
+    // so the immediate caller's `zym_getCallResult` still finds it.
+    if (vm->stack_top > frame_base + 1) {
+        vm->stack_top = frame_base + 1;
+    }
 
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
