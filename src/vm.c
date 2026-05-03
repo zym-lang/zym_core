@@ -3552,15 +3552,58 @@ InterpretResult runChunk(VM* vm, Chunk* chunk) {
     return run(vm);
 }
 
-bool zym_call_prepare(VM* vm, const char* functionName, int arity) {
-    // Mangle the name provided by the C host to match the compiler's internal name.
+// Resolve `functionName` against the runtime's three storage paths in
+// order: fixed mangled (`name@argc`), variadic mangled (`name@vF` with the
+// largest F ≤ argc — most specific accepting overload first), and the
+// bare-name binding (closures defined via `zym_defineGlobal`, e.g. the
+// cross-VM bridge's `registerNative` path). Mirrors what `zym_canCallWith`
+// answers, but returns the actual callable to invoke.
+static bool zym_call_prepare_lookup(VM* vm, const char* functionName, int arity, Value* out) {
     char mangled[256];
-    sprintf(mangled, "%s@%d", functionName, arity);
+    Value v;
 
+    // 1. Fixed mangled: name@arity
+    int n = snprintf(mangled, sizeof(mangled), "%s@%d", functionName, arity);
+    if (n > 0 && n < (int)sizeof(mangled)) {
+        ObjString* nameObj = copyString(vm, mangled, (int)strlen(mangled));
+        if (globalGet(vm, nameObj, &v) &&
+            (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) || IS_NATIVE_CLOSURE(v))) {
+            *out = v;
+            return true;
+        }
+    }
+
+    // 2. Variadic mangled: prefer the most-specific accepting prefix
+    //    (largest F ≤ arity). The variadic prologue packs the remaining
+    //    args into the rest parameter, so any F ≤ arity is callable.
+    int upper = arity < MAX_NATIVE_ARITY ? arity : MAX_NATIVE_ARITY;
+    for (int fixed = upper; fixed >= 0; fixed--) {
+        n = snprintf(mangled, sizeof(mangled), "%s@v%d", functionName, fixed);
+        if (n <= 0 || n >= (int)sizeof(mangled)) continue;
+        ObjString* nameObj = copyString(vm, mangled, (int)strlen(mangled));
+        if (globalGet(vm, nameObj, &v) &&
+            (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) || IS_NATIVE_CLOSURE(v))) {
+            *out = v;
+            return true;
+        }
+    }
+
+    // 3. Bare-name binding (zym_defineGlobal): closure / native closure /
+    //    native function / dispatcher stored under the unmangled name.
+    ObjString* bareName = copyString(vm, functionName, (int)strlen(functionName));
+    if (globalGet(vm, bareName, &v) &&
+        (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) ||
+         IS_NATIVE_CLOSURE(v) || IS_DISPATCHER(v))) {
+        *out = v;
+        return true;
+    }
+
+    return false;
+}
+
+bool zym_call_prepare(VM* vm, const char* functionName, int arity) {
     Value func_val;
-    ObjString* name_obj = copyString(vm, mangled, strlen(mangled));
-
-    if (!globalGet(vm, name_obj, &func_val) || !IS_CLOSURE(func_val)) {
+    if (!zym_call_prepare_lookup(vm, functionName, arity, &func_val)) {
         fprintf(stderr, "Error: Function '%s' with arity %d not found.\n", functionName, arity);
         return false;
     }

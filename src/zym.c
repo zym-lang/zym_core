@@ -2026,6 +2026,114 @@ bool zym_hasFunction(ZymVM* vm, const char* funcName, int arity) {
            (IS_CLOSURE(funcVal) || IS_NATIVE_FUNCTION(funcVal));
 }
 
+// Local helper: probe `funcName@<suffix>` (e.g. "@3" or "@v1") and return
+// true iff it resolves to a callable (script closure or native function).
+static bool zym_internal_hasMangled(ZymVM* vm, const char* funcName, const char* suffix) {
+    char mangled[256];
+    int written = snprintf(mangled, sizeof(mangled), "%s%s", funcName, suffix);
+    if (written < 0 || written >= (int)sizeof(mangled)) return false;
+
+    ObjString* nameObj = copyString(vm, mangled, (int)strlen(mangled));
+    Value funcVal;
+    return globalGet(vm, nameObj, &funcVal) &&
+           (IS_CLOSURE(funcVal) || IS_NATIVE_FUNCTION(funcVal));
+}
+
+// Local helper: fetch the bare-name global value if it resolves to a
+// callable (script closure, native closure, native function, or
+// dispatcher). Used to detect callables bound directly via
+// zym_defineGlobal — i.e., closures with attached context that the
+// runtime dispatches via OP_CALL on the bare name rather than through
+// the `name@N`/`name@vF` mangling table.
+static bool zym_internal_getBareCallable(ZymVM* vm, const char* funcName, Value* out) {
+    ObjString* nameObj = copyString(vm, funcName, (int)strlen(funcName));
+    Value v;
+    if (!globalGet(vm, nameObj, &v)) return false;
+    if (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) || IS_NATIVE_CLOSURE(v) || IS_DISPATCHER(v)) {
+        if (out) *out = v;
+        return true;
+    }
+    return false;
+}
+
+// Local helper: returns true iff `v` is a callable that accepts exactly
+// `argc` arguments (fixed-arity match or variadic acceptance with
+// argc >= fixed-prefix). For dispatchers we walk overloads and the
+// variadic fallback.
+static bool zym_internal_callableAcceptsArgc(Value v, int argc) {
+    if (IS_NATIVE_CLOSURE(v)) {
+        ObjNativeClosure* c = AS_NATIVE_CLOSURE(v);
+        if (c->is_variadic) return argc >= c->arity;
+        return c->arity == argc;
+    }
+    if (IS_NATIVE_FUNCTION(v)) {
+        ObjNativeFunction* f = AS_NATIVE_FUNCTION(v);
+        if (f->is_variadic) return argc >= f->arity;
+        return f->arity == argc;
+    }
+    if (IS_CLOSURE(v)) {
+        ObjClosure* c = AS_CLOSURE(v);
+        if (c->function->is_variadic) return argc >= c->function->arity;
+        return c->function->arity == argc;
+    }
+    if (IS_DISPATCHER(v)) {
+        ObjDispatcher* d = AS_DISPATCHER(v);
+        for (int i = 0; i < d->count; i++) {
+            Obj* o = d->overloads[i];
+            Value ov = OBJ_VAL(o);
+            if (zym_internal_callableAcceptsArgc(ov, argc)) return true;
+        }
+        if (d->variadic_fallback && argc >= d->variadic_min_arity) return true;
+        return false;
+    }
+    return false;
+}
+
+bool zym_hasAnyFunction(ZymVM* vm, const char* funcName) {
+    if (!vm || !funcName) return false;
+
+    // Bare-name binding: closures defined via zym_defineGlobal with attached
+    // context (the cross-VM bridge's `registerNative` path) are stored under
+    // the unmangled name and dispatched via OP_CALL directly.
+    if (zym_internal_getBareCallable(vm, funcName, NULL)) return true;
+
+    // Fixed-arity slots: name@0 .. name@MAX_NATIVE_ARITY
+    char suffix[8];
+    for (int arity = 0; arity <= MAX_NATIVE_ARITY; arity++) {
+        snprintf(suffix, sizeof(suffix), "@%d", arity);
+        if (zym_internal_hasMangled(vm, funcName, suffix)) return true;
+    }
+    // Variadic slots: name@v0 .. name@vMAX_NATIVE_ARITY
+    for (int fixed = 0; fixed <= MAX_NATIVE_ARITY; fixed++) {
+        snprintf(suffix, sizeof(suffix), "@v%d", fixed);
+        if (zym_internal_hasMangled(vm, funcName, suffix)) return true;
+    }
+    return false;
+}
+
+bool zym_canCallWith(ZymVM* vm, const char* funcName, int argc) {
+    if (!vm || !funcName || argc < 0) return false;
+
+    // Fixed-arity exact match: name@argc
+    if (zym_hasFunction(vm, funcName, argc)) return true;
+
+    // Variadic acceptance: any name@vF where argc >= F.
+    char suffix[8];
+    int upper = argc < MAX_NATIVE_ARITY ? argc : MAX_NATIVE_ARITY;
+    for (int fixed = 0; fixed <= upper; fixed++) {
+        snprintf(suffix, sizeof(suffix), "@v%d", fixed);
+        if (zym_internal_hasMangled(vm, funcName, suffix)) return true;
+    }
+
+    // Bare-name binding (see zym_hasAnyFunction): inspect the callable's
+    // intrinsic arity and variadic flag to decide acceptance.
+    Value bare;
+    if (zym_internal_getBareCallable(vm, funcName, &bare)) {
+        if (zym_internal_callableAcceptsArgc(bare, argc)) return true;
+    }
+    return false;
+}
+
 ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     if (!vm || !funcName) return ZYM_STATUS_RUNTIME_ERROR;
 

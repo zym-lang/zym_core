@@ -400,8 +400,24 @@ int zym_enumVariantIndex(ZymVM* vm, ZymValue enumVal);           // 0-based vari
 // CALLING SCRIPT FUNCTIONS FROM C
 // =============================================================================
 
-// Check if a function exists
+// Check if a function exists at the exact fixed-arity slot `name@arity`.
+// This is the strict slot-presence question: does `funcName@arity` literally
+// resolve to a callable? Variadic mangling (`name@vF`) is NOT consulted.
 bool zym_hasFunction(ZymVM* vm, const char* funcName, int arity);
+
+// Check if any callable with the given base name is reachable in the VM's
+// globals — at any fixed arity (`name@0..MAX_NATIVE_ARITY`) or any variadic
+// prefix (`name@v0..vMAX_NATIVE_ARITY`). Mirrors how the compiler's own
+// dispatcher discovers a base name; useful for "does this name resolve at
+// all?" introspection from embedders.
+bool zym_hasAnyFunction(ZymVM* vm, const char* funcName);
+
+// Check if calling `funcName` with exactly `argc` args can dispatch without
+// raising a runtime error. Returns true iff either:
+//   (a) `funcName@argc` is bound (fixed-arity exact match), or
+//   (b) some `funcName@vF` is bound where `argc >= F` (variadic acceptance).
+// This is the question users actually want answered when guarding a call.
+bool zym_canCallWith(ZymVM* vm, const char* funcName, int argc);
 
 // Call a script function with varargs
 // Example: zym_call(vm, "add", 2, zym_newNumber(5), zym_newNumber(3))
