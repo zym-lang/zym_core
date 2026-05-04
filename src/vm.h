@@ -85,6 +85,11 @@ typedef struct VM {
     Value* stack;
     int stack_capacity;
     int stack_top;
+    // Cursor used by the spread-call layout sequence
+    // (CALL_ARG_PREP / CALL_ARG_SPREAD / CALL_VAR). Holds the absolute
+    // stack index of the next free argument slot during a spread call.
+    // Outside of that opcode triple it is meaningless.
+    int call_arg_top;
     Table globals;
     ValueArray globalSlots;
     Table strings;

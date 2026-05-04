@@ -331,6 +331,10 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case SET_GLOBAL_CACHED: return reg_instruction_abx("SET_GLOBAL_CACHED", instruction, offset);
         case CALL:          return callInstruction("CALL", instruction, offset);
         case CALL_SELF:     return callInstruction("CALL_SELF", instruction, offset);
+        case CALL_VAR:      return reg_instruction_a("CALL_VAR", instruction, offset);
+        case CALL_ARG_PREP: return reg_instruction_abx("CALL_ARG_PREP", instruction, offset);
+        case CALL_ARG_SPREAD: return reg_instruction_a("CALL_ARG_SPREAD", instruction, offset);
+        case CALL_ARG_PUSH: return reg_instruction_a("CALL_ARG_PUSH", instruction, offset);
         case TAIL_CALL:     return callInstruction("TAIL_CALL", instruction, offset);
         case TAIL_CALL_SELF: return callInstruction("TAIL_CALL_SELF", instruction, offset);
         case CLOSURE:       return constantInstruction("CLOSURE", chunk, instruction, offset);

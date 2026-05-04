@@ -63,6 +63,7 @@ void initVM(VM* vm) {
     vm->stack_capacity = STACK_INITIAL;
     vm->stack = (Value*)reallocate(vm, NULL, 0, sizeof(Value) * vm->stack_capacity);
     vm->stack_top = 0;
+    vm->call_arg_top = 0;
     for (int i = 0; i < vm->stack_capacity; i++) vm->stack[i] = NULL_VAL;
 
     initTable(&vm->globals);
@@ -700,6 +701,10 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(BRANCH_GE_L),
         JUMP_ENTRY(CALL),
         JUMP_ENTRY(CALL_SELF),
+        JUMP_ENTRY(CALL_ARG_PREP),
+        JUMP_ENTRY(CALL_ARG_SPREAD),
+        JUMP_ENTRY(CALL_ARG_PUSH),
+        JUMP_ENTRY(CALL_VAR),
         JUMP_ENTRY(TAIL_CALL),
         JUMP_ENTRY(TAIL_CALL_SELF),
         JUMP_ENTRY(RET),
@@ -2421,6 +2426,88 @@ static InterpretResult run(VM* vm) {
         bp = stack + base;
         ip = function->chunk.code;
         DISPATCH();
+    }
+    OP(CALL_ARG_PREP) {
+        // Initialize the spread-call argument cursor to point at the slot
+        // immediately after the n_fixed fixed args already laid out by the
+        // compiler at [call_base+1 .. call_base+n_fixed].
+        int call_base = base + REG_A(instr);
+        uint16_t n_fixed = REG_Bx(instr);
+        vm->call_arg_top = call_base + 1 + n_fixed;
+        // Track in stack_top so GC sees the pre-laid-out fixed args as roots
+        // even if call_arg_top later grows past stack_top via spreads.
+        if (vm->call_arg_top > vm->stack_top) {
+            vm->stack_top = vm->call_arg_top;
+        }
+        DISPATCH();
+    }
+    OP(CALL_ARG_SPREAD) {
+        // Append every element of the source list into the active spread-call
+        // argument region, advancing vm->call_arg_top. Must be preceded for
+        // this call site by CALL_ARG_PREP.
+        Value source_val = bp[REG_A(instr)];
+        if (!IS_LIST(source_val)) {
+            STORE_IP(); runtimeError(vm, "Spread argument must be a list.");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+        }
+        ObjList* source = AS_LIST(source_val);
+        int extra = source->items.count;
+        int needed = vm->call_arg_top + extra;
+        if (__builtin_expect(needed > vm->stack_capacity, 0)) {
+            if (!growStackForCall(vm, needed, NULL)) {
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            }
+            RELOAD_STACK();
+            // Re-fetch the source pointer after potential GC/realloc walk:
+            // the list's items array is independently heap-allocated and
+            // unaffected by stack reallocation, but a future GC inside
+            // growStackForCall could move objects -- re-read defensively.
+            source_val = bp[REG_A(instr)];
+            source = AS_LIST(source_val);
+        }
+        for (int i = 0; i < extra; i++) {
+            vm->stack[vm->call_arg_top++] = source->items.values[i];
+        }
+        if (vm->call_arg_top > vm->stack_top) {
+            vm->stack_top = vm->call_arg_top;
+        }
+        DISPATCH();
+    }
+    OP(CALL_ARG_PUSH) {
+        // Append a single value into the active spread-call argument region.
+        // Used (alongside CALL_ARG_SPREAD) to allow fixed args interleaved with
+        // or following spreads, e.g. `f(...a, b, ...c, d)`. Must be preceded for
+        // this call site by CALL_ARG_PREP.
+        int needed = vm->call_arg_top + 1;
+        if (__builtin_expect(needed > vm->stack_capacity, 0)) {
+            if (!growStackForCall(vm, needed, NULL)) {
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            }
+            RELOAD_STACK();
+        }
+        vm->stack[vm->call_arg_top++] = bp[REG_A(instr)];
+        if (vm->call_arg_top > vm->stack_top) {
+            vm->stack_top = vm->call_arg_top;
+        }
+        DISPATCH();
+    }
+    OP(CALL_VAR) {
+        // Runtime-arg-count call: derive arg_count from vm->call_arg_top,
+        // repack the instruction into a CALL-shaped opcode word, and fall
+        // through into the OP(CALL) handler so all downstream behavior
+        // (dispatcher resolution, arity check, frame setup, native fast
+        // path, etc.) is shared with the static-count CALL.
+        int callee_slot = base + REG_A(instr);
+        int arg_count_int = vm->call_arg_top - callee_slot - 1;
+        if (arg_count_int < 0) arg_count_int = 0;
+        if (arg_count_int > 0xFFFF) {
+            STORE_IP(); runtimeError(vm, "Too many spread arguments (max 65535).");
+            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+        }
+        instr = (uint32_t)CALL
+              | ((uint32_t)REG_A(instr) << 8)
+              | ((uint32_t)arg_count_int << 16);
+        goto CASE_CALL;
     }
     OP(TAIL_CALL) {
         int callee_slot = base + REG_A(instr);

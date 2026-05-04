@@ -88,6 +88,25 @@ typedef enum {
     JUMP,
     CALL,
     CALL_SELF,              // Call current function (recursive call optimization)
+    CALL_ARG_PREP,          // Initialize the spread-call argument cursor (vm->call_arg_top).
+                            // Ra = call_base (callee slot). Bx = number of fixed arguments
+                            // already laid out in [call_base+1 .. call_base+Bx]. Sets
+                            // vm->call_arg_top = base + call_base + 1 + Bx so subsequent
+                            // CALL_ARG_SPREAD ops know where to append.
+    CALL_ARG_SPREAD,        // Append all elements of a list into the spread-call argument region.
+                            // Ra = source_reg (must hold an ObjList). Iterates source and writes
+                            // each element to stack[vm->call_arg_top++]. Must be preceded by a
+                            // CALL_ARG_PREP for the current call site.
+    CALL_ARG_PUSH,          // Append a single value into the spread-call argument region.
+                            // Ra = value_reg. Writes bp[Ra] to stack[vm->call_arg_top++].
+                            // Used (alongside CALL_ARG_SPREAD) to support arbitrary
+                            // interleaving of fixed and spread args, e.g. `f(...a, b, ...c, d)`.
+                            // Must be preceded by a CALL_ARG_PREP for the current call site.
+    CALL_VAR,               // Call with runtime-determined arg_count.
+                            // Ra = call_base (callee slot). arg_count = vm->call_arg_top
+                            // - base - call_base - 1. Downstream behavior (arity check,
+                            // dispatcher resolution, frame setup) is identical to CALL once
+                            // arg_count is known. Used to implement `f(a, ...xs, b)` style calls.
     TAIL_CALL,
     TAIL_CALL_SELF,         // Tail call to current function (recursive TCO)
     RET,

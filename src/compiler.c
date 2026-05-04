@@ -1997,6 +1997,134 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             const int arg_count = expr->as.call.arg_count;
             Expr* callee = expr->as.call.callee;
 
+            // Detect spread arguments. When any argument is a spread (`...x`),
+            // the call's runtime arity isn't known until execution, so we take
+            // a dedicated code path that emits CALL_ARG_PREP + per-arg
+            // CALL_ARG_PUSH / CALL_ARG_SPREAD + CALL_VAR. The fast static path
+            // below stays untouched for all existing (non-spread) call sites.
+            //
+            // Universal-cursor design: rather than splitting args into a fixed
+            // prefix (compile-time slots) and a spread tail (runtime cursor),
+            // *every* arg in a spread call is appended at runtime. This makes
+            // arbitrary interleaving like `f(...a, b, ...c, ...d, e)` trivial
+            // and removes the need for ordering checks.
+            bool has_spread = false;
+            for (int i = 0; i < arg_count; i++) {
+                if (expr->as.call.args[i]->type == EXPR_SPREAD) {
+                    has_spread = true;
+                    break;
+                }
+            }
+
+            if (has_spread) {
+                // Reject spread for struct positional initialization (v1).
+                bool struct_target = false;
+                if (callee->type == EXPR_VARIABLE) {
+                    Token* name = &callee->as.variable.name;
+                    Compiler* search_compiler = compiler;
+                    while (search_compiler != NULL && !struct_target) {
+                        for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
+                            if (tokens_equal(name, &search_compiler->struct_schemas[i].name)) {
+                                struct_target = true;
+                                break;
+                            }
+                        }
+                        search_compiler = search_compiler->enclosing;
+                    }
+                }
+                if (struct_target) {
+                    compiler_error(compiler, expr->line,
+                                   "Spread arguments are not supported in struct positional initialization.");
+                    restore_temp_top_preserve(compiler, saved_top, target_reg);
+                    break;
+                }
+
+                // Layout strategy: to avoid the runtime arg cursor corrupting
+                // the per-arg source-value registers as it grows, we compile
+                // *every* arg source into its own pre-allocated temp register
+                // FIRST (left-to-right), THEN reserve the callee slot ABOVE
+                // all those temps. The cursor (call_base+1, ...) then grows
+                // strictly above the temp region and never overlaps it.
+                //
+                //  Layout (registers, low -> high):
+                //    [ T[0], T[1], ..., T[N-1], callee, arg1, arg2, ... ]
+                //                                ^ call_base   ^ runtime cursor region
+                //
+                // Reentrant safety: inner spread calls fully execute (their
+                // own PREP/PUSH/SPREAD/VAR) during the COMPILE of an arg
+                // source, BEFORE this outer call's CALL_ARG_PREP runs, so
+                // the single-cursor scheme remains correct under nesting.
+                int n_args = arg_count;
+                int* temp_regs = NULL;
+                if (n_args > 0) {
+                    temp_regs = (int*)malloc(sizeof(int) * n_args);
+                }
+                for (int i = 0; i < n_args; i++) {
+                    int src_reg = alloc_temp(compiler);
+                    temp_regs[i] = src_reg;
+                    Expr* arg = expr->as.call.args[i];
+                    Expr* arg_expr = (arg->type == EXPR_SPREAD)
+                                     ? arg->as.spread.expression : arg;
+                    COMPILE_REQUIRED(compiler, arg_expr, src_reg);
+                }
+
+                // Now reserve the callee slot above all temps.
+                int call_base = compiler->next_register;
+                compiler->next_register += 1;
+                if (compiler->next_register > compiler->max_register_seen) {
+                    compiler->max_register_seen = compiler->next_register;
+                }
+
+                // Load callee. We can't use resolve_and_load_function because it
+                // mangles the global lookup with a compile-time arity (e.g.,
+                // `sum3@3`), but with spreads we don't know the arity yet.
+                // Strategy: if the name has any hoisted local/global form,
+                // emit a dispatcher (it groups all overloads + variadic
+                // fallback; OP(CALL) picks one at runtime via resolveOverload).
+                // Otherwise fall back to plain local/upvalue/global lookup
+                // by unmangled name (covers closures-in-vars, native singletons).
+                if (callee->type == EXPR_VARIABLE) {
+                    Token* cname = &callee->as.variable.name;
+                    if (has_any_hoisted_local(compiler, cname)) {
+                        emit_dispatcher(compiler, cname, call_base, callee->line, true);
+                    } else if (has_any_hoisted_global(compiler, cname)) {
+                        emit_dispatcher(compiler, cname, call_base, callee->line, false);
+                    } else {
+                        int reg = resolve_local(compiler, cname);
+                        if (reg != -1) {
+                            emit_move(compiler, call_base, reg, callee->line);
+                        } else if ((reg = resolve_upvalue(compiler, cname)) != -1) {
+                            emit_instruction(compiler, PACK_ABx(GET_UPVALUE, call_base, reg), callee->line);
+                        } else {
+                            int name_const = identifier_constant(compiler, cname);
+                            emit_get_global(compiler, call_base, name_const, callee->line, cname);
+                        }
+                    }
+                } else {
+                    COMPILE_REQUIRED(compiler, callee, call_base);
+                }
+
+                // Initialize the runtime arg cursor at call_base+1 (above all temps).
+                emit_instruction(compiler, PACK_ABx(CALL_ARG_PREP, call_base, 0), expr->line);
+
+                // Emit one PUSH/SPREAD per pre-compiled temp.
+                for (int i = 0; i < n_args; i++) {
+                    Expr* arg = expr->as.call.args[i];
+                    OpCode op = (arg->type == EXPR_SPREAD) ? CALL_ARG_SPREAD : CALL_ARG_PUSH;
+                    emit_instruction(compiler, PACK_ABx(op, temp_regs[i], 0), arg->line);
+                }
+                if (temp_regs) free(temp_regs);
+
+                // Perform the call.
+                emit_instruction(compiler, PACK_ABx(CALL_VAR, call_base, 0), expr->line);
+
+                if (call_base != target_reg) {
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, call_base, expr->line);
+                }
+                restore_temp_top_preserve(compiler, saved_top, target_reg);
+                break;
+            }
+
             // Check if this is actually a struct instantiation: StructName(args...)
             if (callee->type == EXPR_VARIABLE) {
                 Token* name = &callee->as.variable.name;

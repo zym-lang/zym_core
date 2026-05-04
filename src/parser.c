@@ -595,7 +595,13 @@ static Expr* call(Parser* parser, Expr* callee) {
                 arg_cap = GROW_CAPACITY(old_cap);
                 args = GROW_ARRAY(parser->vm, Expr*, args, old_cap, arg_cap);
             }
-            args[arg_count++] = parse_expression(parser);
+            if (match(parser, TOKEN_DOT_DOT_DOT)) {
+                Token spread_token = parser->previous;
+                Expr* spread_expr = parse_expression(parser);
+                args[arg_count++] = new_spread_expr(parser->vm, spread_expr, spread_token);
+            } else {
+                args[arg_count++] = parse_expression(parser);
+            }
         } while (match(parser, TOKEN_COMMA));
     }
 
