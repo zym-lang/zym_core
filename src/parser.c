@@ -188,6 +188,55 @@ static void error_at_previous(Parser* parser, const char* message) {
                    "%s", message ? message : "");
 }
 
+// Reports a diagnostic anchored at an arbitrary captured `Token` rather
+// than at `parser->current` / `parser->previous`. This is used to point
+// missing-closer diagnostics (e.g. unmatched `{`) at the *opening*
+// delimiter the parser remembered, instead of at wherever panic-mode
+// recovery happened to land — which, in multi-file builds, can be deep
+// inside an entirely different module's region of the combined buffer
+// and produces misleading "phantom" follow-on errors.
+static void error_at_token(Parser* parser, Token tok, const char* message) {
+    if (parser->panic_mode) return;
+    parser->had_error = true;
+    parser->panic_mode = true;
+
+    // Suppress diagnostics whose anchor token has no valid origin
+    // attribution (e.g. tokens scanned from synthesized loader wrapper
+    // text like `__module_<name>_init() { ... }`). These produce
+    // "phantom" diagnostics with `file: null, line: 0, startByte: -1`
+    // that are not user-actionable: there's no source location the
+    // user can click through to. The earlier real diagnostic that
+    // triggered panic-mode is already reported with full precision;
+    // emitting a follow-on at a synthesized location only adds noise.
+    // had_error stays set so the build still fails.
+    if (tok.originFileId == ZYM_FILE_ID_INVALID || tok.originStartByte < 0) {
+        return;
+    }
+
+    pushDiagnostic(parser->vm,
+                   ZYM_DIAG_ERROR,
+                   tok.originFileId,
+                   tok.originStartByte,
+                   tok.originLength,
+                   tok.line,
+                   tok.startColumn,
+                   "%s", message ? message : "");
+}
+
+// Variant of `consume` for closing delimiters where, on mismatch, we
+// want the diagnostic anchored at the *opening* delimiter we captured
+// when entering this construct. Falls back gracefully: if we're already
+// in panic_mode the push is suppressed (avoids cascading), and on
+// success we still advance past the closer normally.
+static void consume_closer_at(Parser* parser, TokenType type,
+                              Token opener, const char* message) {
+    if (parser->current.type == type) {
+        advance(parser);
+        return;
+    }
+    error_at_token(parser, opener, message);
+}
+
 static void consume(Parser* parser, TokenType type, const char* message) {
     if (parser->current.type == type) {
         advance(parser);
@@ -1134,7 +1183,18 @@ static Stmt* parse_block(Parser* parser) {
         Stmt* stmt = parse_declaration(parser);
         statements[count++] = stmt;
     }
-    consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after block.");
+    // Anchor the diagnostic at the *opening* `{` (captured as `brace`)
+    // rather than at `parser->current`. After an unmatched paren/brace
+    // earlier in the block, panic-mode synchronization can drift the
+    // current position arbitrarily far — in multi-file builds it
+    // routinely lands inside a *different* module's region of the
+    // combined buffer, producing misleading "phantom" follow-on
+    // diagnostics like "Expect '}' after block." pointing at the last
+    // brace of an unrelated function in another file. Reporting at the
+    // opening brace makes the error point at the actual unmatched
+    // opener, which is what tools like clang/rustc do.
+    consume_closer_at(parser, TOKEN_RIGHT_BRACE, brace,
+                      "Unmatched '{' — expected '}' to close block.");
     return new_block_stmt(parser->vm, statements, count, capacity, brace);
 }
 
