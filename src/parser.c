@@ -237,6 +237,137 @@ static void consume_closer_at(Parser* parser, TokenType type,
     error_at_token(parser, opener, message);
 }
 
+// Formats the lexeme of `tok` into `buf` for inclusion in diagnostic
+// messages — e.g. `found '<lex>'`. Long lexemes (typically large string
+// literals or identifiers from generated code) are truncated with a
+// trailing ellipsis to keep messages readable. Synthetic / EOF tokens
+// produce stable placeholders. The output is always NUL-terminated and
+// never longer than `cap` bytes including the terminator.
+//
+// Format choice mirrors what clang/rustc do: tokens with non-printable
+// content are still rendered, just safely (control chars become '?'),
+// since the caret + line snippet at the call site already shows the
+// real bytes — this string is only meant to disambiguate at a glance
+// when the user reads a one-line diagnostic header without any caret
+// renderer attached (the bare LSP / batch case).
+static void format_token_lexeme(Token tok, char* buf, size_t cap) {
+    if (cap == 0) return;
+    if (tok.type == TOKEN_EOF) {
+        snprintf(buf, cap, "<end of file>");
+        return;
+    }
+    if (tok.start == NULL || tok.length <= 0) {
+        snprintf(buf, cap, "<token>");
+        return;
+    }
+    // Reserve room for an optional "..." truncation suffix and the NUL.
+    const size_t MAX_INLINE = 24;
+    size_t take = (size_t)tok.length;
+    bool truncated = false;
+    if (take > MAX_INLINE) {
+        take = MAX_INLINE;
+        truncated = true;
+    }
+    if (take + (truncated ? 3 : 0) + 1 > cap) {
+        // Caller's buffer is too small — re-clamp to fit.
+        if (cap < 5) {
+            buf[0] = '\0';
+            return;
+        }
+        take = cap - (truncated ? 3 : 0) - 1;
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < take && w + 1 < cap; i++) {
+        unsigned char c = (unsigned char)tok.start[i];
+        // Render newline / control bytes safely so the message stays on
+        // a single line.
+        if (c == '\n')      buf[w++] = '\\';
+        else if (c == '\r') buf[w++] = '\\';
+        else if (c == '\t') buf[w++] = '\\';
+        else                buf[w++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+        if ((c == '\n' || c == '\r' || c == '\t') && w + 1 < cap) {
+            buf[w++] = (c == '\n') ? 'n' : (c == '\r') ? 'r' : 't';
+        }
+    }
+    if (truncated && w + 3 < cap) {
+        buf[w++] = '.'; buf[w++] = '.'; buf[w++] = '.';
+    }
+    buf[w] = '\0';
+}
+
+// Pushes a `note:` follow-on diagnostic anchored at `tok`. Notes are
+// `ZYM_DIAG_INFO` so they don't flip `had_error` and they do NOT
+// engage panic-mode (which would suppress the next real error). They
+// are intended to provide context for the immediately preceding error
+// — e.g. "note: '{' opened here" pointing at the unmatched opener.
+//
+// As with `error_at_token`, suppress notes whose anchor token has no
+// valid origin attribution (synthesized loader wrapper text), since
+// pointing the user at a non-existent source location is worse than
+// no note at all.
+static void note_at_token(Parser* parser, Token tok, const char* message) {
+    if (tok.originFileId == ZYM_FILE_ID_INVALID || tok.originStartByte < 0) {
+        return;
+    }
+    pushDiagnostic(parser->vm,
+                   ZYM_DIAG_INFO,
+                   tok.originFileId,
+                   tok.originStartByte,
+                   tok.originLength,
+                   tok.line,
+                   tok.startColumn,
+                   "%s", message ? message : "");
+}
+
+// Closing-delimiter consume that produces a high-quality diagnostic
+// when the expected closer is missing or mismatched:
+//
+//   1. If the next token is `type`, advance and return (happy path).
+//   2. Otherwise emit a primary error anchored at the *current* token
+//      (where the parser actually is — the offending token), naming
+//      both the expected closer (`expected_closer_lex`, e.g. "}") and
+//      the construct context (`construct`, e.g. "block", "call
+//      arguments"), plus the lexeme of what was found via
+//      `format_token_lexeme`.
+//   3. Then push a `note:` diagnostic anchored at the captured
+//      `opener` to show the user where the unmatched opener lives —
+//      this is the single biggest UX win over the previous
+//      implementation, since multi-file panic-mode recovery often
+//      drifted the primary anchor far from the real problem.
+//
+// If we're already in panic_mode the primary push is suppressed (the
+// inner `error_at_current` short-circuits), and we don't bother
+// pushing a note in that case either, to avoid orphan notes attached
+// to no visible error.
+static void consume_closer_full(Parser* parser, TokenType type,
+                                Token opener,
+                                const char* expected_closer_lex,
+                                const char* construct) {
+    if (parser->current.type == type) {
+        advance(parser);
+        return;
+    }
+    if (parser->panic_mode) {
+        // Still try to recover — but don't emit a phantom diagnostic.
+        return;
+    }
+    char found[40];
+    format_token_lexeme(parser->current, found, sizeof(found));
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "Expected '%s' to close %s, found '%s'.",
+             expected_closer_lex ? expected_closer_lex : "",
+             construct ? construct : "expression",
+             found);
+    error_at_current(parser, msg);
+    // error_at_current set panic_mode; the note bypasses it.
+    char nmsg[80];
+    snprintf(nmsg, sizeof(nmsg),
+             "note: %s started here",
+             construct ? construct : "construct");
+    note_at_token(parser, opener, nmsg);
+}
+
 static void consume(Parser* parser, TokenType type, const char* message) {
     if (parser->current.type == type) {
         advance(parser);
@@ -283,13 +414,33 @@ static bool is_statement_start(Parser* parser) {
     }
 }
 
-static void consume_end_of_statement(Parser* parser, const char* message) {
+// Consumes a statement terminator (`;`, newline, `}`, EOF, or the start
+// of a new statement). On failure, builds a context-rich message of the
+// form `Expected ';' after <where>, found '<lex>'.` so the user knows
+// both *what* the parser was finishing (e.g. "return value", "variable
+// declaration", "expression") and *what* the parser saw instead. This
+// is the single most-frequent diagnostic the parser produces, so its
+// quality matters disproportionately to overall UX.
+static void consume_end_of_statement(Parser* parser, const char* where) {
     if (match(parser, TOKEN_SEMICOLON)) return;
     if (parser->current.line > parser->previous.line) return;
     if (check(parser, TOKEN_EOF)) return;
     if (check(parser, TOKEN_RIGHT_BRACE)) return;
     if (is_statement_start(parser)) return;
-    error_at_current(parser, message);
+
+    char found[40];
+    format_token_lexeme(parser->current, found, sizeof(found));
+    char msg[160];
+    if (where && where[0] != '\0') {
+        snprintf(msg, sizeof(msg),
+                 "Expected ';' after %s, found '%s'.",
+                 where, found);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "Expected ';' after expression, found '%s'.",
+                 found);
+    }
+    error_at_current(parser, msg);
 }
 static void synchronize(Parser* parser) {
     parser->panic_mode = false;
@@ -327,7 +478,49 @@ static Expr* parse_precedence(Parser* parser, Precedence precedence) {
         // advance() already consumed the offending token; report at
         // `previous` so the caret lands on it rather than on the next
         // statement's first token.
-        error_at_previous(parser, "Expect expression.");
+        //
+        // Rather than the bare "Expect expression.", inspect what the
+        // offending token actually is. Stray closers (`)`, `]`, `}`)
+        // and end-of-file are by far the most common cases here, and
+        // each gets its own targeted message — that's the difference
+        // between "what does this even mean?" and "ah, I have one too
+        // many close-parens". The catch-all path still includes the
+        // offending lexeme so it remains far more useful than the
+        // legacy generic message.
+        char found[40];
+        format_token_lexeme(parser->previous, found, sizeof(found));
+        char msg[160];
+        switch (parser->previous.type) {
+            case TOKEN_RIGHT_PAREN:
+                snprintf(msg, sizeof(msg),
+                         "Unexpected ')' — no matching '(' is open here.");
+                break;
+            case TOKEN_RIGHT_BRACKET:
+                snprintf(msg, sizeof(msg),
+                         "Unexpected ']' — no matching '[' is open here.");
+                break;
+            case TOKEN_RIGHT_BRACE:
+                snprintf(msg, sizeof(msg),
+                         "Unexpected '}' — no matching '{' is open here.");
+                break;
+            case TOKEN_EOF:
+                snprintf(msg, sizeof(msg),
+                         "Expected an expression, but reached end of file.");
+                break;
+            case TOKEN_SEMICOLON:
+                snprintf(msg, sizeof(msg),
+                         "Expected an expression before ';'.");
+                break;
+            case TOKEN_COMMA:
+                snprintf(msg, sizeof(msg),
+                         "Expected an expression before ','.");
+                break;
+            default:
+                snprintf(msg, sizeof(msg),
+                         "Expected an expression, found '%s'.", found);
+                break;
+        }
+        error_at_previous(parser, msg);
         return NULL;
     }
     bool can_assign = precedence <= PREC_ASSIGNMENT;
@@ -500,7 +693,7 @@ static Expr* grouping(Parser* parser, bool can_assign) {
 
 parse_as_expression:
     Expr* expr = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after expression.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, paren, ")", "parenthesized expression");
 
     if (parser->current.type == TOKEN_FAT_ARROW) {
         error_at_current(parser, "Arrow function requires parameter list.");
@@ -591,7 +784,7 @@ static Expr* variable(Parser* parser, bool can_assign) {
                 if (parser->current.type == TOKEN_RIGHT_BRACE) break;
             } while (true);
         }
-        consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after struct initialization.");
+        consume_closer_full(parser, TOKEN_RIGHT_BRACE, brace, "}", "struct initialization");
         return new_struct_inst_expr(parser->vm, name, field_names, field_values, field_count, field_capacity, brace);
     }
 
@@ -630,6 +823,11 @@ static Expr* parse_expression(Parser* parser) {
 }
 
 static Expr* call(Parser* parser, Expr* callee) {
+    // `call` is invoked as the infix rule for `(`; at entry, the
+    // tokenizer has already advanced past the `(`, so `parser->previous`
+    // is that opening paren. Captured here so the closer-mismatch
+    // diagnostic can point users back at the actual call site.
+    Token paren = parser->previous;
     int arg_count = 0;
     int arg_cap   = 0;
     Expr** args   = NULL;
@@ -654,7 +852,7 @@ static Expr* call(Parser* parser, Expr* callee) {
         } while (match(parser, TOKEN_COMMA));
     }
 
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, paren, ")", "call arguments");
     return new_call_expr(parser->vm, callee, parser->previous, args, arg_count, arg_cap);
 }
 
@@ -757,14 +955,14 @@ static Expr* list_literal(Parser* parser, bool can_assign) {
             if (parser->current.type == TOKEN_RIGHT_BRACKET) break;
         } while (true);
     }
-    consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' after list elements.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACKET, bracket, "]", "list literal");
     return new_list_expr(parser->vm, elements, count, capacity, bracket);
 }
 
 static Expr* subscript(Parser* parser, Expr* left) {
     Token bracket = parser->previous;
     Expr* index = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_BRACKET, "Expect ']' after subscript index.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACKET, bracket, "]", "subscript");
 
     if (match(parser, TOKEN_EQUAL)) {
         Expr* value = parse_expression(parser);
@@ -844,13 +1042,14 @@ static Expr* map_literal(Parser* parser, bool can_assign) {
             if (parser->current.type == TOKEN_RIGHT_BRACE) break;
         } while (true);
     }
-    consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after map elements.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACE, brace, "}", "map literal");
     return new_map_expr(parser->vm, keys, values, count, capacity, brace);
 }
 
 static Expr* function_expression(Parser* parser, bool can_assign) {
     Token func_token = parser->previous;
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'func' in function expression.");
+    Token params_paren = parser->previous;
 
     Param* params = NULL;
     int param_count = 0;
@@ -882,7 +1081,7 @@ static Expr* function_expression(Parser* parser, bool can_assign) {
             }
         } while (match(parser, TOKEN_COMMA));
     }
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, params_paren, ")", "function parameter list");
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
@@ -914,7 +1113,7 @@ static Stmt* parse_var_declaration(Parser* parser) {
         count++;
     } while (match(parser, TOKEN_COMMA));
 
-    consume_end_of_statement(parser, "Expect ';' after variable declaration.");
+    consume_end_of_statement(parser, "variable declaration");
     return new_var_decl_stmt(parser->vm, variables, count, capacity, keyword);
 }
 
@@ -931,6 +1130,7 @@ static Stmt* function(Parser* parser, const char* kind) {
     }
 
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after function name.");
+    Token params_paren = parser->previous;
 
     Param* params = NULL;
     int param_count = 0;
@@ -963,7 +1163,7 @@ static Stmt* function(Parser* parser, const char* kind) {
             }
         } while (match(parser, TOKEN_COMMA));
     }
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, params_paren, ")", "function parameter list");
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
     Stmt* body = parse_block(parser);
@@ -1051,7 +1251,7 @@ static Stmt* parse_statement(Parser* parser) {
 
     Expr* expr = parse_expression(parser);
     if (expr == NULL) return NULL;
-    consume_end_of_statement(parser, "Expect ';' after expression.");
+    consume_end_of_statement(parser, "expression");
     return new_expression_stmt(parser->vm, expr);
 }
 
@@ -1061,6 +1261,7 @@ static Stmt* parse_struct_declaration(Parser* parser) {
     Token name = parser->previous;
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' after struct name.");
+    Token body_brace = parser->previous;
 
     int field_count = 0;
     int field_capacity = 0;
@@ -1102,7 +1303,7 @@ static Stmt* parse_struct_declaration(Parser* parser) {
         break;
     }
 
-    consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after struct fields.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACE, body_brace, "}", "struct body");
     return new_struct_decl_stmt(parser->vm, name, fields, field_count, field_capacity, keyword);
 }
 
@@ -1112,6 +1313,7 @@ static Stmt* parse_enum_declaration(Parser* parser) {
     Token name = parser->previous;
 
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' after enum name.");
+    Token body_brace = parser->previous;
 
     int variant_count = 0;
     int variant_capacity = 0;
@@ -1135,7 +1337,7 @@ static Stmt* parse_enum_declaration(Parser* parser) {
         } while (match(parser, TOKEN_COMMA));
     }
 
-    consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after enum variants.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACE, body_brace, "}", "enum body");
     return new_enum_decl_stmt(parser->vm, name, variants, variant_count, variant_capacity, keyword);
 }
 
@@ -1193,16 +1395,31 @@ static Stmt* parse_block(Parser* parser) {
     // brace of an unrelated function in another file. Reporting at the
     // opening brace makes the error point at the actual unmatched
     // opener, which is what tools like clang/rustc do.
-    consume_closer_at(parser, TOKEN_RIGHT_BRACE, brace,
-                      "Unmatched '{' — expected '}' to close block.");
+    if (parser->current.type == TOKEN_RIGHT_BRACE) {
+        advance(parser);
+    } else if (!parser->panic_mode) {
+        // Build a context-rich diagnostic anchored at the *opening* `{`,
+        // including the lexeme of whatever token the parser actually
+        // ended up on (typically `<end of file>` for truly unterminated
+        // blocks). The opener anchor is what we want here — see the
+        // multi-line comment above for the full rationale.
+        char found[40];
+        format_token_lexeme(parser->current, found, sizeof(found));
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "Unmatched '{' — expected '}' to close block, found '%s'.",
+                 found);
+        error_at_token(parser, brace, msg);
+    }
     return new_block_stmt(parser->vm, statements, count, capacity, brace);
 }
 
 static Stmt* parse_if_statement(Parser* parser) {
     Token keyword = parser->previous;
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'if'.");
+    Token cond_paren = parser->previous;
     Expr* condition = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after if condition.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, cond_paren, ")", "'if' condition");
     Stmt* then_branch = parse_statement(parser);
     Stmt* else_branch = NULL;
     if (match(parser, TOKEN_ELSE)) {
@@ -1214,8 +1431,9 @@ static Stmt* parse_if_statement(Parser* parser) {
 static Stmt* parse_while_statement(Parser* parser) {
     Token keyword = parser->previous;
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'while'.");
+    Token cond_paren = parser->previous;
     Expr* condition = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after while condition.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, cond_paren, ")", "'while' condition");
     Stmt* body = parse_statement(parser);
     return new_while_stmt(parser->vm, condition, body, keyword);
 }
@@ -1225,8 +1443,9 @@ static Stmt* parse_do_while_statement(Parser* parser) {
     Stmt* body = parse_statement(parser);
     consume(parser, TOKEN_WHILE, "Expect 'while' after do-while body.");
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'while'.");
+    Token cond_paren = parser->previous;
     Expr* condition = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after do-while condition.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, cond_paren, ")", "'do-while' condition");
     match(parser, TOKEN_SEMICOLON);
     return new_do_while_stmt(parser->vm, body, condition, keyword);
 }
@@ -1234,6 +1453,7 @@ static Stmt* parse_do_while_statement(Parser* parser) {
 static Stmt* parse_for_statement(Parser* parser) {
     Token keyword = parser->previous;
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'for'.");
+    Token clauses_paren = parser->previous;
     Stmt* initializer;
     if (match(parser, TOKEN_SEMICOLON)) {
         initializer = NULL;
@@ -1253,7 +1473,7 @@ static Stmt* parse_for_statement(Parser* parser) {
     Expr* increment = NULL;
     if (!match(parser, TOKEN_RIGHT_PAREN)) {
         increment = parse_expression(parser);
-        consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after for clauses.");
+        consume_closer_full(parser, TOKEN_RIGHT_PAREN, clauses_paren, ")", "'for' clauses");
     }
     Stmt* body = parse_statement(parser);
     return new_for_stmt(parser->vm, initializer, condition, increment, body, keyword);
@@ -1261,7 +1481,8 @@ static Stmt* parse_for_statement(Parser* parser) {
 
 static Stmt* parse_jump_statement(Parser* parser) {
     Token keyword = parser->previous;
-    consume_end_of_statement(parser, "Expect ';' after jump statement.");
+    consume_end_of_statement(parser,
+        keyword.type == TOKEN_BREAK ? "'break'" : "'continue'");
     return (keyword.type == TOKEN_BREAK) ? new_break_stmt(parser->vm, keyword) : new_continue_stmt(parser->vm, keyword);
 }
 
@@ -1273,7 +1494,7 @@ static Stmt* parse_goto_statement(Parser* parser) {
     }
     Token target = parser->current;
     advance(parser);
-    consume_end_of_statement(parser, "Expect ';' after goto statement.");
+    consume_end_of_statement(parser, "'goto' label");
     return new_goto_stmt(parser->vm, keyword, target);
 }
 
@@ -1281,9 +1502,11 @@ static Stmt* parse_switch_statement(Parser* parser) {
     Token keyword = parser->previous;
 
     consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'switch'.");
+    Token cond_paren = parser->previous;
     Expr* expression = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after switch expression.");
+    consume_closer_full(parser, TOKEN_RIGHT_PAREN, cond_paren, ")", "'switch' expression");
     consume(parser, TOKEN_LEFT_BRACE, "Expect '{' to start switch body.");
+    Token body_brace = parser->previous;
     int case_capacity = 8;
     int case_count = 0;
     CaseClause* cases = ALLOCATE(parser->vm, CaseClause, case_capacity);
@@ -1359,7 +1582,7 @@ static Stmt* parse_switch_statement(Parser* parser) {
         }
     }
 
-    consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after switch body.");
+    consume_closer_full(parser, TOKEN_RIGHT_BRACE, body_brace, "}", "'switch' body");
 
     return new_switch_stmt(parser->vm, expression, cases, case_count,
                           case_capacity, default_index, keyword);
@@ -1376,7 +1599,7 @@ static Stmt* parse_return_statement(Parser* parser) {
         value = parse_expression(parser);
     }
 
-    consume_end_of_statement(parser, "Expect ';' after return value.");
+    consume_end_of_statement(parser, value ? "return value" : "'return'");
     return new_return_stmt(parser->vm, keyword, value);
 }
 AstResult parse(VM* vm, const char* source, const SourceMap* source_map,
