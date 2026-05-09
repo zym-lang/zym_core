@@ -34,7 +34,9 @@
  *   - Captured continuations are heap-allocated, not limited by these values
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
  */
-#define FRAMES_MAX 512
+#ifndef FRAMES_MAX
+#define FRAMES_MAX 256
+#endif
 #define STACK_MAX 65536
 #define STACK_INITIAL 256
 #define MAX_PROMPTS 64
