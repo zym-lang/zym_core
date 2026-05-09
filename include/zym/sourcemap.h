@@ -61,6 +61,15 @@ int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out);
 ZymSourceMap* zym_newSourceMap(ZymVM* vm);
 void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map);
 
+// Deep-clones `src` into a freshly-allocated SourceMap owned by `dstVm`.
+// All segments are copied verbatim (origin file ids, byte ranges, lines).
+// Intended for cross-VM scenarios where a script callback running in a
+// parent VM has produced a SourceMap that must be handed off to a child
+// VM that will free it through its own allocator (e.g. the
+// `loadModules` read-callback path). Returns NULL on allocation failure
+// or if `src` is NULL. Pair with `zym_freeSourceMap(dstVm, ...)`.
+ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src);
+
 #ifdef __cplusplus
 }
 #endif

@@ -172,6 +172,22 @@ void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map)
     ZYM_FREE(&vm->allocator, map, sizeof(ZymSourceMap));
 }
 
+ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src)
+{
+    if (dstVm == NULL || src == NULL) return NULL;
+    ZymSourceMap* dst = zym_newSourceMap(dstVm);
+    if (dst == NULL) return NULL;
+    for (int i = 0; i < src->count; i++) {
+        const SourceMapSegment* s = &src->segments[i];
+        appendSourceMapSegment(dstVm, dst,
+                               s->expandedStartByte, s->expandedLength,
+                               s->originFileId,
+                               s->originStartByte, s->originLength,
+                               s->originLine);
+    }
+    return dst;
+}
+
 ZymStatus zym_preprocess(ZymVM* vm, const char* source,
                          ZymSourceMap* source_map, ZymFileId origin_file_id,
                          const char** processedSource)
@@ -1034,6 +1050,7 @@ int zym_getSourceFile(ZymVM* vm, ZymFileId fileId, ZymSourceFileInfo* out)
 
 ZymSourceMap* zym_newSourceMap(ZymVM* vm) { (void)vm; return NULL; }
 void zym_freeSourceMap(ZymVM* vm, ZymSourceMap* map) { (void)vm; (void)map; }
+ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src) { (void)dstVm; (void)src; return NULL; }
 
 #endif
 
