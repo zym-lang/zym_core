@@ -45,6 +45,14 @@
 #define MAX_WITH_PROMPT_DEPTH 64
 #define FRAME_FLAG_PREEMPT 0x01
 #define FRAME_FLAG_DISABLE_PREEMPT 0x02
+// Re-entrant API boundary: this frame was pushed by a public API call
+// (`zym_call`/`zym_callClosurev` -> `zym_call_execute`) into a VM that
+// may already be mid-bytecode execution. When OP(RET) pops a frame
+// carrying this flag, control must return to the C caller of
+// `zym_call_execute` immediately, **without** falling through into the
+// api_trampoline's RET (which would cascade-pop every suspended caller
+// frame, NULL-ing their stack_base slots and corrupting their locals).
+#define FRAME_FLAG_API_BOUNDARY 0x04
 
 typedef struct ObjPromptTag ObjPromptTag;
 

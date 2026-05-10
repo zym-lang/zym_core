@@ -2179,11 +2179,38 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // called (e.g., a child VM running a parent native trampoline that
     // invokes a parent closure). Hardcoding the frame base to slot 0 would
     // clobber the in-flight bytecode register state. Instead, place the
-    // frame above the current high-water `stack_top` so we don't trample
-    // anything live, then run; `zym_call_execute` writes the result back at
-    // `frame_base` and sets `api_stack_top = frame_base`, so subsequent
-    // `zym_getCallResult` finds it at the right slot.
+    // frame above the current frame's full register window so we don't
+    // trample anything live, then run; `zym_call_execute` writes the
+    // result back at `frame_base` and sets `api_stack_top = frame_base`,
+    // so subsequent `zym_getCallResult` finds it at the right slot.
+    //
+    // CRITICAL: `vm->stack_top` is NOT a reliable upper bound for live
+    // locals here. OP(CALL) only bumps `stack_top` to cover `max_regs`
+    // when dispatching to a *closure*; for native dispatch it is left at
+    // whatever the previous instruction set it to (often just past the
+    // call's args). If a native (e.g. `vm.loadModules`) re-enters the
+    // parent VM via this function while the caller frame is suspended,
+    // using `stack_top` directly would land the new frame INSIDE the
+    // caller's still-live register window, silently corrupting locals
+    // (the symptom: a script local that was a map becomes null between
+    // two adjacent statements). Conservatively reserve up through the
+    // current frame's `stack_base + max_regs` instead.
     int frame_base = vm->stack_top;
+    if (vm->current_frame && vm->current_frame->closure &&
+        vm->current_frame->closure->function) {
+        int caller_top = vm->current_frame->stack_base +
+                         vm->current_frame->closure->function->max_regs;
+        if (caller_top > frame_base) frame_base = caller_top;
+    }
+    // Also walk all active frames to find the highest live slot, in case
+    // the active frame chain has gaps (defensive against unusual layouts).
+    for (int fi = 0; fi < vm->frame_count; fi++) {
+        CallFrame* f = &vm->frames[fi];
+        if (f->closure && f->closure->function) {
+            int ftop = f->stack_base + f->closure->function->max_regs;
+            if (ftop > frame_base) frame_base = ftop;
+        }
+    }
 
     // Reserve room for closure + args. zym_call_execute will grow further
     // for the callee's locals if needed; we only need enough to place args.

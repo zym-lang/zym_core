@@ -2800,6 +2800,30 @@ static InterpretResult run(VM* vm) {
             closeUpvalues(vm, &stack[frame->stack_base]);
         }
 
+        // Public-API boundary frame: the C caller (zym_call_execute) is
+        // waiting just below. Place the return value at the frame's
+        // stack_base (so zym_call_getResult can find it), pop the
+        // boundary frame, and exit `run()` cleanly. Without this, OP(RET)
+        // would fall through to api_trampoline's RET, which would in
+        // turn pop and NULL-write the suspended caller frames' stack
+        // slots — corrupting the script-side locals of whoever was
+        // mid-execution when this re-entrant call happened.
+        if (__builtin_expect((frame->flags & FRAME_FLAG_API_BOUNDARY) != 0, 0)) {
+            stack[frame->stack_base] = return_value;
+            vm->frame_count--;
+            // Restore base/current_frame to whatever was active before
+            // zym_call_execute pushed this boundary; the C side will
+            // overwrite vm->current_frame from its saved snapshot.
+            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            bp = stack + base;
+            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
+                vm->preemption_disable_depth--;
+            }
+            STORE_STATE();
+            return INTERPRET_OK;
+        }
+
         // Now pop the callee frame
         vm->frame_count--;
         base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
@@ -3780,11 +3804,24 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
         vm->stack_top = needed_top;
     }
 
+    // Save outer state BEFORE pushing the boundary frame, so that
+    // restoration after `run()` is independent of how many frames
+    // got popped inside (in particular, our API_BOUNDARY exit path
+    // pops the boundary frame from inside `run()` itself).
+    uint32_t* saved_ip            = vm->ip;
+    Chunk*    saved_chunk         = vm->chunk;
+    int       saved_cur_base      = vm->cur_base;
+    int       saved_frame_count   = vm->frame_count;
+    CallFrame* saved_current_frame = vm->current_frame;
+
     // Push frame just like OP(CALL)
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure      = closure;
     frame->stack_base   = frame_base;
-    frame->flags        = 0;
+    // Mark as the public-API boundary so OP(RET) knows to stop here
+    // when this frame returns, instead of cascading through any
+    // already-suspended caller frames (re-entrant case).
+    frame->flags        = FRAME_FLAG_API_BOUNDARY;
     frame->arg_count    = (uint16_t)argCount;
 
     // On return, resume at the API trampoline, not bytecode.
@@ -3793,10 +3830,6 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     vm->current_frame = frame;
     vm->cur_base = frame_base;
-    uint32_t* saved_ip = vm->ip;
-    Chunk* saved_chunk = vm->chunk;
-    int saved_cur_base = vm->cur_base;
-    CallFrame* saved_current_frame = vm->current_frame;
 
     // Enter the callee
     vm->chunk = &function->chunk;
@@ -3804,9 +3837,15 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     InterpretResult result = run(vm);
 
-    vm->ip    = saved_ip;
-    vm->chunk = saved_chunk;
-    vm->cur_base = saved_cur_base;
+    // Restore the outer state. `run()` may have already popped the
+    // boundary frame via the FRAME_FLAG_API_BOUNDARY exit path; in
+    // any case, we want frame_count / current_frame to reflect what
+    // existed BEFORE this re-entrant call so the caller's bytecode
+    // can resume normally.
+    vm->ip            = saved_ip;
+    vm->chunk         = saved_chunk;
+    vm->cur_base      = saved_cur_base;
+    vm->frame_count   = saved_frame_count;
     vm->current_frame = saved_current_frame;
 
     // Result is placed in stack[frame_base] by OP(RET); expose that at API top.
