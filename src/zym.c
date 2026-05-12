@@ -1859,7 +1859,8 @@ bool zym_mapHas(ZymValue map, const char* key) {
     if (!IS_MAP(map) || !key) return false;
     ObjMap* m = AS_MAP(map);
 
-    uint32_t hash = 0;
+    // FNV-1a, must match hashString() in object.c (offset basis 2166136261u).
+    uint32_t hash = 2166136261u;
     int len = (int)strlen(key);
     for (int i = 0; i < len; i++) {
         hash ^= (uint8_t)key[i];
@@ -1877,7 +1878,8 @@ bool zym_mapDelete(ZymVM* vm, ZymValue map, const char* key) {
     if (!IS_MAP(map) || !key) return false;
     ObjMap* m = AS_MAP(map);
 
-    uint32_t hash = 0;
+    // FNV-1a, must match hashString() in object.c (offset basis 2166136261u).
+    uint32_t hash = 2166136261u;
     int len = (int)strlen(key);
     for (int i = 0; i < len; i++) {
         hash ^= (uint8_t)key[i];
