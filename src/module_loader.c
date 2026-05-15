@@ -685,8 +685,9 @@ static void stack_free(ImportStack* stack) {
 
 static bool load_module_recursive(
     VM* vm,
-    const char* module_path,
+    const char* module_path_in,
     ModuleReadCallback read_callback,
+    ModuleResolveCallback resolve_callback,
     void* user_data,
     StringSet* loaded_modules,
     ImportStack* import_stack,
@@ -695,6 +696,51 @@ static bool load_module_recursive(
     SymbolMap* symbol_map,
     char** error_msg)
 {
+    // If the embedder installed a resolve callback, give it a chance to
+    // canonicalize the key BEFORE the cycle detector and cache run. A
+    // NULL return means "use the loader's default key" (identical to no
+    // resolver). A non-NULL return takes ownership of the string from
+    // the callback; we free it before returning.
+    //
+    // We need an active import-frame on the VM while invoking the
+    // resolver too, so the script-side can call
+    // `vm.moduleLoader.getCaller()` / `getStack()` from inside resolve
+    // just like it can from read.
+    const char* module_path = module_path_in;
+    char* canonical_owned = NULL;
+    if (resolve_callback) {
+        // Expose the parent stack to the resolver so it can call
+        // `vm.moduleLoader.getCaller()` to learn who issued the import.
+        // We have not pushed `module_path_in` yet, so the top of the
+        // stack is the actual requester — which means `getCaller()`
+        // (returns `depth-2`, with depth-1 being the "current") needs
+        // depth to be `import_stack->count + 1` so depth-2 lands on
+        // the real top-of-parent. `getStack()` will then return the
+        // parent chain (length depth-1 == parent count) since
+        // ImportStack only has `count` entries beyond which
+        // `zym_currentImportPathAt` returns NULL.
+        void* saved_stack_r = vm->current_import_stack;
+        int saved_count_r = vm->current_import_count;
+        vm->current_import_stack = import_stack;
+        vm->current_import_count = import_stack->count + 1;
+
+        const char* rebound = resolve_callback(module_path_in, user_data);
+
+        vm->current_import_stack = saved_stack_r;
+        vm->current_import_count = saved_count_r;
+
+        if (rebound && strcmp(rebound, module_path_in) != 0) {
+            // Copy into loader-owned storage; the callback's pointer is
+            // borrowed and may not outlive this call.
+            canonical_owned = zym_strdup(&vm->allocator, rebound);
+            module_path = canonical_owned;
+        }
+        // NULL or same-content return → keep default key, nothing to free.
+    }
+
+    bool ok = true;
+    bool returning = false;
+
     if (stack_contains(import_stack, module_path)) {
         int cycle_start = -1;
         for (int i = 0; i < import_stack->count; i++) {
@@ -731,22 +777,36 @@ static bool load_module_recursive(
         }
         ptr += sprintf(ptr, "  `--> [%s] <-- ERROR: Already importing (creates cycle)\n", module_path);
 
-        return false;
+        ok = false; returning = true; goto lmr_cleanup;
     }
 
     if (set_contains(loaded_modules, module_path)) {
-        return true;
+        ok = true; returning = true; goto lmr_cleanup;
     }
+    (void)returning;
 
     stack_push(import_stack, module_path);
 
+    // Expose the active ImportStack to the VM so callbacks (and anything
+    // reachable from them) can answer "who asked?" via the public
+    // `zym_currentImport*` accessors. Save/restore around the call to
+    // support nested loadModules calls on the same VM and to ensure the
+    // VM fields are NULL/0 once the callback returns.
+    void* saved_stack = vm->current_import_stack;
+    int saved_count = vm->current_import_count;
+    vm->current_import_stack = import_stack;
+    vm->current_import_count = import_stack->count;
+
     ModuleReadResult read_result = read_callback(module_path, user_data);
+
+    vm->current_import_stack = saved_stack;
+    vm->current_import_count = saved_count;
     if (!read_result.source) {
         size_t error_size = 256 + strlen(module_path);
         *error_msg = (char*)ZYM_ALLOC(&vm->allocator, error_size);
         snprintf(*error_msg, error_size, "Failed to read/preprocess module: [%s]", module_path);
         stack_pop(import_stack);
-        return false;
+        ok = false; goto lmr_cleanup;
     }
 
     map_set(module_sources, module_path, read_result.source);
@@ -759,14 +819,14 @@ static bool load_module_recursive(
     if (!scan_for_imports(&vm->allocator, read_result.source, module_path, &deps, symbol_map, error_msg)) {
         queue_free(&deps);
         stack_pop(import_stack);
-        return false;
+        ok = false; goto lmr_cleanup;
     }
 
     while (!queue_empty(&deps)) {
         ModuleQueueItem item = queue_pop(&deps);
         char* resolved_path = resolve_module_path(&vm->allocator, item.base_path, item.module_path);
 
-        if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
+        if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
                                    loaded_modules, import_stack, module_sources,
                                    module_source_maps, symbol_map, error_msg)) {
             ZYM_FREE_STR(&vm->allocator, resolved_path);
@@ -774,7 +834,7 @@ static bool load_module_recursive(
             ZYM_FREE_STR(&vm->allocator, item.base_path);
             queue_free(&deps);
             stack_pop(import_stack);
-            return false;
+            ok = false; goto lmr_cleanup;
         }
 
         ZYM_FREE_STR(&vm->allocator, resolved_path);
@@ -785,7 +845,13 @@ static bool load_module_recursive(
     queue_free(&deps);
 
     stack_pop(import_stack);
-    return true;
+    ok = true;
+
+lmr_cleanup:
+    if (canonical_owned) {
+        ZYM_FREE_STR(&vm->allocator, canonical_owned);
+    }
+    return ok;
 }
 
 #if 0
@@ -1058,6 +1124,24 @@ ModuleLoadResult* loadModules(
     bool write_debug_output,
     const char* debug_output_path)
 {
+    // Thin wrapper: existing embedders see byte-identical behavior.
+    return loadModulesEx(vm, entry_source, entry_source_map, entry_path,
+                         read_callback, /*resolve_callback=*/NULL, user_data,
+                         debug_names, write_debug_output, debug_output_path);
+}
+
+ModuleLoadResult* loadModulesEx(
+    VM* vm,
+    const char* entry_source,
+    SourceMap* entry_source_map,
+    const char* entry_path,
+    ModuleReadCallback read_callback,
+    ModuleResolveCallback resolve_callback,
+    void* user_data,
+    bool debug_names,
+    bool write_debug_output,
+    const char* debug_output_path)
+{
     ZymAllocator* alloc = &vm->allocator;
     ModuleLoadResult* result = (ModuleLoadResult*)ZYM_ALLOC(alloc, sizeof(ModuleLoadResult));
     result->combined_source = NULL;
@@ -1100,7 +1184,7 @@ ModuleLoadResult* loadModules(
         ModuleQueueItem item = queue_pop(&entry_deps);
         char* resolved_path = resolve_module_path(alloc, item.base_path, item.module_path);
 
-        if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
+        if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
                                    &loaded_modules, &import_stack, &module_sources,
                                    &module_source_maps, &symbol_map, &result->error_message)) {
             result->has_error = true;
@@ -1275,4 +1359,34 @@ void freeModuleLoadResult(VM* vm, ModuleLoadResult* result) {
 
     ZYM_FREE_STR(alloc, result->error_message);
     ZYM_FREE(alloc, result, sizeof(ModuleLoadResult));
+}
+
+// =============================================================================
+// Public runtime introspection accessors (see module_loader.h)
+// =============================================================================
+
+int zym_currentImportDepth(VM* vm) {
+    if (!vm || !vm->current_import_stack) return 0;
+    return vm->current_import_count;
+}
+
+const char* zym_currentImportPathAt(VM* vm, int i) {
+    if (!vm || !vm->current_import_stack) return NULL;
+    ImportStack* s = (ImportStack*)vm->current_import_stack;
+    if (i < 0 || i >= vm->current_import_count) return NULL;
+    if (i >= s->count) return NULL;
+    return s->modules[i];
+}
+
+const char* zym_currentImportCaller(VM* vm) {
+    if (!vm || !vm->current_import_stack) return NULL;
+    // The currently-loading module is at depth-1; its caller is at
+    // depth-2. depth == 1 means we're loading the entry module: no
+    // caller.
+    int d = vm->current_import_count;
+    if (d < 2) return NULL;
+    ImportStack* s = (ImportStack*)vm->current_import_stack;
+    int idx = d - 2;
+    if (idx < 0 || idx >= s->count) return NULL;
+    return s->modules[idx];
 }

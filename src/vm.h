@@ -177,6 +177,16 @@ typedef struct VM {
     // compiler polls at every statement-emit boundary.
     volatile sig_atomic_t compile_cancelled;
 
+    // Module loader: pointer to the *currently active* ImportStack (an
+    // opaque struct defined in module_loader.c) and its current depth, set
+    // by `load_module_recursive` around each `read_callback` invocation
+    // and cleared on return. Used by the public `zym_currentImport*`
+    // accessors so an embedder's read_callback can answer "who asked?"
+    // without changing the callback signature. NULL / 0 outside an active
+    // read_callback frame. The pointer is borrowed (never owned by VM).
+    void* current_import_stack;
+    int current_import_count;
+
 #if ZYM_HAS_BUILD_TESTING
     // Phase 4.5: compiler resolution-trace buffer used by the parity test
     // between `resolver.c` and `compiler.c`. Non-NULL only between

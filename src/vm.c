@@ -99,6 +99,9 @@ void initVM(VM* vm) {
     diagsink_init(&vm->diagnostics);
     vm->compile_cancelled = 0;
 
+    vm->current_import_stack = NULL;
+    vm->current_import_count = 0;
+
     vm->gc_enabled = true;
     // Recalculate debt: headroom = next_gc - bytes_allocated, clamped to INT32_MAX
     {
