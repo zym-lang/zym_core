@@ -215,22 +215,27 @@ char* processEscapeSequences(ZymAllocator* alloc, const char* input, int input_l
 }
 
 char* decodeModulePath(ZymAllocator* alloc, const char* encoded, int length) {
+    /* Iterate over the shared escape table (declared in utils.h, defined in
+     * module_loader.c) so encoder and decoder cannot drift. Output is at
+     * most as long as input -- every escape token is >= 1 byte and decodes
+     * to exactly 1 byte. */
     char* result = (char*)ZYM_ALLOC(alloc, length + 1);
     size_t j = 0;
 
     for (int i = 0; i < length; ) {
-        if (i + 7 <= length && memcmp(encoded + i, "_slash_", 7) == 0) {
-            result[j++] = '/';
-            i += 7;
-        } else if (i + 5 <= length && memcmp(encoded + i, "_dot_", 5) == 0) {
-            result[j++] = '.';
-            i += 5;
-        } else if (i + 6 <= length && memcmp(encoded + i, "_dash_", 6) == 0) {
-            result[j++] = '-';
-            i += 6;
-        } else if (i + 7 <= length && memcmp(encoded + i, "_space_", 7) == 0) {
-            result[j++] = ' ';
-            i += 7;
+        const ModulePathEscape* hit = NULL;
+        for (size_t k = 0; k < MODULE_PATH_ESCAPES_COUNT; k++) {
+            const ModulePathEscape* e = &MODULE_PATH_ESCAPES[k];
+            if (e->ch == '\\') continue; /* encode-only alias; '_slash_' decodes to '/' */
+            if ((int)(i + e->token_len) <= length &&
+                memcmp(encoded + i, e->token, e->token_len) == 0) {
+                hit = e;
+                break;
+            }
+        }
+        if (hit) {
+            result[j++] = hit->ch;
+            i += (int)hit->token_len;
         } else {
             result[j++] = encoded[i++];
         }

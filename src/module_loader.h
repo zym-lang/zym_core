@@ -22,11 +22,17 @@ typedef struct {
 typedef ModuleReadResult (*ModuleReadCallback)(const char* path, void* user_data);
 
 // Optional resolve callback. See `include/zym/module_loader.h` for the
-// full contract. Returns NULL to keep the loader's default behavior;
-// otherwise a NUL-terminated borrowed string that the loader copies
-// internally and uses as the canonical key for cycle detection,
-// caching, and the subsequent `read_callback`.
-typedef const char* (*ModuleResolveCallback)(const char* path, void* user_data);
+// full contract. Called with the raw import `spec` and the canonical
+// path of the `importer` (NULL for the entry module), BEFORE any
+// directory join or `normalize_path` runs. Return NULL to fall back to
+// the loader's default `resolve_module_path`; otherwise a NUL-
+// terminated borrowed string that the loader copies internally and
+// uses as the canonical key for cycle detection, caching, the
+// `read_callback` path argument, and the `importer` of any transitive
+// imports.
+typedef const char* (*ModuleResolveCallback)(const char* spec,
+                                             const char* importer,
+                                             void* user_data);
 
 typedef struct {
     char* combined_source;

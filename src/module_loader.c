@@ -7,6 +7,7 @@
 #include "vm.h"
 #include "memory.h"
 #include "sourcemap.h"
+#include "utils.h"
 
 static char* normalize_path(ZymAllocator* alloc, const char* path) {
     if (!path) return NULL;
@@ -79,39 +80,62 @@ static unsigned int hash_path(const char* path) {
     return hash;
 }
 
+/*
+ * Single source of truth for the module-path <-> identifier escape table.
+ * Both the encoder here and `decodeModulePath` in utils.c iterate over
+ * this table -- to add a new escapable character, add one row and both
+ * sides stay in sync automatically.
+ *
+ * Note: '\\' is encoded as "_slash_" (same token as '/') intentionally;
+ * the decoder maps "_slash_" back to '/' only, which is the desired
+ * canonicalization (Windows-style separators collapse to POSIX).
+ */
+const ModulePathEscape MODULE_PATH_ESCAPES[] = {
+    { '/',  "_slash_",  7 },
+    { '\\', "_slash_",  7 },  /* encode-only alias for '/' */
+    { '.',  "_dot_",    5 },
+    { '-',  "_dash_",   6 },
+    { ' ',  "_space_",  7 },
+    { ':',  "_colon_",  7 },
+    { '@',  "_at_",     4 },
+    { '$',  "_dollar_", 8 },
+    { '#',  "_hash_",   6 },
+    { '%',  "_pct_",    5 },
+    { '&',  "_amp_",    5 },
+    { '*',  "_star_",   6 },
+    { '~',  "_tilde_",  7 },
+    { '!',  "_bang_",   6 },
+};
+const size_t MODULE_PATH_ESCAPES_COUNT =
+    sizeof(MODULE_PATH_ESCAPES) / sizeof(MODULE_PATH_ESCAPES[0]);
+
 /* "src/math.zym" -> "src_slash_math_dot_zym" */
 static char* encode_path_to_identifier(ZymAllocator* alloc, const char* path) {
     size_t len = strlen(path);
     size_t result_len = 0;
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
-        if (c == '/' || c == '\\') result_len += 7;
-        else if (c == '.') result_len += 5;
-        else if (c == '-') result_len += 6;
-        else if (c == ' ') result_len += 7;
-        else if (c == ':') result_len += 7;
-        else result_len += 1;
+        size_t add = 1;
+        for (size_t k = 0; k < MODULE_PATH_ESCAPES_COUNT; k++) {
+            if (MODULE_PATH_ESCAPES[k].ch == c) {
+                add = MODULE_PATH_ESCAPES[k].token_len;
+                break;
+            }
+        }
+        result_len += add;
     }
 
     char* result = (char*)ZYM_ALLOC(alloc, result_len + 1);
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
-        if (c == '/' || c == '\\') {
-            memcpy(result + j, "_slash_", 7);
-            j += 7;
-        } else if (c == '.') {
-            memcpy(result + j, "_dot_", 5);
-            j += 5;
-        } else if (c == '-') {
-            memcpy(result + j, "_dash_", 6);
-            j += 6;
-        } else if (c == ' ') {
-            memcpy(result + j, "_space_", 7);
-            j += 7;
-        } else if (c == ':') {
-            memcpy(result + j, "_colon_", 7);
-            j += 7;
+        const ModulePathEscape* esc = NULL;
+        for (size_t k = 0; k < MODULE_PATH_ESCAPES_COUNT; k++) {
+            if (MODULE_PATH_ESCAPES[k].ch == c) { esc = &MODULE_PATH_ESCAPES[k]; break; }
+        }
+        if (esc) {
+            memcpy(result + j, esc->token, esc->token_len);
+            j += esc->token_len;
         } else {
             result[j++] = c;
         }
@@ -120,38 +144,6 @@ static char* encode_path_to_identifier(ZymAllocator* alloc, const char* path) {
 
     return result;
 }
-
-/* "src_slash_math_dot_zym" -> "src/math.zym" */
-#if 0
-static char* decode_identifier_to_path(const char* encoded, int length) {
-    char* result = (char*)malloc(length + 1);
-    size_t j = 0;
-
-    for (int i = 0; i < length; ) {
-        if (i + 7 <= length && memcmp(encoded + i, "_slash_", 7) == 0) {
-            result[j++] = '/';
-            i += 7;
-        } else if (i + 5 <= length && memcmp(encoded + i, "_dot_", 5) == 0) {
-            result[j++] = '.';
-            i += 5;
-        } else if (i + 6 <= length && memcmp(encoded + i, "_dash_", 6) == 0) {
-            result[j++] = '-';
-            i += 6;
-        } else if (i + 7 <= length && memcmp(encoded + i, "_space_", 7) == 0) {
-            result[j++] = ' ';
-            i += 7;
-        } else if (i + 7 <= length && memcmp(encoded + i, "_colon_", 7) == 0) {
-            result[j++] = ':';
-            i += 7;
-        } else {
-            result[j++] = encoded[i++];
-        }
-    }
-    result[j] = '\0';
-
-    return result;
-}
-#endif
 
 typedef struct {
     ZymAllocator* alloc;
@@ -683,9 +675,54 @@ static void stack_free(ImportStack* stack) {
     stack->capacity = 0;
 }
 
+// Resolve an import `spec` (raw, as it appeared in source) against an
+// `importer` (canonical path of the module that issued the import, or
+// NULL for the entry module's own deps) into the canonical key the
+// loader will use for cycle detection, caching, and `read_callback`.
+//
+// If a `resolve_callback` is installed and returns non-NULL, that value
+// is the canonical key (copied into allocator-owned storage). If the
+// resolver returns NULL — or none is installed — fall back to the
+// default `resolve_module_path(importer_dir, spec)` behavior. The
+// returned string is always allocator-owned; the caller must
+// `ZYM_FREE_STR` it.
+static char* resolve_import_spec(VM* vm,
+                                 const char* spec,
+                                 const char* importer,
+                                 ModuleResolveCallback resolve_callback,
+                                 void* user_data,
+                                 ImportStack* import_stack) {
+    if (resolve_callback) {
+        // Expose the active import stack to the resolver so it can call
+        // `vm.moduleLoader.getCaller()` / `getStack()` while deciding.
+        // Depth is set to `count + 1` so `getCaller()` (which returns
+        // depth-2, with depth-1 being the "currently loading") lands on
+        // the real importer rather than one above it.
+        void* saved_stack = vm->current_import_stack;
+        int saved_count = vm->current_import_count;
+        vm->current_import_stack = import_stack;
+        vm->current_import_count = import_stack ? import_stack->count + 1 : 1;
+
+        const char* rebound = resolve_callback(spec, importer, user_data);
+
+        vm->current_import_stack = saved_stack;
+        vm->current_import_count = saved_count;
+
+        if (rebound) {
+            return zym_strdup(&vm->allocator, rebound);
+        }
+    }
+    // Default fallback. `importer` is the canonical path of the importer
+    // (a file, not a dir); `resolve_module_path` strips to its dir and
+    // joins. For the entry module's deps there is no importer; in that
+    // case the caller passes the entry's own path so deps resolve
+    // relative to it (matches pre-resolver behavior).
+    return resolve_module_path(&vm->allocator, importer ? importer : "", spec);
+}
+
 static bool load_module_recursive(
     VM* vm,
-    const char* module_path_in,
+    const char* module_path,
     ModuleReadCallback read_callback,
     ModuleResolveCallback resolve_callback,
     void* user_data,
@@ -696,50 +733,11 @@ static bool load_module_recursive(
     SymbolMap* symbol_map,
     char** error_msg)
 {
-    // If the embedder installed a resolve callback, give it a chance to
-    // canonicalize the key BEFORE the cycle detector and cache run. A
-    // NULL return means "use the loader's default key" (identical to no
-    // resolver). A non-NULL return takes ownership of the string from
-    // the callback; we free it before returning.
-    //
-    // We need an active import-frame on the VM while invoking the
-    // resolver too, so the script-side can call
-    // `vm.moduleLoader.getCaller()` / `getStack()` from inside resolve
-    // just like it can from read.
-    const char* module_path = module_path_in;
-    char* canonical_owned = NULL;
-    if (resolve_callback) {
-        // Expose the parent stack to the resolver so it can call
-        // `vm.moduleLoader.getCaller()` to learn who issued the import.
-        // We have not pushed `module_path_in` yet, so the top of the
-        // stack is the actual requester — which means `getCaller()`
-        // (returns `depth-2`, with depth-1 being the "current") needs
-        // depth to be `import_stack->count + 1` so depth-2 lands on
-        // the real top-of-parent. `getStack()` will then return the
-        // parent chain (length depth-1 == parent count) since
-        // ImportStack only has `count` entries beyond which
-        // `zym_currentImportPathAt` returns NULL.
-        void* saved_stack_r = vm->current_import_stack;
-        int saved_count_r = vm->current_import_count;
-        vm->current_import_stack = import_stack;
-        vm->current_import_count = import_stack->count + 1;
-
-        const char* rebound = resolve_callback(module_path_in, user_data);
-
-        vm->current_import_stack = saved_stack_r;
-        vm->current_import_count = saved_count_r;
-
-        if (rebound && strcmp(rebound, module_path_in) != 0) {
-            // Copy into loader-owned storage; the callback's pointer is
-            // borrowed and may not outlive this call.
-            canonical_owned = zym_strdup(&vm->allocator, rebound);
-            module_path = canonical_owned;
-        }
-        // NULL or same-content return → keep default key, nothing to free.
-    }
-
-    bool ok = true;
-    bool returning = false;
+    // `module_path` is already the canonical key — the caller resolved
+    // the (spec, importer) pair via `resolve_import_spec` before
+    // recursing. We do NOT call the resolver again here; doing so would
+    // double-resolve and break script-side resolvers that produce
+    // synthetic keys (e.g. `<builtin>/json`) which won't round-trip.
 
     if (stack_contains(import_stack, module_path)) {
         int cycle_start = -1;
@@ -777,13 +775,12 @@ static bool load_module_recursive(
         }
         ptr += sprintf(ptr, "  `--> [%s] <-- ERROR: Already importing (creates cycle)\n", module_path);
 
-        ok = false; returning = true; goto lmr_cleanup;
+        return false;
     }
 
     if (set_contains(loaded_modules, module_path)) {
-        ok = true; returning = true; goto lmr_cleanup;
+        return true;
     }
-    (void)returning;
 
     stack_push(import_stack, module_path);
 
@@ -806,7 +803,7 @@ static bool load_module_recursive(
         *error_msg = (char*)ZYM_ALLOC(&vm->allocator, error_size);
         snprintf(*error_msg, error_size, "Failed to read/preprocess module: [%s]", module_path);
         stack_pop(import_stack);
-        ok = false; goto lmr_cleanup;
+        return false;
     }
 
     map_set(module_sources, module_path, read_result.source);
@@ -819,12 +816,20 @@ static bool load_module_recursive(
     if (!scan_for_imports(&vm->allocator, read_result.source, module_path, &deps, symbol_map, error_msg)) {
         queue_free(&deps);
         stack_pop(import_stack);
-        ok = false; goto lmr_cleanup;
+        return false;
     }
 
     while (!queue_empty(&deps)) {
         ModuleQueueItem item = queue_pop(&deps);
-        char* resolved_path = resolve_module_path(&vm->allocator, item.base_path, item.module_path);
+        // Resolve (spec, importer) via the resolver callback first;
+        // fall back to the default directory-join behavior only if the
+        // resolver is absent or returns NULL. `module_path` here is the
+        // canonical path of the importer (the module we're currently
+        // processing) — it's what the resolver and the default
+        // `resolve_module_path` both consume as the importer side.
+        char* resolved_path = resolve_import_spec(
+            vm, item.module_path, module_path,
+            resolve_callback, user_data, import_stack);
 
         if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
                                    loaded_modules, import_stack, module_sources,
@@ -834,7 +839,7 @@ static bool load_module_recursive(
             ZYM_FREE_STR(&vm->allocator, item.base_path);
             queue_free(&deps);
             stack_pop(import_stack);
-            ok = false; goto lmr_cleanup;
+            return false;
         }
 
         ZYM_FREE_STR(&vm->allocator, resolved_path);
@@ -845,13 +850,7 @@ static bool load_module_recursive(
     queue_free(&deps);
 
     stack_pop(import_stack);
-    ok = true;
-
-lmr_cleanup:
-    if (canonical_owned) {
-        ZYM_FREE_STR(&vm->allocator, canonical_owned);
-    }
-    return ok;
+    return true;
 }
 
 #if 0
@@ -963,8 +962,17 @@ static const char* skip_fresh_directive(const char* source) {
     return p;
 }
 
-static char* transform_imports(ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
-                               SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules) {
+// `vm`, `resolve_callback`, `user_data` are threaded so the call-site
+// rewrite can consult the same resolver the loader used at load time.
+// This keeps the encoded identifier at every `import("spec")` call site
+// in sync with the encoded identifier of the module that was actually
+// loaded for `(spec, importer)` — otherwise scripts that return
+// synthetic keys from the resolver would emit references to modules
+// that don't exist. `vm` is allowed to be NULL only when no resolver is
+// installed (the default fallback path doesn't need it).
+static char* transform_imports(VM* vm, ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
+                               SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules,
+                               ModuleResolveCallback resolve_callback, void* user_data) {
     StringBuilder sb;
     sb_init(&sb, alloc);
 
@@ -1048,7 +1056,16 @@ static char* transform_imports(ZymAllocator* alloc, const char* source, const ch
                         if (*p == ')') {
                             p++;
 
-                            char* resolved = resolve_module_path(alloc, base_path, path);
+                            // Use the same resolver the loader used.
+                            // `base_path` is the canonical path of the
+                            // module containing this `import("...")`
+                            // call site (the importer). If no resolver
+                            // is installed, this falls back to
+                            // `resolve_module_path(base_path, path)` —
+                            // byte-identical to the previous behavior.
+                            char* resolved = resolve_import_spec(
+                                vm, path, base_path,
+                                resolve_callback, user_data, NULL);
 
                             if (debug_names) {
                                 sb_append(&sb, "__module_");
@@ -1198,7 +1215,11 @@ ModuleLoadResult* loadModulesEx(
 
     while (!queue_empty(&entry_deps)) {
         ModuleQueueItem item = queue_pop(&entry_deps);
-        char* resolved_path = resolve_module_path(alloc, item.base_path, item.module_path);
+        // Resolve (spec, importer=entry_path) via the resolver first;
+        // fall back to default directory-join behavior if absent / NULL.
+        char* resolved_path = resolve_import_spec(
+            vm, item.module_path, entry_path,
+            resolve_callback, user_data, &import_stack);
 
         if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
                                    &loaded_modules, &import_stack, &module_sources,
@@ -1301,7 +1322,7 @@ ModuleLoadResult* loadModulesEx(
                 if (*q == '\n') source_line_idx++;
             }
         }
-        char* transformed = transform_imports(alloc, source_for_transform, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
+        char* transformed = transform_imports(vm, alloc, source_for_transform, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules, resolve_callback, user_data);
         add_mapped_lines(vm, transformed, source_source_map, source_file_id,
                          combined_source_map, &combined_byte_cursor, &source_line_idx);
 
@@ -1330,7 +1351,7 @@ ModuleLoadResult* loadModulesEx(
         sb_append_synth(vm, &combined, "\n", combined_source_map, &combined_byte_cursor);
     }
 
-    char* transformed_entry = transform_imports(alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
+    char* transformed_entry = transform_imports(vm, alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules, resolve_callback, user_data);
 
     // Resolve entry module's own file_id so the entry SourceMap can be
     // copied into the combined map with the correct originFileId on

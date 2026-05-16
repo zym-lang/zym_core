@@ -21,24 +21,37 @@ typedef struct {
 
 typedef ModuleReadResult (*ModuleReadCallback)(const char* path, void* user_data);
 
-// Optional resolve callback. Invoked by the loader BEFORE the cycle
-// detector and module cache run, giving the embedder a chance to
-// canonicalize the module key.
+// Optional resolve callback. Invoked by the loader BEFORE any internal
+// path math (no `resolve_module_path` join, no `normalize_path`) and
+// BEFORE the cycle detector and module cache run. The resolver is the
+// authority over the canonical module key.
 //
-// `path` is the result of the loader's built-in `resolve_module_path`
-// (i.e. today's root-relative behavior). The callback returns either
+// Arguments:
+//   - `spec`     : the raw import spec exactly as it appeared in source
+//                  (e.g. `"@/foo.zym"`, `"./bar.zym"`, `"std/json"`).
+//                  The loader does NOT pre-join this with the importer's
+//                  directory before calling the resolver.
+//   - `importer` : the resolved canonical path of the module that issued
+//                  the import, or NULL when resolving the entry module
+//                  (which has no importer).
+//   - `user_data`: opaque pointer from `loadModulesEx`.
+//
+// Return value:
 //   - a NUL-terminated C string (BORROWED — the loader copies it into
 //     its own allocator-owned storage immediately on return; the
-//     callback's pointer does NOT need to outlive the call) to override
-//     the key the loader will use for cycle detection, caching, the
-//     read_callback path argument, and as `base_path` for transitive
-//     imports, OR
-//   - NULL to keep the loader's default resolution (identical to not
-//     installing a resolve callback at all).
+//     callback's pointer does NOT need to outlive the call) to use as
+//     the canonical key for cycle detection, caching, the
+//     `read_callback` path argument, and as the `importer` of any
+//     transitive imports, OR
+//   - NULL to fall back to the loader's default `resolve_module_path`
+//     (directory join + `normalize_path`) — identical to not installing
+//     a resolve callback at all for that spec.
 //
 // The callback may also read the active import frame via
-// `zym_currentImport*` to know who asked.
-typedef const char* (*ModuleResolveCallback)(const char* path, void* user_data);
+// `zym_currentImport*` accessors.
+typedef const char* (*ModuleResolveCallback)(const char* spec,
+                                             const char* importer,
+                                             void* user_data);
 
 typedef struct {
     char* combined_source;
