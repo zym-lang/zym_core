@@ -4526,9 +4526,23 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     if (stmt->name.length > 9 && memcmp(stmt->name.start, "__module_", 9) == 0) {
         // Case 1: We are compiling a Module Factory.
         // Decode encoded path: "__module_src_slash_math_dot_zym" -> "src/math.zym"
-        char* decoded_path = decodeModulePath(&fn_compiler.vm->allocator, stmt->name.start + 9, stmt->name.length - 9);
+        // Non-fresh modules are emitted by module_loader as a wrapper
+        // function named `__module_<encoded>_init` whose return value is
+        // cached in `var __module_<encoded> = __module_<encoded>_init()`.
+        // The trailing `_init` is purely an emission artifact -- strip it
+        // (only when it is the LAST segment of the encoded portion) so
+        // runtime error frames report `[localModuleOne.zym]` rather than
+        // `[localModuleOne.zym_init]`. A module whose real path happens to
+        // contain "init" elsewhere (e.g. `init_helpers.zym`) is unaffected
+        // because we only chop a trailing `_init` suffix.
+        int enc_len = stmt->name.length - 9;
+        const char* enc_start = stmt->name.start + 9;
+        if (enc_len > 5 && memcmp(enc_start + enc_len - 5, "_init", 5) == 0) {
+            enc_len -= 5;
+        }
+        char* decoded_path = decodeModulePath(&fn_compiler.vm->allocator, enc_start, enc_len);
         fn_compiler.current_module_name = copyString(fn_compiler.vm, decoded_path, strlen(decoded_path));
-        ZYM_FREE(&fn_compiler.vm->allocator, decoded_path, stmt->name.length - 9 + 1);
+        ZYM_FREE(&fn_compiler.vm->allocator, decoded_path, enc_len + 1);
     }
     else if (current_compiler->current_module_name != NULL) {
         // Case 2: We are inside a module (e.g. 'sum' inside 'array_utils'). Inherit it.
