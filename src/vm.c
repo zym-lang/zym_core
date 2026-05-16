@@ -2618,11 +2618,16 @@ static InterpretResult run(VM* vm) {
                 LOAD_STATE(); DISPATCH();
             }
 
-            // Tail position: return the native's result from the current frame
+            // Tail position: return the native's result from the current frame.
+            // Note: close upvalues only for the callee's own locals (stack_base + 1
+            // upward). `stack_base` itself is the caller's slot that will receive
+            // the return value -- closing an upvalue on that slot here would
+            // capture the callee value (e.g. the loaded function) instead of the
+            // return value written immediately below.
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
-                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
-                closeUpvalues(vm, &stack[frame->stack_base]);
+                                vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base + 1]);
             }
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
@@ -2703,11 +2708,15 @@ static InterpretResult run(VM* vm) {
                 LOAD_STATE(); DISPATCH();
             }
 
-            // Tail position: return the native closure's result from the current frame
+            // Tail position: return the native closure's result from the current frame.
+            // See OP(RET) / native tail-return note: `stack_base` is the caller's
+            // result slot; only close upvalues at `stack_base + 1` and above so
+            // the upvalue for `var x = native_closure()` doesn't snapshot the
+            // callee before the return value is written.
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
-                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
-                closeUpvalues(vm, &stack[frame->stack_base]);
+                                vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base + 1]);
             }
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
@@ -2797,10 +2806,20 @@ static InterpretResult run(VM* vm) {
                            : stack[frame->stack_base + ret_reg];
 
         // Before we pop the frame, close any upvalues pointing to its stack slots.
+        // IMPORTANT: `frame->stack_base` is the caller's slot that receives the
+        // return value below (`stack[frame->stack_base] = return_value`). If an
+        // upvalue is open on that exact slot (e.g. caller did `var m = mk()` and
+        // the CALL optimization placed both the callee load and the result in
+        // m's register), closing it here would snapshot the *callee* value
+        // (loaded into the slot just before CALL) rather than the upcoming
+        // return value -- so any enclosed closure would observe `m` as the
+        // function it called, not the value the function returned. The callee's
+        // own locals begin at `stack_base + 1`, so we bound the close at that
+        // address and use strict `>` in the fast-path predicate to match.
         // Fast path: skip the function call if no open upvalues reach into this frame.
         if (__builtin_expect(vm->open_upvalues != NULL &&
-                            vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
-            closeUpvalues(vm, &stack[frame->stack_base]);
+                            vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
+            closeUpvalues(vm, &stack[frame->stack_base + 1]);
         }
 
         // Public-API boundary frame: the C caller (zym_call_execute) is

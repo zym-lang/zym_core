@@ -947,6 +947,22 @@ static bool is_fresh_module(const char* source) {
     return strncmp(p, "\"use fresh\"", 11) == 0;
 }
 
+// Returns a pointer into `source` past a leading `"use fresh"` directive
+// (and any trailing whitespace/newline on that line). If the directive is
+// not present, returns `source` unchanged. Used so the directive itself
+// doesn't leak into the wrapped function body of a fresh module.
+static const char* skip_fresh_directive(const char* source) {
+    const char* p = source;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (strncmp(p, "\"use fresh\"", 11) != 0) return source;
+    p += 11;
+    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+    if (*p == ';') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+    if (*p == '\n') p++;
+    return p;
+}
+
 static char* transform_imports(ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
                                SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules) {
     StringBuilder sb;
@@ -1214,7 +1230,27 @@ ModuleLoadResult* loadModulesEx(
     initSourceMap(combined_source_map);
     int combined_byte_cursor = 0;
 
+    // Pre-scan every loaded module for the `"use fresh"` directive so
+    // `fresh_modules` is fully populated before any `transform_imports`
+    // call runs. Without this, a module emitted earlier in the loop (a
+    // parent) that imports a fresh module emitted later (a child) sees
+    // an empty `fresh_modules` set and rewrites the call site to the
+    // cache variable instead of the direct function call.
     for (int i = 0; i < loaded_modules.count; i++) {
+        const char* module_path = loaded_modules.items[i];
+        if (strcmp(module_path, entry_path) == 0) continue;
+        char* source = map_get(&module_sources, module_path);
+        if (!source) continue;
+        if (is_fresh_module(source)) {
+            set_add(&fresh_modules, module_path);
+        }
+    }
+
+    // Emit modules in dependency-first order: BFS added parents before
+    // children, so iterating in reverse gives leaves first. This
+    // guarantees a non-fresh module's `var __module_X = __module_X_init()`
+    // initializer runs before any parent `_init` that references X.
+    for (int i = loaded_modules.count - 1; i >= 0; i--) {
         const char* module_path = loaded_modules.items[i];
 
         if (strcmp(module_path, entry_path) == 0) {
@@ -1227,10 +1263,7 @@ ModuleLoadResult* loadModulesEx(
         ZymFileId source_file_id = source_entry ? source_entry->file_id : ZYM_FILE_ID_INVALID;
         if (!source) continue;
 
-        bool is_fresh = is_fresh_module(source);
-        if (is_fresh) {
-            set_add(&fresh_modules, module_path);
-        }
+        bool is_fresh = set_contains(&fresh_modules, module_path);
 
         if (debug_names) {
             char* encoded = encode_path_to_identifier(alloc, module_path);
@@ -1255,9 +1288,20 @@ ModuleLoadResult* loadModulesEx(
 
         sb_append_synth(vm, &combined, "() {\n", combined_source_map, &combined_byte_cursor);
 
-        char* transformed = transform_imports(alloc, source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
-
+        // For fresh modules, drop the leading `"use fresh"` directive
+        // so it doesn't end up as a stray string-expression statement
+        // inside the wrapped function body. Count how many source lines
+        // we skipped so `source_line_idx` still indexes the right per-
+        // module SourceMap segment for what's actually emitted.
+        const char* source_for_transform = source;
         int source_line_idx = 0;
+        if (is_fresh) {
+            source_for_transform = skip_fresh_directive(source);
+            for (const char* q = source; q < source_for_transform; q++) {
+                if (*q == '\n') source_line_idx++;
+            }
+        }
+        char* transformed = transform_imports(alloc, source_for_transform, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
         add_mapped_lines(vm, transformed, source_source_map, source_file_id,
                          combined_source_map, &combined_byte_cursor, &source_line_idx);
 
