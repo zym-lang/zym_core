@@ -841,10 +841,18 @@ static bool find_hoisted_function(Compiler* c, const Token* name, int arity, Hoi
         }
 
         case HOISTED_LOCAL: {
-            for (int i = 0; i < c->local_hoisted_count; i++) {
-                if (c->local_hoisted[i].is_variadic) continue;
-                if (c->local_hoisted[i].arity == arity && tokens_equal(&c->local_hoisted[i].name, name)) {
-                    return true;
+            // Walk current compiler and the enclosing chain so that nested
+            // function bodies (e.g. overloaded `func` declarations inside a
+            // module body) can still find sibling overloads declared in an
+            // outer scope. Without this, an unmangled name resolution path
+            // would capture the wrong overload as an upvalue.
+            for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+                for (int i = 0; i < cur->local_hoisted_count; i++) {
+                    if (cur->local_hoisted[i].is_variadic) continue;
+                    if (cur->local_hoisted[i].arity == arity &&
+                        tokens_equal(&cur->local_hoisted[i].name, name)) {
+                        return true;
+                    }
                 }
             }
             return false;
@@ -892,9 +900,12 @@ static bool has_variadic_hoisted_global(Compiler* c, const Token* name) {
 }
 
 static bool has_variadic_hoisted_local(Compiler* c, const Token* name) {
-    for (int i = 0; i < c->local_hoisted_count; i++) {
-        if (c->local_hoisted[i].is_variadic && tokens_equal(&c->local_hoisted[i].name, name)) {
-            return true;
+    // Walk the enclosing chain — see is_hoisted_local for rationale.
+    for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+        for (int i = 0; i < cur->local_hoisted_count; i++) {
+            if (cur->local_hoisted[i].is_variadic && tokens_equal(&cur->local_hoisted[i].name, name)) {
+                return true;
+            }
         }
     }
     return false;
@@ -909,8 +920,11 @@ static bool has_any_hoisted_global(Compiler* c, const Token* name) {
 }
 
 static bool has_any_hoisted_local(Compiler* c, const Token* name) {
-    for (int i = 0; i < c->local_hoisted_count; i++) {
-        if (tokens_equal(&c->local_hoisted[i].name, name)) return true;
+    // Walk the enclosing chain — see is_hoisted_local for rationale.
+    for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+        for (int i = 0; i < cur->local_hoisted_count; i++) {
+            if (tokens_equal(&cur->local_hoisted[i].name, name)) return true;
+        }
     }
     return false;
 }
@@ -1105,7 +1119,18 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
         ScopedString mangled = scoped_mangle(compiler, name, arg_count);
         Token mangled_token = { .start = mangled.str, .length = (int)strlen(mangled.str), .line = name->line };
         reg = resolve_local(compiler, &mangled_token);
-        scoped_string_free(&mangled);
+        if (reg == -1) {
+            // Overload lives in an enclosing scope — capture mangled name as
+            // upvalue (mirrors the fix in resolve_and_load_function).
+            int up = resolve_upvalue(compiler, &mangled_token);
+            scoped_string_free(&mangled);
+            if (up != -1) {
+                emit_get_upvalue(compiler, call_base, up, line);
+                return;
+            }
+        } else {
+            scoped_string_free(&mangled);
+        }
     }
     // 1b. No exact local match, but local has variadic — needs dispatcher
     if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
@@ -1432,7 +1457,23 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
         char* mangled = mangle_name(compiler, name, arg_count);
         Token mangled_token = { .start = mangled, .length = (int)strlen(mangled), .line = name->line };
         reg = resolve_local(compiler, &mangled_token);
-        FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+        if (reg == -1) {
+            // The overload lives in an enclosing scope (e.g. a sibling `func`
+            // declared at module scope, referenced from inside another
+            // overload's body). Capture the mangled name as an upvalue so the
+            // correct overload is bound instead of falling through to the
+            // unmangled name and accidentally capturing whichever overload
+            // happens to be visible (often the enclosing function itself via
+            // recursive self-binding).
+            int up = resolve_upvalue(compiler, &mangled_token);
+            FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+            if (up != -1) {
+                emit_instruction(compiler, PACK_ABx(GET_UPVALUE, target_reg, up), line);
+                return true;
+            }
+        } else {
+            FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+        }
     }
     // 1b. If no exact local match, check if local has variadic — needs dispatcher
     if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
