@@ -2267,7 +2267,24 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // Guard against the (theoretical) case where the callee grew the
     // stack via stack reallocation and stack_top is now below the
     // saved value — only shrink, never enlarge.
+    //
+    // CRITICAL: zero out the slots in `[saved_stack_top, vm->stack_top)`
+    // before shrinking. These slots were used as the callee's register
+    // window and may contain object pointers written by the body (e.g.
+    // OP_CLOSURE, OP_NEW_MAP) that are no longer reachable through any
+    // other root. Once we shrink `stack_top` below them, the very next
+    // GC will free them. But the slot memory itself remains in
+    // `vm->stack`, so a subsequent re-entrant call that re-grows
+    // `stack_top` above `saved_stack_top` (typical: looped
+    // `ui.frame(win, body)` / `UI.child(...)` callbacks) makes
+    // `markRoots` revisit those slots in
+    // `for (i = 0; i < vm->stack_top; i++) markValue(...)` and
+    // dereference freed memory — exactly the heap-use-after-free
+    // reported under ASan for examples/gui/dashboard.zym.
     if (saved_stack_top < vm->stack_top) {
+        for (int i = saved_stack_top; i < vm->stack_top; i++) {
+            vm->stack[i] = NULL_VAL;
+        }
         vm->stack_top = saved_stack_top;
     }
 

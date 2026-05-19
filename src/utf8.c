@@ -235,11 +235,15 @@ bool utf8_substring(const char* str, int byte_len,
 }
 
 char* utf8_toupper(ZymAllocator* alloc, const char* str, int byte_len, int* out_len) {
-    if (str == NULL || byte_len == 0) {
+    if (str == NULL || byte_len < 0) {
         *out_len = 0;
         return NULL;
     }
 
+    // Allocate at least 1 byte so an empty input still returns a valid
+    // NUL-terminated buffer (NULL is reserved for true allocation failure;
+    // callers translate NULL into an "out of memory" runtime error, which
+    // would be a lie for an empty string).
     char* result = (char*)ZYM_ALLOC(alloc, byte_len + 1);
     if (result == NULL) {
         *out_len = 0;
@@ -260,11 +264,14 @@ char* utf8_toupper(ZymAllocator* alloc, const char* str, int byte_len, int* out_
 }
 
 char* utf8_tolower(ZymAllocator* alloc, const char* str, int byte_len, int* out_len) {
-    if (str == NULL || byte_len == 0) {
+    if (str == NULL || byte_len < 0) {
         *out_len = 0;
         return NULL;
     }
 
+    // See utf8_toupper for why we no longer bail on byte_len == 0: callers
+    // turn NULL into an "out of memory" error, so an empty input must still
+    // return a valid (empty, NUL-terminated) heap buffer.
     char* result = (char*)ZYM_ALLOC(alloc, byte_len + 1);
     if (result == NULL) {
         *out_len = 0;
