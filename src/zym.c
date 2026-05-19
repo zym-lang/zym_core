@@ -2234,6 +2234,18 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
         updateStackReferences((VM*)vm, old_stack, new_stack);
     }
 
+    // Save the caller's stack_top so we can fully restore it after the
+    // call. Previously we shrank stack_top to `frame_base + 1` on return,
+    // but `frame_base` is computed from active-frame extents and can
+    // exceed the caller's pre-call `stack_top` — leaking one or more
+    // slots per re-entrant call. Looped native callbacks (e.g.,
+    // `ui.frame(win, body)` called every frame from a script's main
+    // loop) then grow `stack_top` linearly until it hits STACK_MAX and
+    // the next OP(CALL) inside the callee fails with a spurious
+    // "Stack overflow" / corrupt-stack crash. Saving and restoring the
+    // original stack_top keeps the re-entrant call hermetic.
+    int saved_stack_top = vm->stack_top;
+
     vm->stack[frame_base] = closure;
     for (int i = 0; i < argc; i++) {
         vm->stack[frame_base + 1 + i] = argv[i];
@@ -2247,11 +2259,16 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // zym_call_execute leaves the result at stack[frame_base] and sets
     // api_stack_top=frame_base so zym_getCallResult can read it.
 
-    // Shrink stack_top back down to release any stale callee frame slots
-    // that grew the high-water mark. Keep the result slot live (one slot)
-    // so the immediate caller's `zym_getCallResult` still finds it.
-    if (vm->stack_top > frame_base + 1) {
-        vm->stack_top = frame_base + 1;
+    // Restore stack_top to its pre-call value. The result is at
+    // stack[frame_base]; `api_stack_top` already points at it for
+    // `zym_getCallResult`. The caller didn't have any live registers
+    // above `saved_stack_top` (by definition of stack_top as the
+    // live-slot high-water mark), so dropping back to it is safe.
+    // Guard against the (theoretical) case where the callee grew the
+    // stack via stack reallocation and stack_top is now below the
+    // saved value — only shrink, never enlarge.
+    if (saved_stack_top < vm->stack_top) {
+        vm->stack_top = saved_stack_top;
     }
 
     switch (result) {

@@ -3848,7 +3848,32 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     // On return, resume at the API trampoline, not bytecode.
     frame->ip           = vm->api_trampoline.code;
-    frame->caller_chunk = &vm->api_trampoline;
+    // GC ROOT: point `caller_chunk` at the outer chunk we just suspended
+    // (`saved_chunk`), NOT at the trampoline. `markRoots` walks
+    // `vm->frames[i].caller_chunk`, so this is what keeps the outer
+    // chunk's constants table (and every Obj it references) reachable
+    // for the duration of this re-entrant call.
+    //
+    // Without this, if the outer chunk is a top-level chunk that runs
+    // with `frame_count==0` (the `runChunk` path), it has no frame
+    // entry — its only roots are `vm->chunk`, which we're about to
+    // overwrite below with `&function->chunk`. A GC anywhere inside
+    // the re-entrant call (e.g. a `newClosure` inside an ImGui body
+    // callback) would then sweep the outer chunk's string constants
+    // and crash on the next `markChunk` walk after returning.
+    //
+    // The API_BOUNDARY exit path in `run()` (vm.c ~2833) does NOT use
+    // `caller_chunk` to restore `vm->chunk` (the C side does that from
+    // `saved_chunk`), so changing this field doesn't affect return
+    // semantics. It only changes which chunk stack traces attribute the
+    // boundary frame to — which is arguably more correct anyway, since
+    // the trampoline is a synthetic 1-instruction stub.
+    //
+    // `saved_chunk` may be NULL if the very first call into the VM is
+    // through `zym_call_execute` (no chunk had been set yet); in that
+    // case leave `caller_chunk` NULL and let the existing NULL-tolerant
+    // paths (markRoots, stack traces) handle it.
+    frame->caller_chunk = saved_chunk;
 
     vm->current_frame = frame;
     vm->cur_base = frame_base;
