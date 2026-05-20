@@ -37,7 +37,9 @@
 #ifndef FRAMES_MAX
 #define FRAMES_MAX 256
 #endif
+#ifndef STACK_MAX
 #define STACK_MAX 65536
+#endif
 #define STACK_INITIAL 256
 #define MAX_PROMPTS 64
 #define DEFAULT_TIMESLICE 10000
