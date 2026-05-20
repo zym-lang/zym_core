@@ -2281,11 +2281,30 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // `for (i = 0; i < vm->stack_top; i++) markValue(...)` and
     // dereference freed memory — exactly the heap-use-after-free
     // reported under ASan for examples/gui/dashboard.zym.
+    //
+    // ADDITIONAL CRITICAL CASE: in the re-entrant scenario where a native
+    // (e.g. `vm.loadModules`) calls back into the parent VM via
+    // `zym_callClosurev` while a caller frame is suspended, `frame_base`
+    // can be bumped *above* the caller's `vm->stack_top` (= saved_stack_top).
+    // The callee's result is written to `stack[frame_base]` ==
+    // `stack[api_stack_top]`. If we blindly NULL every slot in
+    // `[saved_stack_top, stack_top)` we will clobber the result slot
+    // itself, and `zym_getCallResult` will hand the caller `NULL_VAL`
+    // instead of the real return value (observed: `loadModules`
+    // read-callback returning a `{source, sourceMap, fileId}` map that
+    // the trampoline then saw as null, producing a spurious
+    // "Failed to read/preprocess module" error). Preserve the result
+    // slot and shrink to one past it.
     if (saved_stack_top < vm->stack_top) {
         for (int i = saved_stack_top; i < vm->stack_top; i++) {
+            if (i == vm->api_stack_top) continue; // keep the result alive
             vm->stack[i] = NULL_VAL;
         }
-        vm->stack_top = saved_stack_top;
+        int new_top = saved_stack_top;
+        if (vm->api_stack_top >= new_top) {
+            new_top = vm->api_stack_top + 1;
+        }
+        vm->stack_top = new_top;
     }
 
     switch (result) {
