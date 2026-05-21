@@ -172,6 +172,16 @@ static void markRoots(VM* vm) {
         markValue(vm, vm->stack[i]);
     }
 
+    // The most recently-returned call result lives at stack[api_stack_top]
+    // and may sit at or above stack_top in the re-entrant native trampoline
+    // path (zym_callClosurev). Mark it explicitly so it survives until the
+    // caller (native code via zym_getCallResult, or bytecode via the next
+    // OP) consumes it — without inflating stack_top, which would leak a
+    // slot per re-entrant call in looped UI callbacks (e.g. ui.frame).
+    if (vm->api_stack_top >= 0 && vm->api_stack_top < vm->stack_capacity) {
+        markValue(vm, vm->stack[vm->api_stack_top]);
+    }
+
     #ifdef GC_DEBUG_FULL
     printf("Marking global variables\n");
     fflush(stdout);

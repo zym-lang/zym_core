@@ -2295,16 +2295,21 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // the trampoline then saw as null, producing a spurious
     // "Failed to read/preprocess module" error). Preserve the result
     // slot and shrink to one past it.
+    // The result slot at stack[api_stack_top] is kept alive via an
+    // explicit GC root in markRoots (see gc.c), so we no longer need to
+    // bump stack_top past it to anchor it. Always restore stack_top to
+    // saved_stack_top — this stops the per-callback ratchet that leaked
+    // a slot every time `frame_base > saved_stack_top` (which is the
+    // common case for re-entrant UI scope wrappers like ui.frame,
+    // ui.window, ui.child, ui.withStyleColor, ...). The loadModules
+    // read-callback result is still safe across GC because of the
+    // markRoots anchor.
     if (saved_stack_top < vm->stack_top) {
         for (int i = saved_stack_top; i < vm->stack_top; i++) {
-            if (i == vm->api_stack_top) continue; // keep the result alive
+            if (i == vm->api_stack_top) continue; // belt-and-suspenders
             vm->stack[i] = NULL_VAL;
         }
-        int new_top = saved_stack_top;
-        if (vm->api_stack_top >= new_top) {
-            new_top = vm->api_stack_top + 1;
-        }
-        vm->stack_top = new_top;
+        vm->stack_top = saved_stack_top;
     }
 
     switch (result) {
