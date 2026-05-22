@@ -383,6 +383,37 @@ static Token string(Scanner* scanner) {
     return makeToken(scanner, TOKEN_STRING);
 }
 
+// Triple-quoted multiline string: """...""".
+// Entered after the opening three `"` have already been consumed by
+// scanToken. Scans until a closing run of three consecutive `"` is
+// found, allowing real newlines and lone/double `"` inside. A literal
+// triple quote can be embedded by escaping at least one of the three
+// quotes (e.g. `\"""`). Escape sequences are processed later by the
+// compiler via processEscapeSequences, same as regular strings.
+static Token tripleString(Scanner* scanner) {
+    for (;;) {
+        if (isAtEnd(scanner)) {
+            return errorToken(scanner, "Unterminated triple-quoted string.");
+        }
+        if (peek(scanner) == '\\') {
+            advance(scanner);
+            if (isAtEnd(scanner)) {
+                return errorToken(scanner, "Unterminated triple-quoted string.");
+            }
+            advance(scanner);
+            continue;
+        }
+        if (peek(scanner) == '"' && peekNext(scanner) == '"'
+            && scanner->current[2] == '"') {
+            advance(scanner);
+            advance(scanner);
+            advance(scanner);
+            return makeToken(scanner, TOKEN_STRING);
+        }
+        advance(scanner);
+    }
+}
+
 
 Token scanToken(Scanner* scanner) {
     skipWhitespace(scanner);
@@ -465,7 +496,13 @@ Token scanToken(Scanner* scanner) {
             }
             return makeToken(scanner, match(scanner, '=') ? TOKEN_GREATER_EQUAL : TOKEN_GREATER);
 
-        case '"': return string(scanner);
+        case '"':
+            if (peek(scanner) == '"' && peekNext(scanner) == '"') {
+                advance(scanner);
+                advance(scanner);
+                return tripleString(scanner);
+            }
+            return string(scanner);
     }
 
     if (c >= 32 && c < 127) {

@@ -1785,9 +1785,43 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     break;
                 }
                 case TOKEN_STRING: {
-                    // Process escape sequences in string literals
-                    const char* raw_str = expr->as.literal.literal.start + 1;  // Skip opening quote
-                    int raw_len = expr->as.literal.literal.length - 2;         // Skip both quotes
+                    // Process escape sequences in string literals. Triple-quoted
+                    // strings ("""...""") use three quote chars on each side
+                    // instead of one; additionally, a single leading newline
+                    // immediately after the opening `"""` is stripped so users
+                    // can put the content on the next line without picking up
+                    // an extra `\n` at the start, and symmetrically a single
+                    // trailing newline immediately before the closing `"""`
+                    // is stripped so the closing delimiter can sit on its own
+                    // line without adding an extra `\n` at the end. Only the
+                    // *first* leading and the *last* trailing newline are
+                    // stripped — any further blank lines / spacing the user
+                    // wrote are preserved verbatim.
+                    const char* lit_start = expr->as.literal.literal.start;
+                    int lit_len = expr->as.literal.literal.length;
+                    bool is_triple = (lit_len >= 6
+                                      && lit_start[0] == '"' && lit_start[1] == '"' && lit_start[2] == '"');
+                    const char* raw_str;
+                    int raw_len;
+                    if (is_triple) {
+                        raw_str = lit_start + 3;
+                        raw_len = lit_len - 6;
+                        if (raw_len > 0 && raw_str[0] == '\n') {
+                            raw_str += 1;
+                            raw_len -= 1;
+                        } else if (raw_len >= 2 && raw_str[0] == '\r' && raw_str[1] == '\n') {
+                            raw_str += 2;
+                            raw_len -= 2;
+                        }
+                        if (raw_len >= 2 && raw_str[raw_len - 2] == '\r' && raw_str[raw_len - 1] == '\n') {
+                            raw_len -= 2;
+                        } else if (raw_len >= 1 && raw_str[raw_len - 1] == '\n') {
+                            raw_len -= 1;
+                        }
+                    } else {
+                        raw_str = lit_start + 1;  // Skip opening quote
+                        raw_len = lit_len - 2;    // Skip both quotes
+                    }
 
                     int processed_len;
                     const char* error_msg = NULL;
