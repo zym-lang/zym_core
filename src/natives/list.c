@@ -150,6 +150,72 @@ ZymValue nativeList_remove(ZymVM* vm, ZymValue list, ZymValue indexVal) {
 }
 
 // =============================================================================
+// BULK FILL
+// =============================================================================
+
+// Fill every element of the list with `value`. Replaces a per-element write
+// loop with a single native pass over the underlying ValueArray — the fast
+// path for clearing/initializing large grids, sample buffers, mask lists,
+// etc. Writes are direct stores into `items.values[i]` (same idiom as
+// `nativeList_sort` below); no GC barrier is needed because ValueArray
+// slots are scanned conservatively.
+ZymValue nativeList_fill(ZymVM* vm, ZymValue list, ZymValue value) {
+    if (!zym_isList(list)) {
+        zym_runtimeError(vm, "fill() requires a list as first argument");
+        return ZYM_ERROR;
+    }
+
+    ObjList* objList = AS_LIST(list);
+    int count = objList->items.count;
+    for (int i = 0; i < count; i++) {
+        objList->items.values[i] = value;
+    }
+    return zym_newNull();
+}
+
+// Partial fill: write `value` into `len` slots starting at `start`. Out-of-
+// range bounds clamp silently (so `fillRange(xs, -10, 5, 0)` and
+// `fillRange(xs, length(xs) - 2, 999, 0)` both do the obvious sane thing);
+// negative `len` is rejected because it almost certainly means a caller bug.
+ZymValue nativeList_fillRange(ZymVM* vm, ZymValue list, ZymValue startVal, ZymValue lenVal, ZymValue value) {
+    if (!zym_isList(list)) {
+        zym_runtimeError(vm, "fillRange() requires a list as first argument");
+        return ZYM_ERROR;
+    }
+    if (!zym_isNumber(startVal)) {
+        zym_runtimeError(vm, "fillRange() requires a number as second argument (start)");
+        return ZYM_ERROR;
+    }
+    if (!zym_isNumber(lenVal)) {
+        zym_runtimeError(vm, "fillRange() requires a number as third argument (len)");
+        return ZYM_ERROR;
+    }
+
+    int start = (int)zym_asNumber(startVal);
+    int len   = (int)zym_asNumber(lenVal);
+    if (len < 0) {
+        zym_runtimeError(vm, "fillRange() requires len >= 0 (got %d)", len);
+        return ZYM_ERROR;
+    }
+
+    ObjList* objList = AS_LIST(list);
+    int count = objList->items.count;
+
+    // Negative `start` counts from the end (matches `slice`/`remove` conventions).
+    if (start < 0) start = count + start;
+    if (start < 0) start = 0;
+    if (start > count) start = count;
+
+    int end = start + len;
+    if (end > count) end = count;
+
+    for (int i = start; i < end; i++) {
+        objList->items.values[i] = value;
+    }
+    return zym_newNull();
+}
+
+// =============================================================================
 // SORT HELPERS
 // =============================================================================
 
@@ -318,4 +384,6 @@ void registerListNatives(VM* vm) {
     zym_defineNative(vm, "reverse(list)", nativeList_reverse);
     zym_defineNative(vm, "sort(list)", nativeList_sort);
     zym_defineNative(vm, "join(list, separator)", nativeList_join);
+    zym_defineNative(vm, "fill(list, value)", nativeList_fill);
+    zym_defineNative(vm, "fillRange(list, start, len, value)", nativeList_fillRange);
 }
