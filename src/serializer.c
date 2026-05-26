@@ -23,7 +23,10 @@ static void writeBytes(VM* vm, OutputBuffer* out, const void* data, size_t size)
 
 void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* out) {
     const char magic[] = "ZYM\0";
-    const uint8_t version = 1;
+    // Format version bumped 1 → 2 when ObjFunction gained `spill_count`
+    // for the register-spilling feature. Loaders that read version 1
+    // implicitly assume spill_count == 0.
+    const uint8_t version = 2;
     writeBytes(vm, out, magic, 4);
     writeBytes(vm, out, &version, sizeof(uint8_t));
 
@@ -64,6 +67,7 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             uint8_t variadic_flag = fn->is_variadic ? 1 : 0;
             writeBytes(vm, out, &variadic_flag, sizeof(uint8_t));
             writeBytes(vm, out, &fn->max_regs, sizeof(int));
+            writeBytes(vm, out, &fn->spill_count, sizeof(int));
             writeBytes(vm, out, &fn->upvalue_count, sizeof(int));
             if (fn->upvalue_count > 0) {
                 writeBytes(vm, out, fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
@@ -165,7 +169,9 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
 
     uint8_t version = 0;
     READ_BYTES(&version, sizeof(uint8_t));
-    if (version != 1) return false;
+    // v1 omits the spill_count field; v2+ writes it after max_regs.
+    // Older v1 packages cleanly upgrade by treating spill_count as 0.
+    if (version != 1 && version != 2) return false;
 
     int entryFileLen = 0;
     READ_BYTES(&entryFileLen, sizeof(int));
@@ -237,6 +243,11 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 READ_BYTES_OR_FAIL(&variadic_flag, sizeof(uint8_t));
                 fn->is_variadic = (variadic_flag != 0);
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
+                if (version >= 2) {
+                    READ_BYTES_OR_FAIL(&fn->spill_count, sizeof(int));
+                } else {
+                    fn->spill_count = 0;
+                }
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
                 if (fn->upvalue_count > 0) {
                     fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);

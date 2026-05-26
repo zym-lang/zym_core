@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdint.h>
 #include "./parser.h"
 #include "./parse_tree.h"
 #include "./chunk.h"
@@ -17,6 +18,14 @@ typedef struct ObjEnumSchema ObjEnumSchema;
 #define MAX_LABELS 256
 #define MAX_PHYSICAL_REGS 256     // 8-bit register addressing supports 256 registers
 
+// Number of physical registers reserved at the top of the register
+// window as scratch for SPILL_LOAD targets. These regs are not
+// allocatable to locals via reserve_local_register; alloc_temp may
+// use them once spilling is active and the regular temp area is full.
+// 4 simultaneous spill loads covers nearly every realistic expression
+// (binary op with two spilled operands = 2; three-operand call = 3).
+#define SPILL_SCRATCH_COUNT 4
+
 typedef enum {
     TCO_OFF,        // No tail call optimization
     TCO_SAFE,       // Only optimize pure self-recursion (no captured upvalues)
@@ -27,9 +36,17 @@ typedef enum {
 typedef struct {
     Token name;
     int depth;
-    int reg;
+    int reg;                // physical register index; ignored when is_spilled
     bool is_initialized;
     bool is_captured;       // true if this local is captured by an inner closure as an upvalue
+    // Register-spill state. When the per-function register window is
+    // exhausted at the point of declaration, the new local is allocated
+    // into the per-frame spill area at `spill_slot` and all subsequent
+    // reads/writes route through SPILL_LOAD/SPILL_STORE. Captured locals
+    // are never spilled (the upvalue mechanism assumes a stable physical
+    // register location).
+    bool is_spilled;
+    uint16_t spill_slot;
     ObjStructSchema* struct_type; // if this local holds a struct instance, this is its schema (NULL otherwise)
 } Local;
 
@@ -103,6 +120,34 @@ typedef struct Compiler {
     int max_register_seen;
     int temp_free[MAX_PHYSICAL_REGS];
     int temp_free_top;
+
+    // Two-cap register window. Locals stop at `local_alloc_cap`; temps
+    // and SPILL_LOAD scratch may use up to `temp_alloc_cap`. The
+    // difference (SPILL_SCRATCH_COUNT) is the scratch headroom that
+    // keeps spilled-local reads viable even when locals fill their cap.
+    //
+    // Defaults:
+    //   local_alloc_cap = MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT (252)
+    //   temp_alloc_cap  = MAX_PHYSICAL_REGS                       (256)
+    //
+    // The ZYM_FORCE_SPILL_AT environment variable lowers both so the
+    // spill path triggers on small test programs.
+    int local_alloc_cap;
+    int temp_alloc_cap;
+
+    // Spill-area bookkeeping. spill_count is the total number of slots
+    // allocated by this function so far (= ObjFunction.spill_count at
+    // function compile end). peak_concurrent_spills tracks the high
+    // water mark for trace output. Counters track emitted opcodes.
+    int spill_count;
+    int peak_concurrent_spills;
+    int spill_loads_emitted;
+    int spill_stores_emitted;
+
+    // Cached "line in source" used when resolve_local needs to emit a
+    // SPILL_LOAD for a transparent read but the caller didn't pass a
+    // line. Updated at the top of compile_expression / compile_statement.
+    int current_line;
 
     Local locals[MAX_LOCALS];
     int local_count;

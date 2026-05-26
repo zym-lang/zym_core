@@ -408,6 +408,8 @@ int disassembleInstruction(Chunk* chunk, int offset) {
         case POST_INC: return reg_instruction_ab("POST_INC", instruction, offset);
         case PRE_DEC: return reg_instruction_ab("PRE_DEC", instruction, offset);
         case POST_DEC: return reg_instruction_ab("POST_DEC", instruction, offset);
+        case SPILL_LOAD:  return reg_instruction_abx("SPILL_LOAD",  instruction, offset);
+        case SPILL_STORE: return reg_instruction_abx("SPILL_STORE", instruction, offset);
         case RET: {
             uint32_t instr = instruction;
             uint8_t  a  = REG_A(instr);

@@ -80,6 +80,7 @@ ObjFunction* newFunction(VM* vm) {
     function->upvalue_capacity = 0;
     function->upvalues = NULL;
     function->max_regs = 1;
+    function->spill_count = 0;
     function->name = NULL;
     function->module_name = NULL;
     initChunk(&function->chunk);

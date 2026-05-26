@@ -90,6 +90,8 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg);
 static int compile_sub_expression(Compiler* c, Expr* e);
 static int reserve_register(Compiler* compiler);
 static void free_register(Compiler* compiler);
+static int resolve_local_index(Compiler* compiler, Token* name);
+static inline int phys_local_count(Compiler* compiler);
 static int emit_jump_instruction(Compiler* compiler, OpCode opcode, int reg, int line);
 static void patch_jump(Compiler* compiler, int jump_address);
 static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclStmt* stmt);
@@ -291,8 +293,12 @@ static int identifier_constant(Compiler* compiler, Token* name) {
 }
 
 static Local* get_local_by_reg(Compiler* c, int reg) {
+    // Spilled locals have reg == -1; ignore them here. Callers use this
+    // helper to find a local by its physical register slot (e.g. capture
+    // resolution, struct-type look-up), which never applies to spills.
+    if (reg < 0) return NULL;
     for (int i = 0; i < c->local_count; i++) {
-        if (c->locals[i].reg == reg) {
+        if (!c->locals[i].is_spilled && c->locals[i].reg == reg) {
             return &c->locals[i];
         }
     }
@@ -304,12 +310,20 @@ static int is_local_reg(Compiler* c, int r) {
 }
 
 static int alloc_temp(Compiler* c) {
-    if (c->next_register < c->local_count) {
-        c->next_register = c->local_count;
+    // Bump next_register past the highest reg occupied by a live local.
+    // Spilled locals occupy no physical reg, so they don't contribute.
+    int phys_locals = phys_local_count(c);
+    if (c->next_register < phys_locals) {
+        c->next_register = phys_locals;
     }
 
-    if (c->next_register >= MAX_PHYSICAL_REGS) {
-        compiler_error(c, -1, "Too many registers in use (%d). Maximum is %d.", c->next_register + 1, MAX_PHYSICAL_REGS);
+    // Temps stay stack-disciplined and cannot spill — see the design note:
+    // long-lived pressure belongs to locals, which get the spill path.
+    // Temps may use the full window including the SPILL_SCRATCH_COUNT
+    // headroom above local_alloc_cap (that's its purpose: keep spill
+    // loads viable even when locals fill their cap).
+    if (c->next_register >= c->temp_alloc_cap) {
+        compiler_error(c, c->current_line, "Too many registers in use (%d). Maximum is %d.", c->next_register + 1, c->temp_alloc_cap);
         return 0;
     }
 
@@ -322,34 +336,62 @@ static inline int save_temp_top(Compiler* c) {
     return c->next_register;
 }
 
+// Temp-reclamation floor — the lowest register a new temp can use
+// without clobbering a live local. In function bodies locals are
+// declared at the bottom of the window contiguously (Pass 1 pre-decl),
+// so this is just local_count. But in top-level / nested-scope chunks
+// locals are declared mid-stream and may sit at arbitrary regs above
+// other live state (e.g. a while-condition temp consumed reg 0 before
+// the body's `var x` got reg 1). We scan non-spilled locals and use
+// the highest reg in use, plus one. Spilled locals occupy no physical
+// reg, so they don't raise the floor.
+static inline int phys_local_count(Compiler* c) {
+    int floor = 0;
+    for (int i = 0; i < c->local_count; i++) {
+        if (!c->locals[i].is_spilled && c->locals[i].reg >= floor) {
+            floor = c->locals[i].reg + 1;
+        }
+    }
+    if (floor > c->local_alloc_cap) floor = c->local_alloc_cap;
+    return floor;
+}
+
 static inline void restore_temp_top(Compiler* c, int saved_top) {
-    if (saved_top >= c->local_count && saved_top <= c->next_register) {
+    int floor = phys_local_count(c);
+    if (saved_top >= floor && saved_top <= c->next_register) {
         c->next_register = saved_top;
     }
 }
 
 static inline void restore_temp_top_preserve(Compiler* c, int saved_top, int target_reg) {
+    int floor = phys_local_count(c);
     int safe_top = saved_top;
 
-    if (target_reg >= c->local_count) {
+    if (target_reg >= floor) {
         int min_for_preserve = target_reg + 1;
         if (saved_top < min_for_preserve) {
             safe_top = min_for_preserve;
         }
     }
 
-    if (safe_top < c->local_count) {
-        safe_top = c->local_count;
+    if (safe_top < floor) {
+        safe_top = floor;
     }
 
-    if (safe_top >= c->local_count && safe_top <= c->next_register) {
+    if (safe_top >= floor && safe_top <= c->next_register) {
         c->next_register = safe_top;
     }
 }
 
 static int reserve_register(Compiler* c) {
-    if (c->next_register >= MAX_PHYSICAL_REGS) {
-        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.", c->next_register + 1, MAX_LOCALS);
+    // NOTE: Only used by paths that *must* have a physical register
+    // (function self-slot R0, parameter binding, call-site arg setup).
+    // Local-declaration paths must use reserve_local_register() instead,
+    // which falls back to the spill area when the window is exhausted.
+    // The local-alloc cap leaves SPILL_SCRATCH_COUNT regs reserved at
+    // the top of the window for spill loads.
+    if (c->next_register >= c->local_alloc_cap) {
+        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.", c->next_register + 1, c->local_alloc_cap);
         return 0;
     }
 
@@ -357,6 +399,66 @@ static int reserve_register(Compiler* c) {
     if (r > c->max_register_seen) c->max_register_seen = r;
 
     return r;
+}
+
+// Allocate storage for a newly-declared local variable. Returns a
+// physical register if one is available within the cap; otherwise
+// allocates a fresh spill slot. The local-declaration site reads
+// `*out_reg` (when !*out_spilled) or `*out_slot` (when *out_spilled)
+// to know where the value lives.
+//
+// Returns 0 on success and -1 on hard failure (both register and
+// spill space exhausted). A failure emits its own diagnostic.
+static int reserve_local_register(Compiler* c, int* out_reg, bool* out_spilled, uint16_t* out_slot) {
+    if (c->next_register < c->local_alloc_cap) {
+        int r = c->next_register++;
+        if (r > c->max_register_seen) c->max_register_seen = r;
+        *out_reg = r;
+        *out_spilled = false;
+        *out_slot = 0;
+        return 0;
+    }
+    // Cap exhausted — spill the new local to a fresh slot.
+    if (c->spill_count >= 0xFFFF) {
+        compiler_error(c, -1,
+            "Too many spilled local variables in function (%d). Maximum is %d.",
+            c->spill_count + 1, 0xFFFF);
+        return -1;
+    }
+    uint16_t slot = (uint16_t)c->spill_count++;
+    if (c->spill_count > c->peak_concurrent_spills) {
+        c->peak_concurrent_spills = c->spill_count;
+    }
+    *out_reg = -1;
+    *out_spilled = true;
+    *out_slot = slot;
+    return 0;
+}
+
+// Emit SPILL_LOAD `dst <- spill[slot]`.
+static inline void emit_spill_load(Compiler* c, int dst_reg, uint16_t slot, int line) {
+    emit_instruction(c, PACK_ABx(SPILL_LOAD, dst_reg, slot), line);
+    c->spill_loads_emitted++;
+}
+
+// Emit SPILL_STORE `spill[slot] <- src`.
+static inline void emit_spill_store(Compiler* c, int src_reg, uint16_t slot, int line) {
+    emit_instruction(c, PACK_ABx(SPILL_STORE, src_reg, slot), line);
+    c->spill_stores_emitted++;
+}
+
+// If `name` resolves to a spilled local, emit SPILL_STORE to write the
+// new value (currently held in `result_reg`) back to the spill slot.
+// No-op for non-spilled locals — writing to local->reg already updated
+// the live storage. Callers: read-modify-write paths (PRE_INC, POST_INC,
+// PRE_DEC, POST_DEC) where the codegen uses the local's reg as both
+// input and output operand and resolve_local already arranged the
+// SPILL_LOAD into a scratch.
+static void maybe_writeback_spilled_local(Compiler* c, Token* name, int result_reg, int line) {
+    int idx = resolve_local_index(c, name);
+    if (idx != -1 && c->locals[idx].is_spilled) {
+        emit_spill_store(c, result_reg, c->locals[idx].spill_slot, line);
+    }
 }
 
 /*
@@ -549,24 +651,60 @@ static int resolve_hoisted_name(Compiler* compiler, Token* name) {
     }
 }
 
-static int resolve_local_impl(Compiler* compiler, Token* name) {
+// Returns the local *index* (into compiler->locals[]) of `name`, or -1.
+// Pure lookup — never emits. Used by paths that need to inspect the
+// Local directly (write paths checking is_spilled, capture detection).
+static int resolve_local_index(Compiler* compiler, Token* name) {
     for (int i = compiler->local_count - 1; i >= 0; i--) {
         Local* local = &compiler->locals[i];
         if (tokens_equal(name, &local->name)) {
-            return local->reg;
+            return i;
         }
     }
     return -1;
 }
 
+// Sentinel returned by resolve_local_impl when the name resolved to
+// a local that has been spilled. Distinct from -1 (not a local) so
+// callers can give an accurate diagnostic instead of falling through
+// to the upvalue/global resolution paths.
+#define RESOLVE_LOCAL_SPILLED (-2)
+
+// Internal lookup that does NOT emit any code. Returns the local's
+// physical register slot if it has one, RESOLVE_LOCAL_SPILLED if the
+// name matched a spilled local (caller must handle), or -1 if no
+// matching local exists.
+//
+// Used by the capture path (resolve_upvalue_impl) which calls into the
+// *enclosing* compiler and must not emit into that compiler's chunk.
+static int resolve_local_impl(Compiler* compiler, Token* name) {
+    int idx = resolve_local_index(compiler, name);
+    if (idx == -1) return -1;
+    Local* local = &compiler->locals[idx];
+    if (local->is_spilled) return RESOLVE_LOCAL_SPILLED;
+    return local->reg;
+}
+
 /* Phase 4.5 tracing wrapper. Internal recursive paths call _impl directly
  * so intermediate lookups don't produce spurious trace records. Only the
- * top-level "compile this identifier" callers see the wrapper. */
+ * top-level "compile this identifier" callers see the wrapper.
+ *
+ * Transparently materializes spilled locals into a scratch temp via
+ * SPILL_LOAD. The scratch lives as a normal temp and is reclaimed by
+ * the enclosing statement's save/restore_temp_top discipline. */
 static int resolve_local(Compiler* compiler, Token* name) {
-    int r = resolve_local_impl(compiler, name);
-    if (r != -1) {
-        COMPILER_TRACE_TOK(compiler, name, ZYM_RES_LOCAL, r, -1);
+    int idx = resolve_local_index(compiler, name);
+    if (idx == -1) return -1;
+    Local* local = &compiler->locals[idx];
+    int r;
+    if (local->is_spilled) {
+        int scratch = alloc_temp(compiler);
+        emit_spill_load(compiler, scratch, local->spill_slot, compiler->current_line);
+        r = scratch;
+    } else {
+        r = local->reg;
     }
+    COMPILER_TRACE_TOK(compiler, name, ZYM_RES_LOCAL, r, -1);
     return r;
 }
 
@@ -646,6 +784,20 @@ static int resolve_upvalue_impl(Compiler* compiler, Token* name) {
      * so only the outermost user-facing resolve_upvalue wrapper emits one
      * UPVALUE trace entry for the source identifier. */
     int local = resolve_local_impl(compiler->enclosing, name);
+    if (local == RESOLVE_LOCAL_SPILLED) {
+        // The enclosing scope's variable was register-spilled, which means
+        // it has no stable physical register slot for the upvalue
+        // mechanism to point at. We refuse to capture it (refuse-to-spill
+        // captured locals, expressed inversely from the capture site).
+        // In practice this only triggers when the outer function has more
+        // declared locals than the register window allows AND an inner
+        // closure tries to close over one of the overflow locals — rare.
+        compiler_error(compiler, -1,
+            "Cannot capture variable '%.*s' from enclosing function: target is in spill area. "
+            "Consider refactoring the outer function to reduce local-variable pressure.",
+            name->length, name->start);
+        return -1;
+    }
     if (local != -1) {
         Local* parent_local = get_local_by_reg(compiler->enclosing, local);
         if (parent_local) parent_local->is_captured = true;
@@ -692,9 +844,35 @@ static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
     local->reg = reg;
     local->is_initialized = true;
     local->is_captured = false;
+    local->is_spilled = false;
+    local->spill_slot = 0;
     local->struct_type = NULL;
 }
 
+// Variant of add_local_at_reg for a local that lives in the spill area
+// rather than a physical register. Used by the STMT_VAR_DECLARATION
+// branch when reserve_local_register reports the new local was spilled.
+static void add_local_spilled(Compiler* compiler, Token name, uint16_t slot) {
+    if (compiler->local_count >= MAX_LOCALS) {
+        compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
+        return;
+    }
+    Local* local = &compiler->locals[compiler->local_count++];
+    local->name = name;
+    local->depth = compiler->scope_depth;
+    local->reg = -1;            // not in a physical register
+    local->is_initialized = true;
+    local->is_captured = false;
+    local->is_spilled = true;
+    local->spill_slot = slot;
+    local->struct_type = NULL;
+}
+
+// Reserve a *physical-only* local slot. Used by paths that bind a name
+// to a fixed register (hoisted-function self-slots, etc.) where the
+// caller stores the returned reg as a constant identity reference.
+// Spillable locals go through reserve_local_register + add_local_spilled
+// in STMT_VAR_DECLARATION instead.
 static int add_local(Compiler* compiler, Token name) {
     if (compiler->local_count >= MAX_LOCALS) {
         compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
@@ -706,6 +884,8 @@ static int add_local(Compiler* compiler, Token name) {
     local->reg = compiler->next_register;
     local->is_initialized = false;
     local->is_captured = false;
+    local->is_spilled = false;
+    local->spill_slot = 0;
     local->struct_type = NULL;
     return reserve_register(compiler);
 }
@@ -786,7 +966,10 @@ static ObjStructSchema* get_global_type(Compiler* compiler, const Token* name) {
 }
 
 static inline bool can_use_target_directly(Compiler* c, int target_reg) {
-    return target_reg >= c->local_count;
+    // The "safe to write" boundary is the top of the locals' *physical*
+    // region (highest local reg in use + 1). Spilled locals occupy no
+    // physical reg so they don't shrink the safe zone.
+    return target_reg >= phys_local_count(c);
 }
 
 static int compile_sub_expression_to(Compiler* c, Expr* e, int preferred_target) {
@@ -1579,6 +1762,11 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
 }
 
 static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
+    // Track the current line for synthetic emits that don't have a direct
+    // line at hand (e.g. SPILL_LOAD inside resolve_local). Best-effort —
+    // line attribution is only used for diagnostics, never correctness.
+    if (expr != NULL) compiler->current_line = expr->line;
+
     // Defensive check: if expr is NULL, report error and emit null constant
     if (expr == NULL) {
         compiler->has_error = true;
@@ -1675,6 +1863,21 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // Handle compound assignment for variables
             if (is_compound && expr->as.assign.target->type == EXPR_VARIABLE) {
                 Token name = expr->as.assign.target->as.variable.name;
+                // For spilled locals, do the load-op-store dance explicitly
+                // so the new value is written back to the spill slot.
+                int local_idx = resolve_local_index(compiler, &name);
+                if (local_idx != -1 && compiler->locals[local_idx].is_spilled) {
+                    Local* local = &compiler->locals[local_idx];
+                    int scratch = alloc_temp(compiler);
+                    emit_spill_load(compiler, scratch, local->spill_slot, expr->line);
+                    int value_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
+                    emit_instruction(compiler, PACK_ABC(binary_op, scratch, scratch, value_reg), expr->line);
+                    emit_spill_store(compiler, scratch, local->spill_slot, expr->line);
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, scratch, expr->line);
+                    restore_temp_top_preserve(compiler, saved_top, target_reg);
+                    break;
+                }
                 int target_var_reg = resolve_local(compiler, &name);
 
                 if (target_var_reg != -1) {
@@ -1743,7 +1946,26 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // simple variable
             if (expr->as.assign.target->type == EXPR_VARIABLE) {
                 Token name = expr->as.assign.target->as.variable.name;
-                int reg = resolve_local(compiler, &name);
+                // Inspect the local directly: for a spilled target we
+                // want to write through SPILL_STORE, not read via
+                // SPILL_LOAD that resolve_local would emit.
+                int local_idx = resolve_local_index(compiler, &name);
+                int reg;
+                if (local_idx != -1) {
+                    Local* local = &compiler->locals[local_idx];
+                    if (local->is_spilled) {
+                        int scratch = alloc_temp(compiler);
+                        COMPILE_REQUIRED(compiler, expr->as.assign.value, scratch);
+                        emit_spill_store(compiler, scratch, local->spill_slot, expr->line);
+                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, scratch, expr->line);
+                        restore_temp_top_preserve(compiler, saved_top, target_reg);
+                        break;
+                    }
+                    reg = local->reg;
+                    COMPILER_TRACE_TOK(compiler, &name, ZYM_RES_LOCAL, reg, -1);
+                } else {
+                    reg = -1;
+                }
 
                 if (reg != -1) {
                     // Normal variable: compile value directly into its register
@@ -2903,6 +3125,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: PRE_INC directly on register
                     emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, reg, 0), expr->line);
+                    // Spilled-local writeback: reg is a scratch with the
+                    // new value; push it back to the spill slot.
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, increment, store back
                     int temp = alloc_temp(compiler);
@@ -2967,6 +3192,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: POST_INC directly on register
                     emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, reg, 0), expr->line);
+                    // Spilled-local writeback: reg (scratch) now holds the
+                    // new value; target_reg holds the old value returned
+                    // to the caller. We must persist the new value.
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, increment, store back
                     int temp = alloc_temp(compiler);
@@ -3033,6 +3262,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: PRE_DEC directly on register
                     emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, reg, 0), expr->line);
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, decrement, store back
                     int temp = alloc_temp(compiler);
@@ -3100,6 +3330,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: POST_DEC directly on register
                     emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, reg, 0), expr->line);
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, decrement, store back
                     int temp = alloc_temp(compiler);
@@ -3295,16 +3526,37 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 VarDecl* var = &var_stmt->variables[i];
                 if (compiler->scope_depth > 0) { // Local variable
                     declare_variable(compiler, &var->name);
-                    int value_reg = reserve_register(compiler);
-                    if (var->initializer) {
-                        compile_expression(compiler, var->initializer, value_reg);
-                    } else {
-                        int null_const = make_constant(compiler, NULL_VAL);
-                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                    int value_reg = -1;
+                    bool spilled = false;
+                    uint16_t spill_slot = 0;
+                    if (reserve_local_register(compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                        // diagnostic already emitted
+                        break;
                     }
-                    add_local_at_reg(compiler, var->name, value_reg);
+                    if (spilled) {
+                        // No physical reg for this local — compile the
+                        // initializer into a scratch temp and evict it
+                        // to the spill slot.
+                        int scratch = alloc_temp(compiler);
+                        if (var->initializer) {
+                            compile_expression(compiler, var->initializer, scratch);
+                        } else {
+                            int null_const = make_constant(compiler, NULL_VAL);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), stmt->line);
+                        }
+                        emit_spill_store(compiler, scratch, spill_slot, stmt->line);
+                        add_local_spilled(compiler, var->name, spill_slot);
+                    } else {
+                        if (var->initializer) {
+                            compile_expression(compiler, var->initializer, value_reg);
+                        } else {
+                            int null_const = make_constant(compiler, NULL_VAL);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                        }
+                        add_local_at_reg(compiler, var->name, value_reg);
+                    }
 
-                    // Check for struct type
+                    // Check for struct type (applies whether spilled or not)
                     if (var->initializer && var->initializer->type == EXPR_STRUCT_INST) {
                         ObjStructSchema* struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                         if (struct_schema) {
@@ -3582,11 +3834,24 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     for (int j = 0; j < var_stmt->count; j++) {
                         VarDecl* var = &var_stmt->variables[j];
                         declare_variable(compiler, &var->name);
-                        int value_reg = reserve_register(compiler);
-                        // Initialize to null for now; actual initializer will be evaluated later
+                        int value_reg = -1;
+                        bool spilled = false;
+                        uint16_t spill_slot = 0;
+                        if (reserve_local_register(compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                            break;  // diagnostic already emitted
+                        }
                         int null_const = make_constant(compiler, NULL_VAL);
-                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), block->statements[i]->line);
-                        add_local_at_reg(compiler, var->name, value_reg);
+                        if (spilled) {
+                            int saved_top = save_temp_top(compiler);
+                            int scratch = alloc_temp(compiler);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), block->statements[i]->line);
+                            emit_spill_store(compiler, scratch, spill_slot, block->statements[i]->line);
+                            add_local_spilled(compiler, var->name, spill_slot);
+                            restore_temp_top(compiler, saved_top);
+                        } else {
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), block->statements[i]->line);
+                            add_local_at_reg(compiler, var->name, value_reg);
+                        }
                     }
                 }
             }
@@ -3631,24 +3896,33 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     VarDeclStmt* var_stmt = &s->as.var_declaration;
                     for (int j = 0; j < var_stmt->count; j++) {
                         VarDecl* var = &var_stmt->variables[j];
-                        int var_reg = resolve_local(compiler, &var->name);
+                        // Look up the local directly so we can branch on
+                        // is_spilled without resolve_local emitting a
+                        // SPILL_LOAD we don't actually need (we want to
+                        // *write* the initializer, not read the slot).
+                        int idx = resolve_local_index(compiler, &var->name);
+                        if (idx == -1) continue;
+                        Local* local = &compiler->locals[idx];
 
-                        if (var_reg != -1) {
-                            // Variable was pre-declared - just compile the initializer
+                        if (local->is_spilled) {
+                            int scratch = alloc_temp(compiler);
+                            if (var->initializer) {
+                                compile_expression(compiler, var->initializer, scratch);
+                            } else {
+                                int null_const = make_constant(compiler, NULL_VAL);
+                                emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), s->line);
+                            }
+                            emit_spill_store(compiler, scratch, local->spill_slot, s->line);
+                        } else {
+                            int var_reg = local->reg;
                             if (var->initializer) {
                                 compile_expression(compiler, var->initializer, var_reg);
                             } else {
                                 int null_const = make_constant(compiler, NULL_VAL);
                                 emit_instruction(compiler, PACK_ABx(LOAD_CONST, var_reg, null_const), s->line);
                             }
-                            // Mark as initialized
-                            for (int k = 0; k < compiler->local_count; k++) {
-                                if (compiler->locals[k].reg == var_reg) {
-                                    compiler->locals[k].is_initialized = true;
-                                    break;
-                                }
-                            }
                         }
+                        local->is_initialized = true;
                     }
                     continue;
                 }
@@ -3664,6 +3938,19 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     terminates = true;
                     // Note: We still compile remaining statements for error checking
                     // but we know the block terminates
+                }
+
+                // Reclaim temps the statement allocated but didn't release.
+                // Mirrors the function-body Pass 3 reset (scope_depth==1)
+                // so deeply nested blocks don't pin next_register at the
+                // cap. Floor is the top-of-locals-physical-area; spilled
+                // locals don't shrink the safe zone.
+                {
+                    int floor = phys_local_count(compiler);
+                    if (compiler->next_register > floor) {
+                        compiler->next_register = floor;
+                    }
+                    compiler->temp_free_top = 0;
                 }
             }
 
@@ -3693,12 +3980,25 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 // Check if we are assigning to a simple local variable.
                 if (assign->target->type == EXPR_VARIABLE) {
                     Token name = assign->target->as.variable.name;
-                    int reg = resolve_local(compiler, &name);
-                    if (reg != -1) {
-                        // Compile the value directly into the variable's home register.
-                        // We don't need to ask for the result in a new temp register.
-                        compile_expression(compiler, assign->value, reg);
-                        return false; // Optimization complete, statement does not terminate.
+                    // For spilled locals we can't use resolve_local's
+                    // SPILL_LOAD-into-scratch read path here — the assign
+                    // is a *write*, so we want the value in a scratch
+                    // and then SPILL_STORE, not a load first.
+                    int local_idx = resolve_local_index(compiler, &name);
+                    if (local_idx != -1) {
+                        Local* local = &compiler->locals[local_idx];
+                        if (local->is_spilled) {
+                            int saved_top = save_temp_top(compiler);
+                            int scratch = alloc_temp(compiler);
+                            compile_expression(compiler, assign->value, scratch);
+                            emit_spill_store(compiler, scratch, local->spill_slot, stmt->line);
+                            restore_temp_top(compiler, saved_top);
+                            return false;
+                        }
+                        // Non-spilled local: compile straight into its register.
+                        compile_expression(compiler, assign->value, local->reg);
+                        COMPILER_TRACE_TOK(compiler, &name, ZYM_RES_LOCAL, local->reg, -1);
+                        return false;
                     }
                 }
             }
@@ -4200,6 +4500,14 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->max_register_seen = 0;
     compiler->temp_free_top = 0;
 
+    compiler->local_alloc_cap = MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT;
+    compiler->temp_alloc_cap = MAX_PHYSICAL_REGS;
+    compiler->spill_count = 0;
+    compiler->peak_concurrent_spills = 0;
+    compiler->spill_loads_emitted = 0;
+    compiler->spill_stores_emitted = 0;
+    compiler->current_line = -1;
+
     compiler->local_count = 0;
     compiler->scope_depth = 0;
 
@@ -4580,6 +4888,11 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     Compiler fn_compiler = {0};  // Zero-initialize to prevent garbage values during GC
     init_compiler(&fn_compiler, current_compiler->vm, current_compiler);
 
+    // Inherit the spill-test register caps from the enclosing compiler
+    // so nested functions exercise the same forced-spill window.
+    fn_compiler.local_alloc_cap = current_compiler->local_alloc_cap;
+    fn_compiler.temp_alloc_cap  = current_compiler->temp_alloc_cap;
+
     // Create a new function object for the body we are about to compile.
     ObjFunction* function = newFunction(fn_compiler.vm);
 
@@ -4715,17 +5028,40 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
             for (int j = 0; j < var_stmt->count; j++) {
                 VarDecl* var = &var_stmt->variables[j];
                 declare_variable(&fn_compiler, &var->name);
-                int value_reg = reserve_register(&fn_compiler);
-                if (has_closures || var->initializer == NULL) {
-                    // Initialize to null when:
-                    // 1. Closures exist: closures compiled in Pass 2 may capture this variable
-                    //    before its initializer runs in Pass 3, so it must have a defined value.
-                    // 2. No initializer: "var x" with no initializer must be null, and there's
-                    //    no Pass 3 initializer to overwrite it.
-                    int null_const = make_constant(&fn_compiler, NULL_VAL);
-                    emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                int value_reg = -1;
+                bool spilled = false;
+                uint16_t spill_slot = 0;
+                if (reserve_local_register(&fn_compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                    break;
                 }
-                add_local_at_reg(&fn_compiler, var->name, value_reg);
+                bool need_init = (has_closures || var->initializer == NULL);
+                if (spilled) {
+                    // Always null-initialize spilled locals: even when Pass 3
+                    // will overwrite the slot, the spill area's contents at
+                    // function entry are whatever the previous frame left
+                    // (or whatever stack growth zeroed). Leaving them
+                    // uninitialized would break Pass 2's closure compilation
+                    // path if it ever reads through the spill before Pass 3
+                    // runs.
+                    int saved_top = save_temp_top(&fn_compiler);
+                    int scratch = alloc_temp(&fn_compiler);
+                    int null_const = make_constant(&fn_compiler, NULL_VAL);
+                    emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, scratch, null_const), body->statements[i]->line);
+                    emit_spill_store(&fn_compiler, scratch, spill_slot, body->statements[i]->line);
+                    add_local_spilled(&fn_compiler, var->name, spill_slot);
+                    restore_temp_top(&fn_compiler, saved_top);
+                } else {
+                    if (need_init) {
+                        // Initialize to null when:
+                        // 1. Closures exist: closures compiled in Pass 2 may capture this variable
+                        //    before its initializer runs in Pass 3, so it must have a defined value.
+                        // 2. No initializer: "var x" with no initializer must be null, and there's
+                        //    no Pass 3 initializer to overwrite it.
+                        int null_const = make_constant(&fn_compiler, NULL_VAL);
+                        emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                    }
+                    add_local_at_reg(&fn_compiler, var->name, value_reg);
+                }
             }
         }
     }
@@ -4770,18 +5106,17 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
                 // Normal variable - just evaluate the initializer
                 if (var->initializer) {
-                    int var_reg = resolve_local(&fn_compiler, &var->name);
-                    if (var_reg != -1) {
-                        compile_expression(&fn_compiler, var->initializer, var_reg);
-
-                        // Mark the variable as initialized
-                        for (int k = 0; k < fn_compiler.local_count; k++) {
-                            if (fn_compiler.locals[k].reg == var_reg) {
-                                fn_compiler.locals[k].is_initialized = true;
-                                break;
-                            }
-                        }
+                    int idx = resolve_local_index(&fn_compiler, &var->name);
+                    if (idx == -1) continue;
+                    Local* local = &fn_compiler.locals[idx];
+                    if (local->is_spilled) {
+                        int scratch = alloc_temp(&fn_compiler);
+                        compile_expression(&fn_compiler, var->initializer, scratch);
+                        emit_spill_store(&fn_compiler, scratch, local->spill_slot, s->line);
+                    } else {
+                        compile_expression(&fn_compiler, var->initializer, local->reg);
                     }
+                    local->is_initialized = true;
                 }
             }
         } else {
@@ -4790,7 +5125,10 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         }
 
         if (fn_compiler.scope_depth == 1) {
-            fn_compiler.next_register = fn_compiler.local_count;
+            // Reclaim temps allocated by this statement back down to the
+            // top of the locals' physical area. Spilled locals consume no
+            // physical reg, so they don't raise the floor.
+            fn_compiler.next_register = phys_local_count(&fn_compiler);
             fn_compiler.temp_free_top = 0;
         }
     }
@@ -4807,8 +5145,11 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         }
     }
 
-    // Calculate max_regs: highest register used + 1
+    // Calculate max_regs: highest register used + 1.
+    // The spill area lives at [base+max_regs .. base+max_regs+spill_count)
+    // — see growStackForCall in vm.c which sizes the frame accordingly.
     fn_compiler.function->max_regs = fn_compiler.max_register_seen + 1;
+    fn_compiler.function->spill_count = fn_compiler.spill_count;
 
     fn_compiler.function->upvalue_count = fn_compiler.upvalue_count;
     if (fn_compiler.upvalue_count > 0) {
@@ -4973,6 +5314,23 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
     // Use init_compiler to set up the top-level compiler correctly.
     Compiler compiler = {0};  // Zero-initialize to prevent garbage values during GC
     init_compiler(&compiler, vm, NULL); // The top-level script has no enclosing compiler.
+
+    // Debug knob: ZYM_FORCE_SPILL_AT=N lowers the per-function local-alloc
+    // cap to N (with SPILL_SCRATCH_COUNT regs of scratch headroom above
+    // for SPILL_LOAD targets). Lets the spill paths trigger on tiny test
+    // programs that would otherwise never exhaust the 256-reg window.
+    // The cap is inherited by all nested function compilers via
+    // compile_function_body.
+    {
+        const char* force_spill = getenv("ZYM_FORCE_SPILL_AT");
+        if (force_spill && force_spill[0]) {
+            int n = atoi(force_spill);
+            if (n > 0 && n <= MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT) {
+                compiler.local_alloc_cap = n;
+                compiler.temp_alloc_cap  = n + SPILL_SCRATCH_COUNT;
+            }
+        }
+    }
 
     // Register this compiler with the VM so GC can mark compiler roots
     vm->compiler = &compiler;

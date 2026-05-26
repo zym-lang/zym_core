@@ -189,4 +189,15 @@ typedef enum {
     PRE_DEC,       // Ra = --stack[Rb] (decrement then return new value)
     POST_DEC,      // Ra = stack[Rb]-- (return old value then decrement)
 
+    // Register spill opcodes (A:8 + Bx:16)
+    //
+    // The per-frame stack window is laid out as
+    //     [bp+0 .. bp+max_regs)                — physical 8-bit registers
+    //     [bp+max_regs .. bp+max_regs+spill_count) — spill area (uint16 indexed)
+    //
+    // Only emitted by the compiler when register pressure exceeds the
+    // 8-bit register window. Bx is the spill slot index (0..65535).
+    SPILL_LOAD,    // Ra = spill[Bx]   (load a spilled value back into a register)
+    SPILL_STORE,   // spill[Bx] = Ra   (evict a register value to the spill area)
+
 } OpCode;

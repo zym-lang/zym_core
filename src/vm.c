@@ -561,7 +561,7 @@ static bool pushPreemptFrame(VM* vm) {
     }
 
     int callee_slot = vm->stack_top;
-    int needed_top = callee_slot + function->max_regs;
+    int needed_top = callee_slot + function->max_regs + function->spill_count;
 
     if (!growStackForCall(vm, needed_top, NULL)) {
         return false;
@@ -747,6 +747,8 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(POST_INC),
         JUMP_ENTRY(PRE_DEC),
         JUMP_ENTRY(POST_DEC),
+        JUMP_ENTRY(SPILL_LOAD),
+        JUMP_ENTRY(SPILL_STORE),
     };
 #undef JUMP_ENTRY
 
@@ -2229,8 +2231,11 @@ static InterpretResult run(VM* vm) {
             }
 
             // Calculate required stack size and grow if needed
+            // Frame layout: [regs 0..max_regs) | [spill 0..spill_count) | [variadic extras transiently above]
+            // PACK_REST runs at function entry before any SPILL op, so the
+            // spill area and the variadic-extras region never alias in time.
             // For variadic functions, extra args beyond arity occupy stack slots too
-            int needed_top = callee_slot + function->max_regs;
+            int needed_top = callee_slot + function->max_regs + function->spill_count;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 int extra = arg_count - function->arity;
                 needed_top += extra;
@@ -2404,7 +2409,7 @@ static InterpretResult run(VM* vm) {
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        int needed_top = callee_slot + function->max_regs;
+        int needed_top = callee_slot + function->max_regs + function->spill_count;
         if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
             if (!growStackForCall(vm, needed_top, NULL)) {
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
@@ -2549,7 +2554,7 @@ static InterpretResult run(VM* vm) {
             // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
             CallFrame* current_frame = vm->current_frame;
             int frame_base = current_frame->stack_base;
-            int needed_top = frame_base + function->max_regs;
+            int needed_top = frame_base + function->max_regs + function->spill_count;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 needed_top += (arg_count - function->arity);
             }
@@ -2768,7 +2773,7 @@ static InterpretResult run(VM* vm) {
         stack[callee_slot] = OBJ_VAL(closure);
 
         int frame_base = current_frame->stack_base;
-        int needed_top = frame_base + function->max_regs;
+        int needed_top = frame_base + function->max_regs + function->spill_count;
 
         if (__builtin_expect(needed_top > STACK_MAX, 0)) {
             STORE_IP(); runtimeError(vm, "Stack overflow.");
@@ -3651,6 +3656,20 @@ static InterpretResult run(VM* vm) {
 
         DISPATCH();
     }
+    // Register spill: load spill slot Bx into register A.
+    // Spill area lives at bp[max_regs .. max_regs+spill_count); only emitted
+    // inside ObjFunction bodies, so vm->current_frame->closure is always set.
+    OP(SPILL_LOAD) {
+        Value* spill = bp + vm->current_frame->closure->function->max_regs;
+        bp[REG_A(instr)] = spill[REG_Bx(instr)];
+        DISPATCH();
+    }
+    // Register spill: evict register A to spill slot Bx.
+    OP(SPILL_STORE) {
+        Value* spill = bp + vm->current_frame->closure->function->max_regs;
+        spill[REG_Bx(instr)] = bp[REG_A(instr)];
+        DISPATCH();
+    }
 #undef OP
 #undef DISPATCH
 #undef CUR_BASE
@@ -3787,7 +3806,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     // Calculate required stack size for this call
     // Mirror OP(CALL): variadic functions with extra args need additional slots.
-    int needed_top = frame_base + function->max_regs;
+    int needed_top = frame_base + function->max_regs + function->spill_count;
     if (function->is_variadic && argCount > function->arity) {
         needed_top += (argCount - function->arity);
     }
