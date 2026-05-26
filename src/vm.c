@@ -760,12 +760,28 @@ static InterpretResult run(VM* vm) {
     register Value* constants = vm->chunk ? vm->chunk->constants.values : NULL;
     register uint32_t instr = 0;
     register Value* bp = stack + base;  // base pointer for direct register access
+    // Spill-area base pointer. The spill region lives at bp[max_regs..],
+    // emitted only inside ObjFunction bodies (top-level chunks never spill),
+    // so we read it from the current frame's function when one exists. At
+    // the top level (frame_count == 0) we leave sp == bp; SPILL_LOAD/STORE
+    // never execute on the top-level chunk, so the value is unused.
+    register Value* sp = (vm->current_frame && vm->current_frame->closure)
+        ? bp + vm->current_frame->closure->function->max_regs
+        : bp;
 
     // Sync locals back to VM struct before calls that read vm->ip/cur_base
 #define STORE_IP()    (vm->ip = ip)
 #define STORE_STATE() do { vm->ip = ip; vm->cur_base = base; } while(0)
-    // Reload locals from VM struct after frame changes or stack reallocation
-#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; } while(0)
+    // Reload locals from VM struct after frame changes or stack reallocation.
+    // RELOAD_SP() recomputes the spill base from the current frame; callers
+    // that know they kept the same frame (just GC stack relocation) should
+    // use RELOAD_STACK() instead, which preserves sp's offset from bp.
+#define RELOAD_SP() do { \
+    sp = (vm->current_frame && vm->current_frame->closure) \
+        ? bp + vm->current_frame->closure->function->max_regs \
+        : bp; \
+} while(0)
+#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; RELOAD_SP(); } while(0)
 
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
@@ -779,7 +795,15 @@ static InterpretResult run(VM* vm) {
     goto *dispatch_table[OPCODE(instr)]; \
 } while(0)
 #define CUR_BASE() (base)
-#define RELOAD_STACK() do { stack = vm->stack; bp = stack + base; } while(0)
+    // GC may relocate the value stack; bp and sp both shift by the same
+    // delta (the current frame's function hasn't changed, so max_regs is
+    // unchanged — sp's offset from bp is invariant).
+#define RELOAD_STACK() do { \
+    Value* _old_bp = bp; \
+    stack = vm->stack; \
+    bp = stack + base; \
+    sp = bp + (sp - _old_bp); \
+} while(0)
 #define BINARY_OP(op) \
     do { \
         Value vb = bp[REG_B(instr)]; \
@@ -2264,6 +2288,7 @@ static InterpretResult run(VM* vm) {
             vm->current_frame = frame;
             base = callee_slot;
             bp = stack + base;
+            sp = bp + function->max_regs;  // spill base for the callee frame
             // Enter callee
             vm->chunk = &function->chunk;
             constants = vm->chunk->constants.values;
@@ -2432,6 +2457,7 @@ static InterpretResult run(VM* vm) {
         vm->current_frame = frame;
         base = callee_slot;
         bp = stack + base;
+        sp = bp + function->max_regs;  // spill base for the CALL_SELF callee
         ip = function->chunk.code;
         DISPATCH();
     }
@@ -2586,6 +2612,9 @@ static InterpretResult run(VM* vm) {
             vm->chunk = &function->chunk;
             constants = vm->chunk->constants.values;
             ip    = function->chunk.code;
+            // base/bp unchanged (frame reused), but the new function may have
+            // a different max_regs — recompute the spill base for the callee.
+            sp = bp + function->max_regs;
 
             DISPATCH();
         }
@@ -2638,6 +2667,7 @@ static InterpretResult run(VM* vm) {
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            RELOAD_SP();  // returning to caller frame: recompute spill base
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
@@ -2727,6 +2757,7 @@ static InterpretResult run(VM* vm) {
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            RELOAD_SP();  // returning to caller frame: recompute spill base
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
@@ -2856,6 +2887,7 @@ static InterpretResult run(VM* vm) {
         base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
         bp = stack + base;
         vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+        RELOAD_SP();  // returning to caller frame: recompute spill base
 
         if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
             vm->preemption_disable_depth--;
@@ -3657,17 +3689,17 @@ static InterpretResult run(VM* vm) {
         DISPATCH();
     }
     // Register spill: load spill slot Bx into register A.
-    // Spill area lives at bp[max_regs .. max_regs+spill_count); only emitted
-    // inside ObjFunction bodies, so vm->current_frame->closure is always set.
+    // Spill area lives at sp[0..spill_count); sp is cached at every frame
+    // transition (see RELOAD_SP / LOAD_STATE / per-call updates below) so
+    // these handlers do zero pointer-chasing — just two memory accesses,
+    // matching the cost of a plain MOVE.
     OP(SPILL_LOAD) {
-        Value* spill = bp + vm->current_frame->closure->function->max_regs;
-        bp[REG_A(instr)] = spill[REG_Bx(instr)];
+        bp[REG_A(instr)] = sp[REG_Bx(instr)];
         DISPATCH();
     }
     // Register spill: evict register A to spill slot Bx.
     OP(SPILL_STORE) {
-        Value* spill = bp + vm->current_frame->closure->function->max_regs;
-        spill[REG_Bx(instr)] = bp[REG_A(instr)];
+        sp[REG_Bx(instr)] = bp[REG_A(instr)];
         DISPATCH();
     }
 #undef OP
@@ -3678,6 +3710,7 @@ static InterpretResult run(VM* vm) {
 #undef STORE_IP
 #undef STORE_STATE
 #undef LOAD_STATE
+#undef RELOAD_SP
 }
 
 InterpretResult runVM(VM* vm) {
