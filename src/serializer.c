@@ -21,21 +21,88 @@ static void writeBytes(VM* vm, OutputBuffer* out, const void* data, size_t size)
     appendToOutputBuffer(vm, out, (const char*)data, size);
 }
 
-void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* out) {
-    const char magic[] = "ZYM\0";
-    // Format version bumped 1 → 2 when ObjFunction gained `spill_count`
-    // for the register-spilling feature. Loaders that read version 1
-    // implicitly assume spill_count == 0.
-    const uint8_t version = 2;
-    writeBytes(vm, out, magic, 4);
-    writeBytes(vm, out, &version, sizeof(uint8_t));
+// =============================================================================
+// String pool
+// =============================================================================
+//
+// The serialized form stores every string exactly once, in a pool at the
+// head of the file; all string-bearing records (string constants,
+// function names, module names, schema names/fields/variants, the entry
+// file) reference it by i32 index (-1 = none). In-memory strings are
+// interned, so an identifier referenced from many function chunks used
+// to serialize as one inline copy per chunk; the pool restores the 1:1
+// relationship and spares the loader re-interning every copy.
 
-    int entryFileLen = (vm->entry_file ? vm->entry_file->byte_length : -1);
-    writeBytes(vm, out, &entryFileLen, sizeof(int));
-    if (entryFileLen > 0) {
-        writeBytes(vm, out, vm->entry_file->chars, (size_t)entryFileLen);
+typedef struct {
+    ObjString** items;    // encounter-ordered pool entries
+    int count;
+    int capacity;
+    ObjString** slots;    // open-addressed set over interned pointers
+    int* slot_index;      // pool index parallel to `slots`
+    int slot_capacity;    // power of two, 0 until first insert
+} StringPool;
+
+static void poolInit(StringPool* pool) {
+    memset(pool, 0, sizeof(*pool));
+}
+
+static void poolFree(VM* vm, StringPool* pool) {
+    if (pool->items)      FREE_ARRAY(vm, ObjString*, pool->items, pool->capacity);
+    if (pool->slots)      FREE_ARRAY(vm, ObjString*, pool->slots, pool->slot_capacity);
+    if (pool->slot_index) FREE_ARRAY(vm, int, pool->slot_index, pool->slot_capacity);
+}
+
+static void poolRehash(VM* vm, StringPool* pool, int new_capacity) {
+    ObjString** slots = ALLOCATE(vm, ObjString*, new_capacity);
+    int* slot_index   = ALLOCATE(vm, int, new_capacity);
+    for (int i = 0; i < new_capacity; i++) slots[i] = NULL;
+    int mask = new_capacity - 1;
+    for (int i = 0; i < pool->count; i++) {
+        ObjString* s = pool->items[i];
+        int probe = (int)(s->hash & (uint32_t)mask);
+        while (slots[probe] != NULL) probe = (probe + 1) & mask;
+        slots[probe] = s;
+        slot_index[probe] = i;
     }
+    if (pool->slots)      FREE_ARRAY(vm, ObjString*, pool->slots, pool->slot_capacity);
+    if (pool->slot_index) FREE_ARRAY(vm, int, pool->slot_index, pool->slot_capacity);
+    pool->slots = slots;
+    pool->slot_index = slot_index;
+    pool->slot_capacity = new_capacity;
+}
 
+// Strings are interned (copyString/takeString), so pointer identity is
+// value identity and the set probes on the pointer alone.
+static int poolIntern(VM* vm, StringPool* pool, ObjString* s) {
+    if ((pool->count + 1) * 2 > pool->slot_capacity) {
+        poolRehash(vm, pool, pool->slot_capacity < 64 ? 64 : pool->slot_capacity * 2);
+    }
+    int mask = pool->slot_capacity - 1;
+    int probe = (int)(s->hash & (uint32_t)mask);
+    while (pool->slots[probe] != NULL) {
+        if (pool->slots[probe] == s) return pool->slot_index[probe];
+        probe = (probe + 1) & mask;
+    }
+    if (pool->count == pool->capacity) {
+        int old = pool->capacity;
+        pool->capacity = old < 64 ? 64 : old * 2;
+        pool->items = (ObjString**)reallocate(vm, pool->items,
+                                              sizeof(ObjString*) * (size_t)old,
+                                              sizeof(ObjString*) * (size_t)pool->capacity);
+    }
+    pool->items[pool->count] = s;
+    pool->slots[probe] = s;
+    pool->slot_index[probe] = pool->count;
+    return pool->count++;
+}
+
+static void writePoolRef(VM* vm, OutputBuffer* out, StringPool* pool, ObjString* s) {
+    int idx = s ? poolIntern(vm, pool, s) : -1;
+    writeBytes(vm, out, &idx, sizeof(int));
+}
+
+static void serializeChunkBody(VM* vm, Chunk* chunk, CompilerConfig config,
+                               OutputBuffer* out, StringPool* pool) {
     writeBytes(vm, out, &chunk->constants.count, sizeof(int));
     for (int i = 0; i < chunk->constants.count; i++) {
         Value value = chunk->constants.values[i];
@@ -48,9 +115,7 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
         } else if (IS_STRING(value)) {
             uint8_t tag = TYPE_TAG_STRING;
             writeBytes(vm, out, &tag, sizeof(uint8_t));
-            ObjString* s = AS_STRING(value);
-            writeBytes(vm, out, &s->byte_length, sizeof(int));
-            writeBytes(vm, out, s->chars, (size_t)s->byte_length);
+            writePoolRef(vm, out, pool, AS_STRING(value));
         } else if (IS_NULL(value)) {
             uint8_t tag = TYPE_TAG_NULL;
             writeBytes(vm, out, &tag, sizeof(uint8_t));
@@ -84,21 +149,12 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
                 }
             }
 
-            int nameLen = (fn->name ? fn->name->byte_length : -1);
-            writeBytes(vm, out, &nameLen, sizeof(int));
-            if (nameLen > 0) {
-                writeBytes(vm, out, fn->name->chars, (size_t)nameLen);
-            }
-
-            int modNameLen = (fn->module_name ? fn->module_name->byte_length : -1);
-            writeBytes(vm, out, &modNameLen, sizeof(int));
-            if (modNameLen > 0) {
-                writeBytes(vm, out, fn->module_name->chars, (size_t)modNameLen);
-            }
+            writePoolRef(vm, out, pool, fn->name);
+            writePoolRef(vm, out, pool, fn->module_name);
 
             OutputBuffer nested;
             initOutputBuffer(&nested);
-            serializeChunk(vm, &fn->chunk, config, &nested);
+            serializeChunkBody(vm, &fn->chunk, config, &nested, pool);
             int32_t nestedSize = (int32_t)nested.count;
             writeBytes(vm, out, &nestedSize, sizeof(int32_t));
             writeBytes(vm, out, nested.buffer, (size_t)nestedSize);
@@ -108,31 +164,21 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             writeBytes(vm, out, &tag, sizeof(uint8_t));
 
             ObjStructSchema* schema = AS_STRUCT_SCHEMA(value);
-            int nameLen = schema->name->byte_length;
-            writeBytes(vm, out, &nameLen, sizeof(int));
-            writeBytes(vm, out, schema->name->chars, (size_t)nameLen);
-
+            writePoolRef(vm, out, pool, schema->name);
             writeBytes(vm, out, &schema->field_count, sizeof(int));
-            for (int i = 0; i < schema->field_count; i++) {
-                int fieldLen = schema->field_names[i]->byte_length;
-                writeBytes(vm, out, &fieldLen, sizeof(int));
-                writeBytes(vm, out, schema->field_names[i]->chars, (size_t)fieldLen);
+            for (int f = 0; f < schema->field_count; f++) {
+                writePoolRef(vm, out, pool, schema->field_names[f]);
             }
         } else if (IS_OBJ(value) && IS_ENUM_SCHEMA(value)) {
             uint8_t tag = 0x08;
             writeBytes(vm, out, &tag, sizeof(uint8_t));
 
             ObjEnumSchema* schema = AS_ENUM_SCHEMA(value);
-            int nameLen = schema->name->byte_length;
-            writeBytes(vm, out, &nameLen, sizeof(int));
-            writeBytes(vm, out, schema->name->chars, (size_t)nameLen);
-
+            writePoolRef(vm, out, pool, schema->name);
             writeBytes(vm, out, &schema->type_id, sizeof(int));
             writeBytes(vm, out, &schema->variant_count, sizeof(int));
-            for (int i = 0; i < schema->variant_count; i++) {
-                int variantLen = schema->variant_names[i]->byte_length;
-                writeBytes(vm, out, &variantLen, sizeof(int));
-                writeBytes(vm, out, schema->variant_names[i]->chars, (size_t)variantLen);
+            for (int v = 0; v < schema->variant_count; v++) {
+                writePoolRef(vm, out, pool, schema->variant_names[v]);
             }
         } else if (IS_ENUM(value)) {
             uint8_t tag = 0x09;
@@ -158,7 +204,55 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
     }
 }
 
-bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) {
+void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* out) {
+    // The pool's bookkeeping arrays hold bare ObjString* that are only
+    // reachable through the (untracked) chunk being serialized, and the
+    // buffers grow through `reallocate`; pause collection for the
+    // duration, mirroring growStack's save/restore of BOTH gc fields
+    // (restoring only gc_enabled would leave the debt counter at the
+    // INT32_MAX that reallocate parks it at when it wraps while paused).
+    bool gc_was_enabled = vm->gc_enabled;
+    int32_t gc_saved_debt = vm->gc_debt;
+    vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;
+
+    StringPool pool;
+    poolInit(&pool);
+
+    // Reserve the entry-file slot first so it lands at a stable index.
+    int entryIdx = vm->entry_file ? poolIntern(vm, &pool, vm->entry_file) : -1;
+
+    OutputBuffer body;
+    initOutputBuffer(&body);
+    serializeChunkBody(vm, chunk, config, &body, &pool);
+
+    const char magic[] = "ZYM\0";
+    // Pre-release bytecode format, pinned at 1 until the first stable
+    // release. The string pool, spill_count, and zeroed upvalue records
+    // are all part of this baseline — no compatibility shims for
+    // earlier drafts.
+    const uint8_t version = 1;
+    writeBytes(vm, out, magic, 4);
+    writeBytes(vm, out, &version, sizeof(uint8_t));
+
+    writeBytes(vm, out, &pool.count, sizeof(int));
+    for (int i = 0; i < pool.count; i++) {
+        ObjString* s = pool.items[i];
+        writeBytes(vm, out, &s->byte_length, sizeof(int));
+        writeBytes(vm, out, s->chars, (size_t)s->byte_length);
+    }
+    writeBytes(vm, out, &entryIdx, sizeof(int));
+
+    appendToOutputBuffer(vm, out, body.buffer, (size_t)body.count);
+
+    freeOutputBuffer(vm, &body);
+    poolFree(vm, &pool);
+    vm->gc_enabled = gc_was_enabled;
+    vm->gc_debt = gc_saved_debt;
+}
+
+static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size,
+                                 ObjString** pool, int pool_count) {
     const uint8_t* p = buffer;
 
     #define READ_BYTES(dest, count) \
@@ -171,30 +265,18 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
             p += (count); \
         } while (0)
 
-    char magic[4];
-    READ_BYTES(magic, 4);
-    if (strncmp(magic, "ZYM\0", 4) != 0) {
-        fprintf(stderr, "Invalid magic header\n");
-        return false;
-    }
-
-    uint8_t version = 0;
-    READ_BYTES(&version, sizeof(uint8_t));
-    // v1 omits the spill_count field; v2+ writes it after max_regs.
-    // Older v1 packages cleanly upgrade by treating spill_count as 0.
-    if (version != 1 && version != 2) return false;
-
-    int entryFileLen = 0;
-    READ_BYTES(&entryFileLen, sizeof(int));
-    if (entryFileLen > 0) {
-        char* entryFileChars = (char*)ZYM_ALLOC(&vm->allocator, entryFileLen + 1);
-        READ_BYTES(entryFileChars, entryFileLen);
-        entryFileChars[entryFileLen] = '\0';
-        vm->entry_file = copyString(vm, entryFileChars, entryFileLen);
-        ZYM_FREE(&vm->allocator, entryFileChars, entryFileLen + 1);
-    } else {
-        vm->entry_file = NULL;
-    }
+    // Resolve an i32 pool reference: yields NULL for -1, fails the
+    // chunk on any other out-of-range index.
+    #define READ_POOL_REF(out_str) \
+        do { \
+            int _idx = 0; \
+            READ_BYTES(&_idx, sizeof(int)); \
+            if (_idx == -1) { (out_str) = NULL; } \
+            else if (_idx < 0 || _idx >= pool_count) { \
+                fprintf(stderr, "Invalid string pool index %d (pool size %d)\n", _idx, pool_count); \
+                return false; \
+            } else { (out_str) = pool[_idx]; } \
+        } while (0)
 
     int constant_count = 0;
     READ_BYTES(&constant_count, sizeof(int));
@@ -210,17 +292,10 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 break;
             }
             case TYPE_TAG_STRING: {
-                int length = 0;
-                READ_BYTES(&length, sizeof(int));
-                if (length < 0) return false;
-                char* chars = (char*)reallocate(vm, NULL, 0, (size_t)length + 1);
-                READ_BYTES(chars, (size_t)length);
-                chars[length] = '\0';
-                ObjString* s = copyString(vm, chars, length);
-                pushTempRoot(vm, (Obj*)s);
-                reallocate(vm, chars, (size_t)length + 1, 0);
+                ObjString* s = NULL;
+                READ_POOL_REF(s);
+                if (s == NULL) return false;
                 addConstant(vm, chunk, OBJ_VAL(s));
-                popTempRoot(vm);
                 break;
             }
             case TYPE_TAG_NULL: {
@@ -254,11 +329,7 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 READ_BYTES_OR_FAIL(&variadic_flag, sizeof(uint8_t));
                 fn->is_variadic = (variadic_flag != 0);
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
-                if (version >= 2) {
-                    READ_BYTES_OR_FAIL(&fn->spill_count, sizeof(int));
-                } else {
-                    fn->spill_count = 0;
-                }
+                READ_BYTES_OR_FAIL(&fn->spill_count, sizeof(int));
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
                 if (fn->upvalue_count > 0) {
                     fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);
@@ -271,26 +342,26 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                     }
                 }
 
-                int nameLen = -1;
-                READ_BYTES_OR_FAIL(&nameLen, sizeof(int));
-                if (nameLen > 0) {
-                    char* nameBuf = (char*)reallocate(vm, NULL, 0, (size_t)nameLen + 1);
-                    READ_BYTES_OR_FAIL(nameBuf, (size_t)nameLen);
-                    nameBuf[nameLen] = '\0';
-                    fn->name = takeString(vm, nameBuf, nameLen);
-                } else {
+                int nameIdx = -1;
+                READ_BYTES_OR_FAIL(&nameIdx, sizeof(int));
+                if (nameIdx == -1) {
                     fn->name = NULL;
+                } else if (nameIdx < 0 || nameIdx >= pool_count) {
+                    fprintf(stderr, "Invalid string pool index %d (pool size %d)\n", nameIdx, pool_count);
+                    goto fn_deserialize_fail;
+                } else {
+                    fn->name = pool[nameIdx];
                 }
 
-                int modNameLen = -1;
-                READ_BYTES_OR_FAIL(&modNameLen, sizeof(int));
-                if (modNameLen > 0) {
-                    char* modNameBuf = (char*)reallocate(vm, NULL, 0, (size_t)modNameLen + 1);
-                    READ_BYTES_OR_FAIL(modNameBuf, (size_t)modNameLen);
-                    modNameBuf[modNameLen] = '\0';
-                    fn->module_name = takeString(vm, modNameBuf, modNameLen);
-                } else {
+                int modNameIdx = -1;
+                READ_BYTES_OR_FAIL(&modNameIdx, sizeof(int));
+                if (modNameIdx == -1) {
                     fn->module_name = NULL;
+                } else if (modNameIdx < 0 || modNameIdx >= pool_count) {
+                    fprintf(stderr, "Invalid string pool index %d (pool size %d)\n", modNameIdx, pool_count);
+                    goto fn_deserialize_fail;
+                } else {
+                    fn->module_name = pool[modNameIdx];
                 }
 
                 int32_t nestedSize = 0;
@@ -306,8 +377,8 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                         goto fn_deserialize_fail;
                     }
 
-                    if (!deserializeChunk(vm, &fn->chunk, nestedStart, (size_t)nestedSize)) {
-                        fprintf(stderr, "Function deserialization: recursive deserializeChunk failed for nested function\n");
+                    if (!deserializeChunkBody(vm, &fn->chunk, nestedStart, (size_t)nestedSize, pool, pool_count)) {
+                        fprintf(stderr, "Function deserialization: recursive deserializeChunkBody failed for nested function\n");
                         goto fn_deserialize_fail;
                     }
                     p += nestedSize;
@@ -324,97 +395,45 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 return false;
             }
             case 0x07: {
-                int nameLen = 0;
-                READ_BYTES(&nameLen, sizeof(int));
-                if (nameLen < 0) return false;
-
-                char* nameChars = (char*)reallocate(vm, NULL, 0, (size_t)nameLen + 1);
-                READ_BYTES(nameChars, (size_t)nameLen);
-                nameChars[nameLen] = '\0';
-                ObjString* name = takeString(vm, nameChars, nameLen);
-                pushTempRoot(vm, (Obj*)name);
+                ObjString* name = NULL;
+                READ_POOL_REF(name);
+                if (name == NULL) return false;
 
                 int field_count = 0;
                 READ_BYTES(&field_count, sizeof(int));
-                if (field_count < 0) {
-                    popTempRoot(vm);
-                    return false;
-                }
+                if (field_count < 0) return false;
 
                 ObjString** field_names = ALLOCATE(vm, ObjString*, field_count);
-                for (int i = 0; i < field_count; i++) {
-                    int fieldLen = 0;
-                    READ_BYTES(&fieldLen, sizeof(int));
-                    if (fieldLen < 0) {
-                        // Cleanup already pushed strings
-                        for (int j = 0; j < i; j++) popTempRoot(vm);
-                        popTempRoot(vm); // name
-                        return false;
-                    }
-
-                    char* fieldChars = (char*)reallocate(vm, NULL, 0, (size_t)fieldLen + 1);
-                    READ_BYTES(fieldChars, (size_t)fieldLen);
-                    fieldChars[fieldLen] = '\0';
-                    field_names[i] = takeString(vm, fieldChars, fieldLen);
-                    pushTempRoot(vm, (Obj*)field_names[i]);
+                for (int f = 0; f < field_count; f++) {
+                    READ_POOL_REF(field_names[f]);
+                    if (field_names[f] == NULL) return false;
                 }
 
                 ObjStructSchema* schema = newStructSchema(vm, name, field_names, field_count);
-                pushTempRoot(vm, (Obj*)schema);
                 addConstant(vm, chunk, OBJ_VAL(schema));
-                popTempRoot(vm); // schema
-
-                // Pop field names and name
-                for (int i = 0; i < field_count; i++) popTempRoot(vm);
-                popTempRoot(vm); // name
                 break;
             }
             case 0x08: {
-                int nameLen = 0;
-                READ_BYTES(&nameLen, sizeof(int));
-                if (nameLen < 0) return false;
-
-                char* nameChars = (char*)reallocate(vm, NULL, 0, (size_t)nameLen + 1);
-                READ_BYTES(nameChars, (size_t)nameLen);
-                nameChars[nameLen] = '\0';
-                ObjString* name = takeString(vm, nameChars, nameLen);
-                pushTempRoot(vm, (Obj*)name);
+                ObjString* name = NULL;
+                READ_POOL_REF(name);
+                if (name == NULL) return false;
 
                 int type_id = 0;
                 READ_BYTES(&type_id, sizeof(int));
 
                 int variant_count = 0;
                 READ_BYTES(&variant_count, sizeof(int));
-                if (variant_count < 0) {
-                    popTempRoot(vm);
-                    return false;
-                }
+                if (variant_count < 0) return false;
 
                 ObjString** variant_names = ALLOCATE(vm, ObjString*, variant_count);
-                for (int i = 0; i < variant_count; i++) {
-                    int variantLen = 0;
-                    READ_BYTES(&variantLen, sizeof(int));
-                    if (variantLen < 0) {
-                        for (int j = 0; j < i; j++) popTempRoot(vm);
-                        popTempRoot(vm);
-                        return false;
-                    }
-
-                    char* variantChars = (char*)reallocate(vm, NULL, 0, (size_t)variantLen + 1);
-                    READ_BYTES(variantChars, (size_t)variantLen);
-                    variantChars[variantLen] = '\0';
-                    variant_names[i] = takeString(vm, variantChars, variantLen);
-                    pushTempRoot(vm, (Obj*)variant_names[i]);
+                for (int v = 0; v < variant_count; v++) {
+                    READ_POOL_REF(variant_names[v]);
+                    if (variant_names[v] == NULL) return false;
                 }
 
                 ObjEnumSchema* schema = newEnumSchema(vm, name, variant_names, variant_count);
                 schema->type_id = type_id;
-                pushTempRoot(vm, (Obj*)schema);
                 addConstant(vm, chunk, OBJ_VAL(schema));
-                popTempRoot(vm); // schema
-
-                for (int i = 0; i < variant_count; i++) popTempRoot(vm);
-                popTempRoot(vm); // name
                 break;
             }
             case 0x09: {
@@ -460,5 +479,77 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
 
     return true;
 
+    #undef READ_POOL_REF
     #undef READ_BYTES
+}
+
+bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) {
+    const uint8_t* p = buffer;
+
+    if (size < 4 + sizeof(uint8_t) + sizeof(int)) {
+        fprintf(stderr, "Bytecode too small for header (size=%zu)\n", size);
+        return false;
+    }
+
+    if (strncmp((const char*)p, "ZYM\0", 4) != 0) {
+        fprintf(stderr, "Invalid magic header\n");
+        return false;
+    }
+    p += 4;
+
+    uint8_t version = *p++;
+    if (version != 1) {
+        fprintf(stderr, "Unsupported bytecode version %u\n", version);
+        return false;
+    }
+
+    int pool_count = 0;
+    memcpy(&pool_count, p, sizeof(int));
+    p += sizeof(int);
+    if (pool_count < 0) return false;
+    // Every pool entry carries at least its 4-byte length; reject
+    // counts the remaining bytes cannot possibly hold before sizing
+    // the pool array from them. Division form so the check cannot
+    // overflow on 32-bit size_t targets.
+    if ((size_t)pool_count > (size - (size_t)(p - buffer)) / sizeof(int)) {
+        fprintf(stderr, "Invalid string pool count %d for %zu remaining bytes\n",
+                pool_count, size - (size_t)(p - buffer));
+        return false;
+    }
+
+    // The pool array and the half-built chunk are invisible to the GC
+    // while deserialization is in flight; pause collection for the
+    // duration (same dual-field save/restore as the serializer).
+    bool gc_was_enabled = vm->gc_enabled;
+    int32_t gc_saved_debt = vm->gc_debt;
+    vm->gc_enabled = false;
+    vm->gc_debt = INT32_MAX;
+
+    ObjString** pool = pool_count > 0 ? ALLOCATE(vm, ObjString*, pool_count) : NULL;
+    bool ok = false;
+    int entryIdx = -1;
+
+    for (int i = 0; i < pool_count; i++) {
+        int len = 0;
+        if ((size_t)(p - buffer) + sizeof(int) > size) goto done;
+        memcpy(&len, p, sizeof(int));
+        p += sizeof(int);
+        if (len < 0 || (size_t)(p - buffer) + (size_t)len > size) goto done;
+        pool[i] = copyString(vm, (const char*)p, len);
+        p += len;
+    }
+
+    if ((size_t)(p - buffer) + sizeof(int) > size) goto done;
+    memcpy(&entryIdx, p, sizeof(int));
+    p += sizeof(int);
+    if (entryIdx < -1 || entryIdx >= pool_count) goto done;
+    vm->entry_file = (entryIdx >= 0) ? pool[entryIdx] : NULL;
+
+    ok = deserializeChunkBody(vm, chunk, p, size - (size_t)(p - buffer), pool, pool_count);
+
+done:
+    if (pool) FREE_ARRAY(vm, ObjString*, pool, pool_count);
+    vm->gc_enabled = gc_was_enabled;
+    vm->gc_debt = gc_saved_debt;
+    return ok;
 }
