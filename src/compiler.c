@@ -83,6 +83,10 @@ void zym_compilerTrace_record(VM* vm,
 
 static char* mangle_name(Compiler* compiler, Token* name, int arity);
 static char* mangle_name_variadic(Compiler* compiler, Token* name, int fixed_count);
+static char* mangle_global_name(Compiler* compiler, Token* name, int arity);
+static char* mangle_global_name_variadic(Compiler* compiler, Token* name, int fixed_count);
+static const char* strip_lookup_token(Compiler* c, const Token* name);
+static int global_identifier_constant(Compiler* compiler, Token* name);
 static void declare_function(Compiler* compiler, Stmt* stmt);
 /* static void define_function(Compiler* compiler, Stmt* stmt); */
 static bool compile_statement(Compiler* compiler, Stmt* stmt);
@@ -1004,6 +1008,34 @@ static Compiler* root_compiler(Compiler* c) {
     return c;
 }
 
+// ---- Symbol stripping (CompilerConfig.strip_symbols) ----------------------
+// Returns the replacement symbol for a unit-defined global base name, or
+// NULL when the name is external (native / kept / not defined here). The
+// map lives on the root compiler and is keyed on base-name tokens, so
+// local resolution and vm->globals native probes are never affected.
+static const char* strip_lookup_token(Compiler* c, const Token* name) {
+    Compiler* root = root_compiler(c);
+    for (int i = 0; i < root->strip_name_count; i++) {
+        if (tokens_equal(&root->strip_names[i].name, name)) {
+            return root->strip_names[i].symbol;
+        }
+    }
+    return NULL;
+}
+
+// Strip-aware sibling of identifier_constant for GLOBAL-name emission
+// sites (GET/SET/DEFINE_GLOBAL). Map-key and property sites keep calling
+// identifier_constant directly.
+static int global_identifier_constant(Compiler* compiler, Token* name) {
+    const char* sym = strip_lookup_token(compiler, name);
+    if (sym == NULL) return identifier_constant(compiler, name);
+    ObjString* str = copyString(compiler->vm, sym, (int)strlen(sym));
+    pushTempRoot(compiler->vm, (Obj*)str);
+    int index = make_constant(compiler, OBJ_VAL(str));
+    popTempRoot(compiler->vm);
+    return index;
+}
+
 typedef enum {
     HOISTED_GLOBAL,
     HOISTED_LOCAL,
@@ -1234,6 +1266,13 @@ typedef struct {
     char* str;
 } ScopedString;
 
+static ScopedString scoped_mangle_global(Compiler* c, Token* name, int arity) {
+    ScopedString result;
+    result.c = c;
+    result.str = mangle_global_name(c, name, arity);
+    return result;
+}
+
 static ScopedString scoped_mangle(Compiler* c, Token* name, int arity) {
     ScopedString result;
     result.c = c;
@@ -1354,7 +1393,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             if (reg != -1) {
                 emit_get_upvalue(compiler, call_base, reg, line);
             } else {
-                int name_const = identifier_constant(compiler, name);
+                int name_const = global_identifier_constant(compiler, name);
                 emit_get_global(compiler, call_base, name_const, line, name);
             }
         }
@@ -1391,7 +1430,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
         if (needs_dispatcher) {
             emit_dispatcher(compiler, name, call_base, line, false);
         } else if (should_mangle) {
-            ScopedString mangled = scoped_mangle(compiler, name, arg_count);
+            ScopedString mangled = scoped_mangle_global(compiler, name, arg_count);
             ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
             pushTempRoot(compiler->vm, (Obj*)str);
             int name_const = make_constant(compiler, OBJ_VAL(str));
@@ -1399,7 +1438,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             scoped_string_free(&mangled);
             emit_get_global(compiler, call_base, name_const, line, name);
         } else {
-            int name_const = identifier_constant(compiler, name);
+            int name_const = global_identifier_constant(compiler, name);
             emit_get_global(compiler, call_base, name_const, line, name);
         }
     }
@@ -1551,7 +1590,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                 if (root->hoisted[i].is_variadic) {
                     // Variadic fallback
                     variadic_min_arity = root->hoisted[i].arity - 1;
-                    char* mangled = mangle_name_variadic(compiler, name, variadic_min_arity);
+                    char* mangled = mangle_global_name_variadic(compiler, name, variadic_min_arity);
                     ObjString* str = copyString(compiler->vm, mangled, (int)strlen(mangled));
                     pushTempRoot(compiler->vm, (Obj*)str);
                     int k = make_constant(compiler, OBJ_VAL(str));
@@ -1563,7 +1602,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     variadic_reg = temp_reg;
                 } else {
                     // Fixed-arity overload
-                    ScopedString mangled = scoped_mangle(compiler, name, root->hoisted[i].arity);
+                    ScopedString mangled = scoped_mangle_global(compiler, name, root->hoisted[i].arity);
                     ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
                     pushTempRoot(compiler->vm, (Obj*)str);
                     int k = make_constant(compiler, OBJ_VAL(str));
@@ -1704,7 +1743,7 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
                 return true;
             } else {
                 // Treat as global
-                int name_const = identifier_constant(compiler, name);
+                int name_const = global_identifier_constant(compiler, name);
                 emit_get_global(compiler, target_reg, name_const, line, name);
                 return true;
             }
@@ -1746,7 +1785,7 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
         if (needs_dispatcher) {
             emit_dispatcher(compiler, name, target_reg, line, false);
         } else if (should_mangle) {
-            char* mangled = mangle_name(compiler, name, arg_count);
+            char* mangled = mangle_global_name(compiler, name, arg_count);
             ObjString* str = copyString(compiler->vm, mangled, (int)strlen(mangled));
             pushTempRoot(compiler->vm, (Obj*)str);
             int name_const = make_constant(compiler, OBJ_VAL(str));
@@ -1754,7 +1793,7 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
             emit_get_global(compiler, target_reg, name_const, line, name);
         } else {
-            int name_const = identifier_constant(compiler, name);
+            int name_const = global_identifier_constant(compiler, name);
             emit_get_global(compiler, target_reg, name_const, line, name);
         }
         return true;
@@ -1827,7 +1866,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 int ar = single_hoisted_arity(compiler, &name);
                 if (ar >= 0) {
                     // Single global overload with unique arity
-                    ScopedString mangled = scoped_mangle(compiler, &name, ar);
+                    ScopedString mangled = scoped_mangle_global(compiler, &name, ar);
                     ObjString* str = copyString(compiler->vm, mangled.str, (int)strlen(mangled.str));
                     pushTempRoot(compiler->vm, (Obj*)str);
                     int k = make_constant(compiler, OBJ_VAL(str));
@@ -1839,7 +1878,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_dispatcher(compiler, &name, target_reg, expr->line, false);
                 } else {
                     // No overloads found
-                    int k = identifier_constant(compiler, &name);
+                    int k = global_identifier_constant(compiler, &name);
                     emit_get_global(compiler, target_reg, k, expr->line, &name);
                 }
             }
@@ -1897,7 +1936,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, temp_reg, expr->line);
                 } else {
                     // Global compound assignment - need to load, modify, store
-                    int name_const = identifier_constant(compiler, &name);
+                    int name_const = global_identifier_constant(compiler, &name);
                     int temp_reg = alloc_temp(compiler);
                     emit_get_global(compiler, temp_reg, name_const, expr->line, &name);
                     int value_reg = alloc_temp(compiler);
@@ -1981,7 +2020,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Assign to a global.
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
-                    int name_const = identifier_constant(compiler, &name);
+                    int name_const = global_identifier_constant(compiler, &name);
                     emit_set_global(compiler, value_reg, name_const, expr->line, &name);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
                 }
@@ -2393,7 +2432,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                         } else if ((reg = resolve_upvalue(compiler, cname)) != -1) {
                             emit_instruction(compiler, PACK_ABx(GET_UPVALUE, call_base, reg), callee->line);
                         } else {
-                            int name_const = identifier_constant(compiler, cname);
+                            int name_const = global_identifier_constant(compiler, cname);
                             emit_get_global(compiler, call_base, name_const, callee->line, cname);
                         }
                     }
@@ -3136,7 +3175,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_instruction(compiler, PACK_ABx(SET_UPVALUE, target_reg, reg), expr->line);
                 } else {
                     // Global: load, increment, store back
-                    int name_const = identifier_constant(compiler, name);
+                    int name_const = global_identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
                     emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, temp, 0), expr->line);
@@ -3205,7 +3244,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_instruction(compiler, PACK_ABx(SET_UPVALUE, temp, reg), expr->line);
                 } else {
                     // Global: load, increment, store back
-                    int name_const = identifier_constant(compiler, name);
+                    int name_const = global_identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
                     emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, temp, 0), expr->line);
@@ -3271,7 +3310,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_instruction(compiler, PACK_ABx(SET_UPVALUE, target_reg, reg), expr->line);
                 } else {
                     // Global: load, decrement, store back
-                    int name_const = identifier_constant(compiler, name);
+                    int name_const = global_identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
                     emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, temp, 0), expr->line);
@@ -3340,7 +3379,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     emit_instruction(compiler, PACK_ABx(SET_UPVALUE, temp, reg), expr->line);
                 } else {
                     // Global: load, decrement, store back
-                    int name_const = identifier_constant(compiler, name);
+                    int name_const = global_identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
                     emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, temp, 0), expr->line);
@@ -3578,7 +3617,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                         emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
                     }
 
-                    int name_const = identifier_constant(compiler, &var->name);
+                    int name_const = global_identifier_constant(compiler, &var->name);
                     int bytecode_pos = compiler->compiling_chunk->count;
                     emit_instruction(compiler, PACK_ABx(DEFINE_GLOBAL, value_reg, name_const), stmt->line);
 
@@ -3727,9 +3766,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 char* mangled;
                 if (stmt_is_variadic) {
                     int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
-                    mangled = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+                    mangled = mangle_global_name_variadic(compiler, &func_stmt->name, fixed);
                 } else {
-                    mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+                    mangled = mangle_global_name(compiler, &func_stmt->name, func_stmt->param_count);
                 }
                 ObjString* str = copyString(compiler->vm, mangled, strlen(mangled));
                 pushTempRoot(compiler->vm, (Obj*)str);
@@ -4563,6 +4602,12 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     memset(compiler->global_decls, 0, sizeof(compiler->global_decls));
     compiler->global_decl_count = 0;
 
+    // Symbol stripping state (populated on the root compiler only).
+    compiler->strip_names = NULL;
+    compiler->strip_name_count = 0;
+    compiler->strip_names_cap = 0;
+    compiler->strip_symbol_next = 0;
+
 
 }
 
@@ -4579,6 +4624,29 @@ static char* mangle_name(Compiler* compiler, Token* name, int arity) {
 static char* mangle_name_variadic(Compiler* compiler, Token* name, int fixed_count) {
     char* buffer = ALLOCATE(compiler->vm, char, name->length + 6); // +1 for '@', +1 for 'v', +3 for digits, +1 for '\0'
     sprintf(buffer, "%.*s@v%d", name->length, name->start, fixed_count);
+    return buffer;
+}
+
+// Strip-aware variants for GLOBAL name EMISSION sites only: when the base
+// name was renamed by strip_symbols, the mangled form carries the
+// replacement symbol. Local declaration/resolution and the vm->globals
+// native probes keep the raw manglers so compile-time resolution is
+// untouched.
+static char* mangle_global_name(Compiler* compiler, Token* name, int arity) {
+    const char* sym = strip_lookup_token(compiler, name);
+    if (sym == NULL) return mangle_name(compiler, name, arity);
+    size_t sym_len = strlen(sym);
+    char* buffer = ALLOCATE(compiler->vm, char, sym_len + 5);
+    sprintf(buffer, "%s@%d", sym, arity);
+    return buffer;
+}
+
+static char* mangle_global_name_variadic(Compiler* compiler, Token* name, int fixed_count) {
+    const char* sym = strip_lookup_token(compiler, name);
+    if (sym == NULL) return mangle_name_variadic(compiler, name, fixed_count);
+    size_t sym_len = strlen(sym);
+    char* buffer = ALLOCATE(compiler->vm, char, sym_len + 6);
+    sprintf(buffer, "%s@v%d", sym, fixed_count);
     return buffer;
 }
 
@@ -4642,9 +4710,9 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
     char* mangled;
     if (is_variadic) {
         int fixed = params_fixed_count(func_stmt->params, func_stmt->param_count);
-        mangled = mangle_name_variadic(compiler, &func_stmt->name, fixed);
+        mangled = mangle_global_name_variadic(compiler, &func_stmt->name, fixed);
     } else {
-        mangled = mangle_name(compiler, &func_stmt->name, func_stmt->param_count);
+        mangled = mangle_global_name(compiler, &func_stmt->name, func_stmt->param_count);
     }
     ObjString* str = copyString(compiler->vm, mangled, strlen(mangled));
     pushTempRoot(compiler->vm, (Obj*)str);
@@ -5267,6 +5335,106 @@ bool checkCompile(VM* vm, const char* source,
 }
 #endif
 
+// Record one unit-defined top-level global for symbol stripping. Skips
+// duplicates (overload families share one base entry), configured keep
+// names, and anything already visible in vm->globals (bare host/native
+// bindings or native function families) so external lookups and
+// shadowing semantics stay byte-for-byte identical.
+static void strip_collect_name(Compiler* root, const Token* name, const CompilerConfig* config) {
+    if (root->strip_names == NULL) return;
+    for (int i = 0; i < root->strip_name_count; i++) {
+        if (tokens_equal(&root->strip_names[i].name, name)) return;
+    }
+    for (int i = 0; i < config->keep_name_count; i++) {
+        const char* keep = config->keep_names[i];
+        if (keep != NULL && (int)strlen(keep) == name->length &&
+            memcmp(keep, name->start, (size_t)name->length) == 0) {
+            return;
+        }
+    }
+    ObjString* bare = copyString(root->vm, name->start, name->length);
+    pushTempRoot(root->vm, (Obj*)bare);
+    Value existing;
+    bool taken = tableGet(&root->vm->globals, bare, &existing);
+    popTempRoot(root->vm);
+    if (taken) return;
+    if (has_any_native_global(root, name)) return;
+
+    StripName* entry = &root->strip_names[root->strip_name_count];
+    entry->name = *name;
+    for (;;) {
+        snprintf(entry->symbol, sizeof(entry->symbol), "s%d", root->strip_symbol_next++);
+        bool clash = false;
+        for (int i = 0; i < config->keep_name_count; i++) {
+            if (config->keep_names[i] != NULL &&
+                strcmp(config->keep_names[i], entry->symbol) == 0) {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash) {
+            // Refuse symbols that collide with anything visible in
+            // vm->globals (bare host bindings, native @N/@vN families)
+            // so a rename can never alias or shadow an external binding.
+            ObjString* symstr = copyString(root->vm, entry->symbol,
+                                           (int)strlen(entry->symbol));
+            pushTempRoot(root->vm, (Obj*)symstr);
+            Value v;
+            bool sym_taken = tableGet(&root->vm->globals, symstr, &v);
+            popTempRoot(root->vm);
+            if (!sym_taken) {
+                Token st;
+                memset(&st, 0, sizeof(st));
+                st.start = entry->symbol;
+                st.length = (int)strlen(entry->symbol);
+                sym_taken = has_any_native_global(root, &st);
+            }
+            clash = sym_taken;
+        }
+        if (!clash) break;
+    }
+    root->strip_name_count++;
+}
+
+// Post-compile pass over the finished function tree: swap serialized
+// display names for their replacement symbols (globals) or drop them
+// (locals, module wrappers). Runs after codegen so compile-time
+// consumers of fn->name (TCO self-checks, module-factory detection) saw
+// the real names. Synthetic names like "<script>" are left alone.
+static void strip_function_display_names(Compiler* root, ObjFunction* fn,
+                                         const CompilerConfig* config) {
+    Chunk* chunk = &fn->chunk;
+    for (int i = 0; i < chunk->constants.count; i++) {
+        Value v = chunk->constants.values[i];
+        if (!IS_OBJ(v) || !IS_FUNCTION(v)) continue;
+        ObjFunction* child = AS_FUNCTION(v);
+        strip_function_display_names(root, child, config);
+        if (child->name == NULL || child->name->chars[0] == '<') continue;
+        Token t;
+        memset(&t, 0, sizeof(t));
+        t.start = child->name->chars;
+        t.length = child->name->byte_length;
+        const char* sym = strip_lookup_token(root, &t);
+        if (sym == NULL) {
+            // Keep-listed entry points keep their display name too, so
+            // stack traces still show the frames the embedder kept.
+            bool kept = false;
+            for (int k = 0; k < config->keep_name_count; k++) {
+                const char* keep = config->keep_names[k];
+                if (keep != NULL &&
+                    (int)strlen(keep) == child->name->byte_length &&
+                    memcmp(keep, child->name->chars,
+                           (size_t)child->name->byte_length) == 0) {
+                    kept = true;
+                    break;
+                }
+            }
+            if (kept) continue;
+        }
+        child->name = sym ? copyString(root->vm, sym, (int)strlen(sym)) : NULL;
+    }
+}
+
 bool compile(VM* vm, const char* source, Chunk* chunk,
              const SourceMap* source_map,
              const char* entry_file, CompilerConfig config,
@@ -5348,6 +5516,35 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
     }
     compiler.compiling_chunk = &compiler.function->chunk;
     // ---------------
+
+    // Symbol stripping: collect the unit's top-level global definitions
+    // (functions and vars — struct declarations emit no global, and enum
+    // schema globals are found by type_id, not name) and assign each
+    // base name a compact symbol in source order, keeping output
+    // deterministic.
+    if (config.strip_symbols) {
+        int cap = 0;
+        for (int i = 0; ast.statements[i] != NULL; i++) {
+            if (ast.statements[i]->type == STMT_FUNC_DECLARATION) cap++;
+            else if (ast.statements[i]->type == STMT_VAR_DECLARATION) {
+                cap += ast.statements[i]->as.var_declaration.count;
+            }
+        }
+        if (cap > 0) {
+            compiler.strip_names = ALLOCATE(vm, StripName, cap);
+            compiler.strip_names_cap = cap;
+            for (int i = 0; ast.statements[i] != NULL; i++) {
+                Stmt* s = ast.statements[i];
+                if (s->type == STMT_FUNC_DECLARATION) {
+                    strip_collect_name(&compiler, &s->as.func_declaration.name, &config);
+                } else if (s->type == STMT_VAR_DECLARATION) {
+                    for (int d = 0; d < s->as.var_declaration.count; d++) {
+                        strip_collect_name(&compiler, &s->as.var_declaration.variables[d].name, &config);
+                    }
+                }
+            }
+        }
+    }
 
     // --- PASS 1: DECLARATION ---
     // Find all function, struct, and enum declarations first to allow for hoisting.
@@ -5484,6 +5681,17 @@ cleanup_on_error:
     // the embedder (CLI, LSP, …) is responsible for rendering the list and
     // any "compilation failed" banner.
     bool success = !compiler.has_error;
+
+    // Symbol stripping: rewrite function display names now that every
+    // compile-time consumer of the real names (TCO self-checks,
+    // module-factory detection) has run, then drop the map.
+    if (success && config.strip_symbols && compiler.strip_names != NULL) {
+        strip_function_display_names(&compiler, compiler.function, &config);
+    }
+    if (compiler.strip_names) {
+        FREE_ARRAY(vm, StripName, compiler.strip_names, compiler.strip_names_cap);
+        compiler.strip_names = NULL;
+    }
 
     // NOTE: compiler.function is managed by the GC (it's in vm->objects list)
     // We don't manually free it here - the GC will handle cleanup

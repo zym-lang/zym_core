@@ -108,6 +108,14 @@ typedef struct {
 
 #define MAX_GLOBAL_DECLS 256
 
+// Symbol stripping (CompilerConfig.strip_symbols): one entry per
+// unit-defined top-level global base name, mapping it to the compact
+// symbol emitted in its place.
+typedef struct {
+    Token name;       // base-name token (points into the source buffer)
+    char symbol[16];  // replacement, e.g. "s17"
+} StripName;
+
 
 
 typedef struct Compiler {
@@ -203,6 +211,13 @@ typedef struct Compiler {
     int global_decl_count;
 
     ObjString* current_module_name;
+
+    // Symbol stripping map — populated on the ROOT compiler only,
+    // before codegen; nested compilers reach it via root_compiler().
+    StripName* strip_names;
+    int strip_name_count;
+    int strip_names_cap;
+    int strip_symbol_next;
 } Compiler;
 
 // Compiles `source` into `chunk`. `source_map`, when non-NULL, is the
