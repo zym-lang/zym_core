@@ -86,6 +86,8 @@ static char* mangle_name_variadic(Compiler* compiler, Token* name, int fixed_cou
 static char* mangle_global_name(Compiler* compiler, Token* name, int arity);
 static char* mangle_global_name_variadic(Compiler* compiler, Token* name, int fixed_count);
 static const char* strip_lookup_token(Compiler* c, const Token* name);
+static const char* strip_type_symbol(Compiler* c, const Token* name);
+static ObjString* type_name_string(Compiler* c, const Token* name);
 static int global_identifier_constant(Compiler* compiler, Token* name);
 static void declare_function(Compiler* compiler, Stmt* stmt);
 /* static void define_function(Compiler* compiler, Stmt* stmt); */
@@ -1021,6 +1023,104 @@ static const char* strip_lookup_token(Compiler* c, const Token* name) {
         }
     }
     return NULL;
+}
+
+// Derive the per-unit symbol salt from the entry file name (djb2, the
+// same hash the module loader and CLI use for path anonymization). Two
+// units with different entry names get different symbol namespaces, so
+// their stripped globals and type names cannot collide when both are
+// loaded into one VM. Units sharing an entry name collide exactly as
+// two unstripped units sharing type/global names always have.
+static void strip_make_salt(Compiler* compiler, const char* entry_file) {
+    unsigned int hash = 0;
+    if (entry_file != NULL) {
+        for (const char* p = entry_file; *p; p++) {
+            hash = ((hash << 5) + hash) + (unsigned char)*p;
+        }
+    }
+    snprintf(compiler->strip_salt, sizeof(compiler->strip_salt), "%04x", hash & 0xFFFFu);
+}
+
+// Resolve (and, on first sight, assign) the replacement symbol for a
+// struct/enum type name. Unlike globals — which are declared only at top
+// level and can be pre-scanned — type declarations occur at any depth
+// (module bodies are wrapped in functions by the module loader), so
+// collection happens lazily at the declaration site. Every type is
+// therefore renamed, which matters for correctness and not just for
+// anonymity: `schema->name` is a live discriminator in the VM's
+// STRUCT_SPREAD compatibility fallback, so leaving *some* type names raw
+// would let a generated symbol collide with one and silently make two
+// unrelated struct types compatible.
+//
+// The map is keyed on the source spelling, so equally-named types share
+// one symbol and differently-named types never share one. That preserves
+// the name-equality relation the VM compares on, exactly.
+static const char* strip_type_symbol(Compiler* c, const Token* name) {
+    Compiler* root = root_compiler(c);
+    const CompilerConfig* config = root->strip_config;
+    if (config == NULL || !config->strip_symbols) return NULL;
+
+    for (int i = 0; i < root->strip_type_name_count; i++) {
+        if (tokens_equal(&root->strip_type_names[i].name, name)) {
+            return root->strip_type_names[i].symbol;
+        }
+    }
+    for (int i = 0; i < config->keep_name_count; i++) {
+        const char* keep = config->keep_names[i];
+        if (keep != NULL && (int)strlen(keep) == name->length &&
+            memcmp(keep, name->start, (size_t)name->length) == 0) {
+            return NULL;  // caller keeps the source spelling
+        }
+    }
+
+    if (root->strip_type_name_count == root->strip_types_cap) {
+        int old_cap = root->strip_types_cap;
+        int new_cap = old_cap < 16 ? 16 : old_cap * 2;
+        root->strip_type_names = (StripName*)reallocate(
+            root->vm, root->strip_type_names,
+            sizeof(StripName) * (size_t)old_cap,
+            sizeof(StripName) * (size_t)new_cap);
+        root->strip_types_cap = new_cap;
+    }
+
+    StripName* entry = &root->strip_type_names[root->strip_type_name_count];
+    entry->name = *name;
+    for (;;) {
+        snprintf(entry->symbol, sizeof(entry->symbol), "t%s_%d",
+                 root->strip_salt, root->strip_type_next++);
+        bool clash = false;
+        // A kept type keeps its source spelling, so no generated symbol
+        // may equal one.
+        for (int i = 0; i < config->keep_name_count; i++) {
+            if (config->keep_names[i] != NULL &&
+                strcmp(config->keep_names[i], entry->symbol) == 0) {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash) {
+            char probe[64];
+            snprintf(probe, sizeof(probe), "__enum_schema_%s", entry->symbol);
+            ObjString* p = copyString(root->vm, probe, (int)strlen(probe));
+            pushTempRoot(root->vm, (Obj*)p);
+            Value v;
+            clash = tableGet(&root->vm->globals, p, &v);
+            popTempRoot(root->vm);
+        }
+        if (!clash) break;
+    }
+    root->strip_type_name_count++;
+    return entry->symbol;
+}
+
+// The ObjString stored as a schema's display name: the replacement
+// symbol when the type was renamed, else the source spelling. Only the
+// type NAME is substituted — field and variant names are data and are
+// always copied verbatim.
+static ObjString* type_name_string(Compiler* c, const Token* name) {
+    const char* sym = strip_type_symbol(c, name);
+    if (sym != NULL) return copyString(c->vm, sym, (int)strlen(sym));
+    return copyString(c->vm, name->start, name->length);
 }
 
 // Strip-aware sibling of identifier_constant for GLOBAL-name emission
@@ -3645,8 +3745,10 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 pushTempRoot(compiler->vm, (Obj*)field_names[i]);
             }
 
-            // Create struct name
-            ObjString* struct_name = copyString(compiler->vm, struct_stmt->name.start, struct_stmt->name.length);
+            // Create struct name (renamed under strip_symbols; the
+            // compiler resolves struct types by source Token, so the
+            // schema's display name is free to differ).
+            ObjString* struct_name = type_name_string(compiler, &struct_stmt->name);
             pushTempRoot(compiler->vm, (Obj*)struct_name);
 
             // Create the schema object
@@ -3681,8 +3783,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 pushTempRoot(compiler->vm, (Obj*)variant_names[i]);
             }
 
-            // Create enum name
-            ObjString* enum_name = copyString(compiler->vm, enum_stmt->name.start, enum_stmt->name.length);
+            // Create enum name (renamed under strip_symbols; variant
+            // names below are data and are never renamed).
+            ObjString* enum_name = type_name_string(compiler, &enum_stmt->name);
             pushTempRoot(compiler->vm, (Obj*)enum_name);
 
             // Create the enum schema object (assigns unique type_id)
@@ -3710,9 +3813,15 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 int schema_const = make_constant(compiler, OBJ_VAL(schema));
                 emit_instruction(compiler, PACK_ABx(LOAD_CONST, schema_reg, schema_const), stmt->line);
 
-                // Create internal name: "__enum_schema_Color"
+                // Create internal name: "__enum_schema_Color". The key
+                // is never read back by name (the VM finds schemas by
+                // scanning globals for a matching type_id), so it
+                // carries the replacement symbol when renamed.
                 char internal_name[256];
-                int name_len = snprintf(internal_name, sizeof(internal_name), "__enum_schema_%.*s", enum_stmt->name.length, enum_stmt->name.start);
+                const char* enum_sym = strip_type_symbol(compiler, &enum_stmt->name);
+                int name_len = enum_sym != NULL
+                    ? snprintf(internal_name, sizeof(internal_name), "__enum_schema_%s", enum_sym)
+                    : snprintf(internal_name, sizeof(internal_name), "__enum_schema_%.*s", enum_stmt->name.length, enum_stmt->name.start);
                 ObjString* str = copyString(compiler->vm, internal_name, name_len);
                 pushTempRoot(compiler->vm, (Obj*)str);
                 int name_const = make_constant(compiler, OBJ_VAL(str));
@@ -4607,6 +4716,12 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->strip_name_count = 0;
     compiler->strip_names_cap = 0;
     compiler->strip_symbol_next = 0;
+    compiler->strip_type_names = NULL;
+    compiler->strip_type_name_count = 0;
+    compiler->strip_types_cap = 0;
+    compiler->strip_type_next = 0;
+    compiler->strip_config = NULL;
+    compiler->strip_salt[0] = '\0';
 
 
 }
@@ -5342,6 +5457,7 @@ bool checkCompile(VM* vm, const char* source,
 // shadowing semantics stay byte-for-byte identical.
 static void strip_collect_name(Compiler* root, const Token* name, const CompilerConfig* config) {
     if (root->strip_names == NULL) return;
+    if (root->strip_name_count >= root->strip_names_cap) return;
     for (int i = 0; i < root->strip_name_count; i++) {
         if (tokens_equal(&root->strip_names[i].name, name)) return;
     }
@@ -5363,7 +5479,8 @@ static void strip_collect_name(Compiler* root, const Token* name, const Compiler
     StripName* entry = &root->strip_names[root->strip_name_count];
     entry->name = *name;
     for (;;) {
-        snprintf(entry->symbol, sizeof(entry->symbol), "s%d", root->strip_symbol_next++);
+        snprintf(entry->symbol, sizeof(entry->symbol), "s%s_%d",
+                 root->strip_salt, root->strip_symbol_next++);
         bool clash = false;
         for (int i = 0; i < config->keep_name_count; i++) {
             if (config->keep_names[i] != NULL &&
@@ -5522,6 +5639,11 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
     // schema globals are found by type_id, not name) and assign each
     // base name a compact symbol in source order, keeping output
     // deterministic.
+    // Struct/enum types self-register at their declaration site via
+    // strip_type_symbol(), which reads the flag and keep list from here.
+    compiler.strip_config = &config;
+    strip_make_salt(&compiler, entry_file);
+
     if (config.strip_symbols) {
         int cap = 0;
         for (int i = 0; ast.statements[i] != NULL; i++) {
@@ -5530,6 +5652,7 @@ bool compile(VM* vm, const char* source, Chunk* chunk,
                 cap += ast.statements[i]->as.var_declaration.count;
             }
         }
+
         if (cap > 0) {
             compiler.strip_names = ALLOCATE(vm, StripName, cap);
             compiler.strip_names_cap = cap;
@@ -5691,6 +5814,10 @@ cleanup_on_error:
     if (compiler.strip_names) {
         FREE_ARRAY(vm, StripName, compiler.strip_names, compiler.strip_names_cap);
         compiler.strip_names = NULL;
+    }
+    if (compiler.strip_type_names) {
+        FREE_ARRAY(vm, StripName, compiler.strip_type_names, compiler.strip_types_cap);
+        compiler.strip_type_names = NULL;
     }
 
     // NOTE: compiler.function is managed by the GC (it's in vm->objects list)

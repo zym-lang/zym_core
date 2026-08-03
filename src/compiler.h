@@ -113,7 +113,7 @@ typedef struct {
 // symbol emitted in its place.
 typedef struct {
     Token name;       // base-name token (points into the source buffer)
-    char symbol[16];  // replacement, e.g. "s17"
+    char symbol[24];  // replacement, e.g. "s3f2a_17"
 } StripName;
 
 
@@ -218,6 +218,28 @@ typedef struct Compiler {
     int strip_name_count;
     int strip_names_cap;
     int strip_symbol_next;
+
+    // Type names (struct/enum) get their OWN map: they live in a
+    // separate namespace from globals, so a `struct Point` and a
+    // `var Point` must not collapse onto one text-keyed entry.
+    StripName* strip_type_names;
+    int strip_type_name_count;
+    int strip_types_cap;
+    int strip_type_next;
+
+    // Borrowed for the duration of compile(): struct/enum declarations
+    // are collected lazily at their declaration site (they can appear at
+    // any depth), so the handlers need the strip flag and keep list.
+    const struct CompilerConfig* strip_config;
+
+    // Per-unit salt woven into every generated symbol. Without it, two
+    // independently compiled units both start numbering at 0, so their
+    // symbols collide if they are ever loaded into one VM — globals
+    // would silently clobber each other in vm->globals, and distinct
+    // struct types would satisfy the VM's name-based STRUCT_SPREAD
+    // compatibility fallback. Derived from the entry file name, so it
+    // stays deterministic.
+    char strip_salt[8];
 } Compiler;
 
 // Compiles `source` into `chunk`. `source_map`, when non-NULL, is the
