@@ -198,29 +198,13 @@ static ZymValue str_impl(ZymVM* vm, const char* format_str, ZymValue* args, int 
 
 // Convert value(s) to string with format support
 ZymValue nativeConversions_str(ZymVM* vm, ZymValue value) {
-    // If it's a string with format specifiers, process it
+    // Single-arg str() unconditionally stringifies its argument; format
+    // interpretation only makes sense in the variadic form (str(fmt, ...)).
     if (zym_isString(value)) {
-        const char* format_str = zym_asCString(value);
-
-        // Check if string contains any format specifiers
-        bool has_format = false;
-        for (const char* p = format_str; *p; p++) {
-            if (*p == '%' && *(p + 1) != '%') {
-                has_format = true;
-                break;
-            }
-        }
-
-        // If no format specifiers, just return the string as-is
-        if (!has_format) {
-            return value;
-        }
-
-        // Has format specifiers but no args - treat as format string with no arguments
-        return str_impl(vm, format_str, NULL, 0);
+        return value;
     }
 
-    // Single non-string value - convert to string using zym_valueToString
+    // Non-string value - convert to string using zym_valueToString
     ZymValue str_val = zym_valueToString(vm, value);
     if (str_val == ZYM_ERROR) {
         zym_runtimeError(vm, "str() failed to convert value to string");

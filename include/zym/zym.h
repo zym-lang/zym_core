@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // =============================================================================
 // CUSTOM ALLOCATOR (defined in allocator.h, shared with internal headers)
 // =============================================================================
@@ -16,10 +20,16 @@
 // CORE TYPES
 // =============================================================================
 
+#ifndef ZYM_VM_FWD_DECLARED
+#define ZYM_VM_FWD_DECLARED
 typedef struct VM ZymVM;
+#endif
 typedef struct Chunk ZymChunk;
-typedef struct LineMap ZymLineMap;
 typedef uint64_t ZymValue;
+
+#include "zym/sourcemap.h"
+#include "zym/diagnostics.h"
+#include "zym/frontend.h"
 
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
 #define ZYM_ERROR ((ZymValue)0x7ff8000000000005ULL)
@@ -69,12 +79,110 @@ void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data)
 ZymChunk* zym_newChunk(ZymVM* vm);
 void zym_freeChunk(ZymVM* vm, ZymChunk* chunk);
 
-ZymLineMap* zym_newLineMap(ZymVM* vm);
-void zym_freeLineMap(ZymVM* vm, ZymLineMap* map);
-
-ZymStatus zym_preprocess(ZymVM* vm, const char* source, ZymLineMap* map, const char** processedSource);
+// Preprocess `source`, returning the expanded buffer through
+// `processedSource`. If `source_map` is non-NULL and `origin_file_id`
+// is valid, each expanded line is recorded in the map so downstream
+// consumers (scanner, diagnostics, LSP) can translate expanded positions
+// back to user-visible coordinates.
+ZymStatus zym_preprocess(ZymVM* vm, const char* source,
+                         ZymSourceMap* source_map, ZymFileId origin_file_id,
+                         const char** processedSource);
 void zym_freeProcessedSource(ZymVM* vm, const char* processedSource);
-ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk, ZymLineMap* map, const char* entry_file, ZymCompilerConfig config);
+
+// Compile `source` into `chunk`. `source_map`, when non-NULL, is the
+// per-expanded-line origin table produced by `zym_preprocess`. Pass
+// NULL only when compiling raw unpreprocessed text.
+//
+// `out_tree` is the Phase 2 retained-parse-tree out-parameter.
+// Pass NULL unless you want the AST handed back to you:
+//   - Retention ON (ZYM_HAS_PARSE_TREE_RETENTION=1) + non-NULL out_tree +
+//     compile succeeded: *out_tree receives a ZymParseTree* that the
+//     caller owns and must release via zym_freeParseTree.
+//   - Any other case: *out_tree is set to NULL and today's behavior
+//     (AST freed at end of compile) applies.
+// The parameter is accepted unconditionally so host code compiles
+// against either build profile; pass NULL on MCU builds.
+ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
+                      const ZymSourceMap* source_map,
+                      const char* entry_file, ZymCompilerConfig config,
+                      ZymParseTree** out_tree);
+
+#if ZYM_HAS_PARSE_TREE_RETENTION
+// Phase 3 — parse-only entry point (ZYM_COMPILE_PARSE_ONLY).
+//
+// Run scan + preprocess + parse only. No bytecode is produced, no Chunk
+// is touched. On success, `*out_tree` receives a non-NULL ZymParseTree*
+// that the caller owns (release via `zym_freeParseTree`); on parse
+// failure, returns ZYM_STATUS_COMPILE_ERROR, leaves `*out_tree == NULL`,
+// and pushes diagnostics to the VM's sink (drain with
+// `zymGetDiagnostics()`).
+//
+// `source_map` must be the map produced by `zym_preprocess` (or NULL
+// when compiling raw, unpreprocessed text). Semantically equivalent to
+// `zym_compile(...)` up to and including parsing, then stopping before
+// any codegen — so the retained tree, trivia buffer, and all spans are
+// identical to what an EXECUTE-mode compile would hand back.
+//
+// Only declared when ZYM_HAS_PARSE_TREE_RETENTION=1; MCU builds cannot
+// call it (compile error).
+ZymStatus zym_parseOnly(ZymVM* vm, const char* source,
+                        const ZymSourceMap* source_map,
+                        const char* entry_file,
+                        ZymParseTree** out_tree);
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+// Phase 4 — check entry point (ZYM_COMPILE_CHECK).
+//
+// Run scan + preprocess + parse, then the parallel resolver. On success
+// `*out_tree` receives the retained ZymParseTree* and `*out_table`
+// receives the ZymSymbolTable* — both caller-owned. Release them with
+// `zym_freeParseTree` and `zym_freeSymbolTable` respectively.
+//
+// The resolver is a *parallel* pass: it never influences code
+// generation and is never invoked from `zym_compile`. It exists purely
+// for tooling consumers (LSP, docs, outline).
+//
+// 4.1a behavior: the resolver records top-level declarations only
+// (var / func / struct / enum). Lexical scopes, references, and
+// closures arrive in 4.1b / 4.1c.
+//
+// Only declared when ZYM_HAS_SYMBOL_TABLE=1 (which implies
+// ZYM_HAS_PARSE_TREE_RETENTION=1); MCU builds cannot call it (compile
+// error).
+ZymStatus zym_check(ZymVM* vm, const char* source,
+                    const ZymSourceMap* source_map,
+                    const char* entry_file,
+                    ZymParseTree** out_tree,
+                    ZymSymbolTable** out_table);
+#endif
+
+// =============================================================================
+// COOPERATIVE CANCELLATION (Phase 1.5)
+// =============================================================================
+//
+// The frontend (parser + compiler) polls vm->compile_cancelled at every
+// statement / declaration boundary. An external thread (e.g. an LSP
+// request that has been superseded) may call zym_requestCancel(vm) at
+// any time to ask an in-flight compile to abort cooperatively. The
+// aborted compile returns ZYM_STATUS_COMPILE_ERROR and pushes a single
+// "Compilation cancelled." diagnostic; the host can distinguish cancel
+// from a genuine compile error by calling zym_wasCancelled(vm).
+//
+// The flag is NOT cleared automatically at the start of a new compile
+// (the API is explicit to avoid hiding a stale cancel). Call
+// zym_clearCancel(vm) before the next compile. Writes from one thread
+// are observed by the compile thread through the underlying
+// `volatile sig_atomic_t`; this is sufficient for the one-way
+// 0 -> 1 signal the parser/compiler need.
+//
+// NOTE: This API only governs the compile pipeline. It does not
+// interrupt bytecode execution; runtime interruption is a separate
+// concern handled by the preemption machinery.
+void zym_requestCancel(ZymVM* vm);
+void zym_clearCancel(ZymVM* vm);
+bool zym_wasCancelled(const ZymVM* vm);
+
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
@@ -292,8 +400,24 @@ int zym_enumVariantIndex(ZymVM* vm, ZymValue enumVal);           // 0-based vari
 // CALLING SCRIPT FUNCTIONS FROM C
 // =============================================================================
 
-// Check if a function exists
+// Check if a function exists at the exact fixed-arity slot `name@arity`.
+// This is the strict slot-presence question: does `funcName@arity` literally
+// resolve to a callable? Variadic mangling (`name@vF`) is NOT consulted.
 bool zym_hasFunction(ZymVM* vm, const char* funcName, int arity);
+
+// Check if any callable with the given base name is reachable in the VM's
+// globals — at any fixed arity (`name@0..MAX_NATIVE_ARITY`) or any variadic
+// prefix (`name@v0..vMAX_NATIVE_ARITY`). Mirrors how the compiler's own
+// dispatcher discovers a base name; useful for "does this name resolve at
+// all?" introspection from embedders.
+bool zym_hasAnyFunction(ZymVM* vm, const char* funcName);
+
+// Check if calling `funcName` with exactly `argc` args can dispatch without
+// raising a runtime error. Returns true iff either:
+//   (a) `funcName@argc` is bound (fixed-arity exact match), or
+//   (b) some `funcName@vF` is bound where `argc >= F` (variadic acceptance).
+// This is the question users actually want answered when guarding a call.
+bool zym_canCallWith(ZymVM* vm, const char* funcName, int argc);
 
 // Call a script function with varargs
 // Example: zym_call(vm, "add", 2, zym_newNumber(5), zym_newNumber(3))
@@ -327,4 +451,8 @@ ZymValue zym_peekRoot(ZymVM* vm, int depth);  // 0 = top of root stack
 // Report a runtime error from native code
 // This will print the error and set the VM to error state
 void zym_runtimeError(ZymVM* vm, const char* format, ...);
+
+#ifdef __cplusplus
+}
+#endif
 

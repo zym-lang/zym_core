@@ -44,9 +44,9 @@ void freeValueArray(VM* vm, ValueArray* array) {
     initValueArray(array);
 }
 
-static void printDouble(double num) {
+static void printDouble(FILE* f, double num) {
     if (floor(num) == num && fabs(num) < 1e15) {
-        printf("%.0f", num);
+        fprintf(f, "%.0f", num);
     } else {
         char buffer[64];
         snprintf(buffer, sizeof(buffer), "%.17f", num);
@@ -62,17 +62,17 @@ static void printDouble(double num) {
 
             }
         }
-        printf("%s", buffer);
+        fprintf(f, "%s", buffer);
 
     }
 }
 
 // Helper for printValue with cycle detection
-static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
+static void printValueHelper(VM* vm, FILE* f, Value value, Obj** visited, int depth) {
     if (IS_BOOL(value)) {
-        printf(AS_BOOL(value) ? "true" : "false");
+        fprintf(f, AS_BOOL(value) ? "true" : "false");
     } else if (IS_NULL(value)) {
-        printf("null");
+        fprintf(f, "null");
     } else if (IS_ENUM(value)) {
         int type_id = ENUM_TYPE_ID(value);
         int variant_idx = ENUM_VARIANT(value);
@@ -92,29 +92,29 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
 
             if (schema != NULL && variant_idx >= 0 && variant_idx < schema->variant_count) {
                 ObjString* variant_name = schema->variant_names[variant_idx];
-                printf("%.*s.%.*s",
+                fprintf(f, "%.*s.%.*s",
                        schema->name->length, schema->name->chars,
                        variant_name->length, variant_name->chars);
             } else {
-                printf("<enum#%d.%d>", type_id, variant_idx);
+                fprintf(f, "<enum#%d.%d>", type_id, variant_idx);
             }
         } else {
-            printf("<enum#%d.%d>", type_id, variant_idx);
+            fprintf(f, "<enum#%d.%d>", type_id, variant_idx);
         }
     } else if (IS_DOUBLE(value)) {
-        printDouble(AS_DOUBLE(value));
+        printDouble(f, AS_DOUBLE(value));
     } else if (IS_OBJ(value)) {
         Obj* obj = AS_OBJ(value);
 
         // Check depth limit to prevent stack overflow
         if (depth >= 100) {
-            printf("...");
+            fprintf(f, "...");
             return;
         }
 
         for (int i = 0; i < depth; i++) {
             if (visited[i] == obj) {
-                printf("...");
+                fprintf(f, "...");
                 return;
             }
         }
@@ -124,73 +124,73 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
         switch (obj->type) {
             case OBJ_LIST: {
                     ObjList* list = AS_LIST(value);
-                    printf("[");
+                    fprintf(f, "[");
                     for (int i = 0; i < list->items.count; i++) {
-                        printValueHelper(vm, list->items.values[i], visited, depth + 1);
+                        printValueHelper(vm, f, list->items.values[i], visited, depth + 1);
                         if (i < list->items.count - 1) {
-                            printf(", ");
+                            fprintf(f, ", ");
                         }
                     }
-                    printf("]");
+                    fprintf(f, "]");
                     break;
             }
             case OBJ_CLOSURE: {
                     ObjFunction* fn = AS_CLOSURE(value)->function;
                     if (fn->name) {
-                        printf("<closure %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
+                        fprintf(f, "<closure %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
                     } else {
-                        printf("<closure /%d>", fn->arity);
+                        fprintf(f, "<closure /%d>", fn->arity);
                     }
                     break;
             }
             case OBJ_FUNCTION: {
                     ObjFunction* fn = AS_FUNCTION(value);
                     if (fn->name) {
-                        printf("<fn %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
+                        fprintf(f, "<fn %.*s/%d>", fn->name->length, fn->name->chars, fn->arity);
                     } else {
-                        printf("<fn /%d>", fn->arity);
+                        fprintf(f, "<fn /%d>", fn->arity);
                     }
                     break;
             }
             case OBJ_NATIVE_FUNCTION: {
                     ObjNativeFunction* native = AS_NATIVE_FUNCTION(value);
                     if (native->name) {
-                        printf("<native fn %.*s/%d>", native->name->length, native->name->chars, native->arity);
+                        fprintf(f, "<native fn %.*s/%d>", native->name->length, native->name->chars, native->arity);
                     } else {
-                        printf("<native fn /%d>", native->arity);
+                        fprintf(f, "<native fn /%d>", native->arity);
                     }
                     break;
             }
             case OBJ_NATIVE_CONTEXT:
-                    printf("<native context>");
+                    fprintf(f, "<native context>");
                     break;
             case OBJ_NATIVE_CLOSURE: {
                     ObjNativeClosure* closure = AS_NATIVE_CLOSURE(value);
                     if (closure->name) {
-                        printf("<native closure %.*s/%d>", closure->name->length, closure->name->chars, closure->arity);
+                        fprintf(f, "<native closure %.*s/%d>", closure->name->length, closure->name->chars, closure->arity);
                     } else {
-                        printf("<native closure /%d>", closure->arity);
+                        fprintf(f, "<native closure /%d>", closure->arity);
                     }
                     break;
             }
             case OBJ_STRING:
-                printf("%.*s", ((ObjString*)obj)->length, ((ObjString*)obj)->chars);
+                fprintf(f, "%.*s", ((ObjString*)obj)->length, ((ObjString*)obj)->chars);
                 break;
             case OBJ_UPVALUE:
-                printf("<upvalue>");
+                fprintf(f, "<upvalue>");
                 break;
             case OBJ_INT64:
-                printf("%lld", ((ObjInt64*)obj)->value);
+                fprintf(f, "%lld", ((ObjInt64*)obj)->value);
                 break;
             case OBJ_DISPATCHER:
-                printf("<overloaded function>");
+                fprintf(f, "<overloaded function>");
                 break;
             case OBJ_PROMPT_TAG: {
                 ObjPromptTag* tag = AS_PROMPT_TAG(value);
                 if (tag->name != NULL) {
-                    printf("<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
+                    fprintf(f, "<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
                 } else {
-                    printf("<prompt-tag #%" PRIu32 ">", tag->id);
+                    fprintf(f, "<prompt-tag #%" PRIu32 ">", tag->id);
                 }
                 break;
             }
@@ -198,33 +198,33 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
                 ObjContinuation* cont = AS_CONTINUATION(value);
                 const char* state_str = cont->state == CONT_VALID ? "valid" :
                                         cont->state == CONT_CONSUMED ? "consumed" : "invalid";
-                printf("<continuation %s, %d frames>", state_str, cont->frame_count);
+                fprintf(f, "<continuation %s, %d frames>", state_str, cont->frame_count);
                 break;
             }
             case OBJ_MAP: {
                     ObjMap* map = AS_MAP(value);
-                    printf("{");
+                    fprintf(f, "{");
                     int printed = 0;
                     for (int i = 0; i < map->table.capacity; i++) {
                         Entry* entry = &map->table.entries[i];
                         if (entry->key != NULL) {
                             if (printed > 0) {
-                                printf(", ");
+                                fprintf(f, ", ");
                             }
-                            printf("\"%.*s\": ", entry->key->length, entry->key->chars);
-                            printValueHelper(vm, entry->value, visited, depth + 1);
+                            fprintf(f, "\"%.*s\": ", entry->key->length, entry->key->chars);
+                            printValueHelper(vm, f, entry->value, visited, depth + 1);
                             printed++;
                         }
                     }
-                    printf("}");
+                    fprintf(f, "}");
                     break;
             }
             case OBJ_STRUCT_SCHEMA: {
                     ObjStructSchema* schema = AS_STRUCT_SCHEMA(value);
                     if (schema->name != NULL) {
-                        printf("<struct %.*s>", schema->name->length, schema->name->chars);
+                        fprintf(f, "<struct %.*s>", schema->name->length, schema->name->chars);
                     } else {
-                        printf("<struct schema@%p>", (void*)schema);
+                        fprintf(f, "<struct schema@%p>", (void*)schema);
                     }
                     break;
             }
@@ -232,25 +232,25 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
                     ObjStructInstance* instance = AS_STRUCT_INSTANCE(value);
                     // Use cached field_count for safety during GC
                     if (instance->schema != NULL && instance->schema->name != NULL) {
-                        printf("<struct %.*s>", instance->schema->name->length, instance->schema->name->chars);
+                        fprintf(f, "<struct %.*s>", instance->schema->name->length, instance->schema->name->chars);
                     } else {
-                        printf("<struct instance@%p>", (void*)instance);
+                        fprintf(f, "<struct instance@%p>", (void*)instance);
                     }
                     break;
             }
             case OBJ_ENUM_SCHEMA: {
                     ObjEnumSchema* schema = AS_ENUM_SCHEMA(value);
                     if (schema->name != NULL) {
-                        printf("<enum %.*s { ", schema->name->length, schema->name->chars);
+                        fprintf(f, "<enum %.*s { ", schema->name->length, schema->name->chars);
                         for (int i = 0; i < schema->variant_count; i++) {
-                            if (i > 0) printf(", ");
+                            if (i > 0) fprintf(f, ", ");
                             if (schema->variant_names && schema->variant_names[i] != NULL) {
-                                printf("%.*s", schema->variant_names[i]->length, schema->variant_names[i]->chars);
+                                fprintf(f, "%.*s", schema->variant_names[i]->length, schema->variant_names[i]->chars);
                             }
                         }
-                        printf(" }>");
+                        fprintf(f, " }>");
                     } else {
-                        printf("<enum schema@%p>", (void*)schema);
+                        fprintf(f, "<enum schema@%p>", (void*)schema);
                     }
                     break;
             }
@@ -258,9 +258,13 @@ static void printValueHelper(VM* vm, Value value, Obj** visited, int depth) {
     }
 }
 
-void printValue(VM* vm, Value value) {
+void fprintValue(VM* vm, FILE* file, Value value) {
     Obj* visited[100];
-    printValueHelper(vm, value, visited, 0);
+    printValueHelper(vm, file, value, visited, 0);
+}
+
+void printValue(VM* vm, Value value) {
+    fprintValue(vm, stdout, value);
 }
 
 Value cloneValue(VM* vm, Value value) {

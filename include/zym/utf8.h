@@ -1,9 +1,12 @@
 #ifndef zym_utf8_h
 #define zym_utf8_h
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define UTF8_MAX_CODEPOINT 0x10FFFF
 #define UTF8_REPLACEMENT_CHAR 0xFFFD
@@ -24,5 +27,9 @@ bool utf8_substring(const char* str, int byte_len,
 
 char* utf8_toupper(const char* str, int byte_len, int* out_len);
 char* utf8_tolower(const char* str, int byte_len, int* out_len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

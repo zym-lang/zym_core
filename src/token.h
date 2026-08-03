@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+#include "./source_file.h"
+
 typedef enum {
     // Single-character tokens.
     TOKEN_LEFT_PAREN,
@@ -92,7 +94,45 @@ typedef enum {
 
 typedef struct {
     TokenType type;
+
+    // Legacy fields (kept for this PR so scanner/parser/compiler/debug
+    // consumers do not need to be rewritten in lockstep with 1.1). These
+    // are a derived view of (fileId, startByte, length, startLine):
+    //   start  == sfr_get(&vm->source_files, fileId)->bytes + startByte
+    //   line   == startLine
+    // The scanner populates both the legacy and new fields; the parser /
+    // compiler / debug consumers continue reading the legacy fields.
     const char* start;
     int length;
     int line;
+
+    // Phase 1.1: canonical byte-offset span into the file identified by
+    // fileId. Columns are counted in UTF-8 bytes (not code points);
+    // position-encoding translation is done on demand by the LSP layer.
+    ZymFileId fileId;
+    int startByte;
+    int startLine;
+    int startColumn;
+    int endLine;
+    int endColumn;
+
+    // Phase 1.1: best-effort origin mapping. For tokens scanned directly
+    // from user source these are equal to (fileId, startByte, length).
+    // For tokens synthesized by the preprocessor (macro expansions,
+    // pasted #include content) these point to the user-visible origin
+    // bytes that should be reported in diagnostics and hover. Byte-
+    // granular origin tracking arrives with SourceMap in Phase 1.2; in
+    // 1.1 the preprocessor may leave originStartByte/originLength as -1
+    // when no exact mapping is available.
+    ZymFileId originFileId;
+    int originStartByte;
+    int originLength;
 } Token;
+
+// Derived accessor for the token's lexeme bytes. In this PR it is
+// equivalent to `tok->start`, but consumers are encouraged to use this
+// helper so a later PR can retire the raw `start` pointer field without
+// another sweep.
+static inline const char* tokenLexeme(const Token* tok) {
+    return tok->start;
+}

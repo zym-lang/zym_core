@@ -13,6 +13,8 @@ ZymValue nativeList_remove(ZymVM* vm, ZymValue list, ZymValue indexVal);
 ZymValue nativeList_reverse(ZymVM* vm, ZymValue list);
 ZymValue nativeList_sort(ZymVM* vm, ZymValue list);
 ZymValue nativeList_join(ZymVM* vm, ZymValue list, ZymValue separator);
+ZymValue nativeList_fill(ZymVM* vm, ZymValue list, ZymValue value);
+ZymValue nativeList_fillRange(ZymVM* vm, ZymValue list, ZymValue startVal, ZymValue lenVal, ZymValue value);
 
 // Register list natives into the VM
 void registerListNatives(VM* vm);
