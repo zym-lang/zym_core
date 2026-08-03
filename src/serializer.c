@@ -70,7 +70,18 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             writeBytes(vm, out, &fn->spill_count, sizeof(int));
             writeBytes(vm, out, &fn->upvalue_count, sizeof(int));
             if (fn->upvalue_count > 0) {
-                writeBytes(vm, out, fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
+                // Write zeroed copies: the in-memory Upvalue carries
+                // struct padding and a compile-time ObjStructSchema*
+                // whose raw pointer value must not leak into the
+                // bytecode (it made output nondeterministic). Only
+                // index/is_local are meaningful on the wire.
+                for (int u = 0; u < fn->upvalue_count; u++) {
+                    Upvalue wire;
+                    memset(&wire, 0, sizeof(Upvalue));
+                    wire.index = fn->upvalues[u].index;
+                    wire.is_local = fn->upvalues[u].is_local;
+                    writeBytes(vm, out, &wire, sizeof(Upvalue));
+                }
             }
 
             int nameLen = (fn->name ? fn->name->byte_length : -1);
@@ -253,6 +264,11 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                     fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);
                     fn->upvalue_capacity = fn->upvalue_count;
                     READ_BYTES_OR_FAIL(fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
+                    // struct_type is a compile-time pointer; whatever
+                    // bytes the file carries are meaningless here.
+                    for (int u = 0; u < fn->upvalue_count; u++) {
+                        fn->upvalues[u].struct_type = NULL;
+                    }
                 }
 
                 int nameLen = -1;
@@ -436,6 +452,10 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
     if (line_count > 0) {
         if (line_count != instruction_count) return false;
         READ_BYTES(chunk->lines, sizeof(int) * (size_t)line_count);
+    } else if (instruction_count > 0) {
+        // Stripped bytecode carries no line table; zero it so readers
+        // (e.g. the disassembler) don't see uninitialized memory.
+        memset(chunk->lines, 0, sizeof(int) * (size_t)instruction_count);
     }
 
     return true;
