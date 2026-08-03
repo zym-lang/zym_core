@@ -1,6 +1,5 @@
 #pragma once
 
-#include <stdio.h>
 #include <string.h>
 #include "./common.h"
 
@@ -65,6 +64,5 @@ void initValueArray(ValueArray* array);
 void writeValueArray(VM* vm, ValueArray* array, Value value);
 void freeValueArray(VM* vm, ValueArray* array);
 void printValue(VM* vm, Value value);
-void fprintValue(VM* vm, FILE* file, Value value);
 Value cloneValue(VM* vm, Value value);
 Value deepCloneValue(VM* vm, Value value);

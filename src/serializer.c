@@ -23,14 +23,11 @@ static void writeBytes(VM* vm, OutputBuffer* out, const void* data, size_t size)
 
 void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* out) {
     const char magic[] = "ZYM\0";
-    // Format version bumped 1 → 2 when ObjFunction gained `spill_count`
-    // for the register-spilling feature. Loaders that read version 1
-    // implicitly assume spill_count == 0.
-    const uint8_t version = 2;
+    const uint8_t version = 1;
     writeBytes(vm, out, magic, 4);
     writeBytes(vm, out, &version, sizeof(uint8_t));
 
-    int entryFileLen = (vm->entry_file ? vm->entry_file->byte_length : -1);
+    int entryFileLen = (vm->entry_file ? vm->entry_file->length : -1);
     writeBytes(vm, out, &entryFileLen, sizeof(int));
     if (entryFileLen > 0) {
         writeBytes(vm, out, vm->entry_file->chars, (size_t)entryFileLen);
@@ -49,8 +46,8 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             uint8_t tag = TYPE_TAG_STRING;
             writeBytes(vm, out, &tag, sizeof(uint8_t));
             ObjString* s = AS_STRING(value);
-            writeBytes(vm, out, &s->byte_length, sizeof(int));
-            writeBytes(vm, out, s->chars, (size_t)s->byte_length);
+            writeBytes(vm, out, &s->length, sizeof(int));
+            writeBytes(vm, out, s->chars, (size_t)s->length);
         } else if (IS_NULL(value)) {
             uint8_t tag = TYPE_TAG_NULL;
             writeBytes(vm, out, &tag, sizeof(uint8_t));
@@ -67,30 +64,18 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             uint8_t variadic_flag = fn->is_variadic ? 1 : 0;
             writeBytes(vm, out, &variadic_flag, sizeof(uint8_t));
             writeBytes(vm, out, &fn->max_regs, sizeof(int));
-            writeBytes(vm, out, &fn->spill_count, sizeof(int));
             writeBytes(vm, out, &fn->upvalue_count, sizeof(int));
             if (fn->upvalue_count > 0) {
-                // Write zeroed copies: the in-memory Upvalue carries
-                // struct padding and a compile-time ObjStructSchema*
-                // whose raw pointer value must not leak into the
-                // bytecode (it made output nondeterministic). Only
-                // index/is_local are meaningful on the wire.
-                for (int u = 0; u < fn->upvalue_count; u++) {
-                    Upvalue wire;
-                    memset(&wire, 0, sizeof(Upvalue));
-                    wire.index = fn->upvalues[u].index;
-                    wire.is_local = fn->upvalues[u].is_local;
-                    writeBytes(vm, out, &wire, sizeof(Upvalue));
-                }
+                writeBytes(vm, out, fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
             }
 
-            int nameLen = (fn->name ? fn->name->byte_length : -1);
+            int nameLen = (fn->name ? fn->name->length : -1);
             writeBytes(vm, out, &nameLen, sizeof(int));
             if (nameLen > 0) {
                 writeBytes(vm, out, fn->name->chars, (size_t)nameLen);
             }
 
-            int modNameLen = (fn->module_name ? fn->module_name->byte_length : -1);
+            int modNameLen = (fn->module_name ? fn->module_name->length : -1);
             writeBytes(vm, out, &modNameLen, sizeof(int));
             if (modNameLen > 0) {
                 writeBytes(vm, out, fn->module_name->chars, (size_t)modNameLen);
@@ -108,13 +93,13 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             writeBytes(vm, out, &tag, sizeof(uint8_t));
 
             ObjStructSchema* schema = AS_STRUCT_SCHEMA(value);
-            int nameLen = schema->name->byte_length;
+            int nameLen = schema->name->length;
             writeBytes(vm, out, &nameLen, sizeof(int));
             writeBytes(vm, out, schema->name->chars, (size_t)nameLen);
 
             writeBytes(vm, out, &schema->field_count, sizeof(int));
             for (int i = 0; i < schema->field_count; i++) {
-                int fieldLen = schema->field_names[i]->byte_length;
+                int fieldLen = schema->field_names[i]->length;
                 writeBytes(vm, out, &fieldLen, sizeof(int));
                 writeBytes(vm, out, schema->field_names[i]->chars, (size_t)fieldLen);
             }
@@ -123,14 +108,14 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
             writeBytes(vm, out, &tag, sizeof(uint8_t));
 
             ObjEnumSchema* schema = AS_ENUM_SCHEMA(value);
-            int nameLen = schema->name->byte_length;
+            int nameLen = schema->name->length;
             writeBytes(vm, out, &nameLen, sizeof(int));
             writeBytes(vm, out, schema->name->chars, (size_t)nameLen);
 
             writeBytes(vm, out, &schema->type_id, sizeof(int));
             writeBytes(vm, out, &schema->variant_count, sizeof(int));
             for (int i = 0; i < schema->variant_count; i++) {
-                int variantLen = schema->variant_names[i]->byte_length;
+                int variantLen = schema->variant_names[i]->length;
                 writeBytes(vm, out, &variantLen, sizeof(int));
                 writeBytes(vm, out, schema->variant_names[i]->chars, (size_t)variantLen);
             }
@@ -180,9 +165,7 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
 
     uint8_t version = 0;
     READ_BYTES(&version, sizeof(uint8_t));
-    // v1 omits the spill_count field; v2+ writes it after max_regs.
-    // Older v1 packages cleanly upgrade by treating spill_count as 0.
-    if (version != 1 && version != 2) return false;
+    if (version != 1) return false;
 
     int entryFileLen = 0;
     READ_BYTES(&entryFileLen, sizeof(int));
@@ -254,21 +237,11 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
                 READ_BYTES_OR_FAIL(&variadic_flag, sizeof(uint8_t));
                 fn->is_variadic = (variadic_flag != 0);
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
-                if (version >= 2) {
-                    READ_BYTES_OR_FAIL(&fn->spill_count, sizeof(int));
-                } else {
-                    fn->spill_count = 0;
-                }
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
                 if (fn->upvalue_count > 0) {
                     fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);
                     fn->upvalue_capacity = fn->upvalue_count;
                     READ_BYTES_OR_FAIL(fn->upvalues, sizeof(Upvalue) * fn->upvalue_count);
-                    // struct_type is a compile-time pointer; whatever
-                    // bytes the file carries are meaningless here.
-                    for (int u = 0; u < fn->upvalue_count; u++) {
-                        fn->upvalues[u].struct_type = NULL;
-                    }
                 }
 
                 int nameLen = -1;
@@ -452,10 +425,6 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
     if (line_count > 0) {
         if (line_count != instruction_count) return false;
         READ_BYTES(chunk->lines, sizeof(int) * (size_t)line_count);
-    } else if (instruction_count > 0) {
-        // Stripped bytecode carries no line table; zero it so readers
-        // (e.g. the disassembler) don't see uninitialized memory.
-        memset(chunk->lines, 0, sizeof(int) * (size_t)instruction_count);
     }
 
     return true;
