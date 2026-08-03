@@ -31,8 +31,7 @@ typedef enum {
     EXPR_POST_INC,
     EXPR_PRE_DEC,
     EXPR_POST_DEC,
-    EXPR_SPREAD,
-    EXPR_ERROR
+    EXPR_SPREAD
 } ExprType;
 
 typedef struct { Expr* target; Expr* value; } AssignExpr;
@@ -55,13 +54,6 @@ typedef struct { Expr* target; } PostIncExpr;
 typedef struct { Expr* target; } PreDecExpr;
 typedef struct { Expr* target; } PostDecExpr;
 typedef struct { Expr* expression; } SpreadExpr;
-/*
- * EXPR_ERROR: placeholder emitted by the parser when an expression could not
- * be parsed. Carries the bracketing tokens covering the skipped range so
- * diagnostics / LSP tooling can reconstruct the span. Compiler must never
- * reach codegen on these; parser currently discards the AST on any error.
- */
-typedef struct { Token start_token; Token end_token; } ErrorExpr;
 
 struct Expr {
     ExprType type;
@@ -87,7 +79,6 @@ struct Expr {
         PreDecExpr   pre_dec;
         PostDecExpr  post_dec;
         SpreadExpr   spread;
-        ErrorExpr    error;
     } as;
 };
 
@@ -108,8 +99,7 @@ typedef enum {
     STMT_ENUM_DECLARATION,
     STMT_LABEL,
     STMT_GOTO,
-    STMT_SWITCH,
-    STMT_ERROR
+    STMT_SWITCH
 } StmtType;
 
 typedef struct {
@@ -220,17 +210,6 @@ typedef struct {
     int default_index;  // -1 if no default
 } SwitchStmt;
 
-/*
- * STMT_ERROR: placeholder emitted by the parser when a top-level declaration
- * or statement could not be parsed and the parser synchronized past it. The
- * start/end tokens bracket the skipped span (start = token before sync,
- * end = token at which parsing resumed). Carries no children.
- */
-typedef struct {
-    Token start_token;
-    Token end_token;
-} ErrorStmt;
-
 struct Stmt {
     StmtType type;
     int line;
@@ -251,7 +230,6 @@ struct Stmt {
         LabelStmt            label;
         GotoStmt             goto_stmt;
         SwitchStmt           switch_stmt;
-        ErrorStmt            error;
     } as;
 };
 
@@ -276,7 +254,6 @@ Expr* new_post_inc_expr(VM* vm, Expr* target, Token token);
 Expr* new_pre_dec_expr(VM* vm, Expr* target, Token token);
 Expr* new_post_dec_expr(VM* vm, Expr* target, Token token);
 Expr* new_spread_expr(VM* vm, Expr* expression, Token token);
-Expr* new_error_expr(VM* vm, Token start_token, Token end_token);
 Expr* clone_expr(VM* vm, Expr* expr);
 void free_expr(VM* vm, Expr* expr);
 
@@ -297,5 +274,4 @@ Stmt* new_enum_decl_stmt(VM* vm, Token name, Token* variants, int variant_count,
 Stmt* new_label_stmt(VM* vm, Token label_name);
 Stmt* new_goto_stmt(VM* vm, Token keyword, Token target_label);
 Stmt* new_switch_stmt(VM* vm, Expr* expression, CaseClause* cases, int case_count, int case_capacity, int default_index, Token keyword);
-Stmt* new_error_stmt(VM* vm, Token start_token, Token end_token);
 void free_stmt(VM* vm, Stmt* stmt);

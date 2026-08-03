@@ -63,7 +63,6 @@ void initVM(VM* vm) {
     vm->stack_capacity = STACK_INITIAL;
     vm->stack = (Value*)reallocate(vm, NULL, 0, sizeof(Value) * vm->stack_capacity);
     vm->stack_top = 0;
-    vm->call_arg_top = 0;
     for (int i = 0; i < vm->stack_capacity; i++) vm->stack[i] = NULL_VAL;
 
     initTable(&vm->globals);
@@ -94,13 +93,6 @@ void initVM(VM* vm) {
 
     vm->error_callback = NULL;
     vm->error_user_data = NULL;
-
-    sfr_init(&vm->source_files);
-    diagsink_init(&vm->diagnostics);
-    vm->compile_cancelled = 0;
-
-    vm->current_import_stack = NULL;
-    vm->current_import_count = 0;
 
     vm->gc_enabled = true;
     // Recalculate debt: headroom = next_gc - bytes_allocated, clamped to INT32_MAX
@@ -143,9 +135,6 @@ void freeVM(VM* vm) {
     vm->stack = NULL;
     vm->stack_capacity = 0;
     vm->stack_top = 0;
-
-    diagsink_free(vm, &vm->diagnostics);
-    sfr_free(vm, &vm->source_files);
 }
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value) {
@@ -561,7 +550,7 @@ static bool pushPreemptFrame(VM* vm) {
     }
 
     int callee_slot = vm->stack_top;
-    int needed_top = callee_slot + function->max_regs + function->spill_count;
+    int needed_top = callee_slot + function->max_regs;
 
     if (!growStackForCall(vm, needed_top, NULL)) {
         return false;
@@ -704,10 +693,6 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(BRANCH_GE_L),
         JUMP_ENTRY(CALL),
         JUMP_ENTRY(CALL_SELF),
-        JUMP_ENTRY(CALL_ARG_PREP),
-        JUMP_ENTRY(CALL_ARG_SPREAD),
-        JUMP_ENTRY(CALL_ARG_PUSH),
-        JUMP_ENTRY(CALL_VAR),
         JUMP_ENTRY(TAIL_CALL),
         JUMP_ENTRY(TAIL_CALL_SELF),
         JUMP_ENTRY(RET),
@@ -747,8 +732,6 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(POST_INC),
         JUMP_ENTRY(PRE_DEC),
         JUMP_ENTRY(POST_DEC),
-        JUMP_ENTRY(SPILL_LOAD),
-        JUMP_ENTRY(SPILL_STORE),
     };
 #undef JUMP_ENTRY
 
@@ -760,28 +743,12 @@ static InterpretResult run(VM* vm) {
     register Value* constants = vm->chunk ? vm->chunk->constants.values : NULL;
     register uint32_t instr = 0;
     register Value* bp = stack + base;  // base pointer for direct register access
-    // Spill-area base pointer. The spill region lives at bp[max_regs..],
-    // emitted only inside ObjFunction bodies (top-level chunks never spill),
-    // so we read it from the current frame's function when one exists. At
-    // the top level (frame_count == 0) we leave sp == bp; SPILL_LOAD/STORE
-    // never execute on the top-level chunk, so the value is unused.
-    register Value* sp = (vm->current_frame && vm->current_frame->closure)
-        ? bp + vm->current_frame->closure->function->max_regs
-        : bp;
 
     // Sync locals back to VM struct before calls that read vm->ip/cur_base
 #define STORE_IP()    (vm->ip = ip)
 #define STORE_STATE() do { vm->ip = ip; vm->cur_base = base; } while(0)
-    // Reload locals from VM struct after frame changes or stack reallocation.
-    // RELOAD_SP() recomputes the spill base from the current frame; callers
-    // that know they kept the same frame (just GC stack relocation) should
-    // use RELOAD_STACK() instead, which preserves sp's offset from bp.
-#define RELOAD_SP() do { \
-    sp = (vm->current_frame && vm->current_frame->closure) \
-        ? bp + vm->current_frame->closure->function->max_regs \
-        : bp; \
-} while(0)
-#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; RELOAD_SP(); } while(0)
+    // Reload locals from VM struct after frame changes or stack reallocation
+#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; } while(0)
 
 #define OP(c) CASE_##c:
 #define DISPATCH() do { \
@@ -795,15 +762,7 @@ static InterpretResult run(VM* vm) {
     goto *dispatch_table[OPCODE(instr)]; \
 } while(0)
 #define CUR_BASE() (base)
-    // GC may relocate the value stack; bp and sp both shift by the same
-    // delta (the current frame's function hasn't changed, so max_regs is
-    // unchanged — sp's offset from bp is invariant).
-#define RELOAD_STACK() do { \
-    Value* _old_bp = bp; \
-    stack = vm->stack; \
-    bp = stack + base; \
-    sp = bp + (sp - _old_bp); \
-} while(0)
+#define RELOAD_STACK() do { stack = vm->stack; bp = stack + base; } while(0)
 #define BINARY_OP(op) \
     do { \
         Value vb = bp[REG_B(instr)]; \
@@ -2255,11 +2214,8 @@ static InterpretResult run(VM* vm) {
             }
 
             // Calculate required stack size and grow if needed
-            // Frame layout: [regs 0..max_regs) | [spill 0..spill_count) | [variadic extras transiently above]
-            // PACK_REST runs at function entry before any SPILL op, so the
-            // spill area and the variadic-extras region never alias in time.
             // For variadic functions, extra args beyond arity occupy stack slots too
-            int needed_top = callee_slot + function->max_regs + function->spill_count;
+            int needed_top = callee_slot + function->max_regs;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 int extra = arg_count - function->arity;
                 needed_top += extra;
@@ -2288,7 +2244,6 @@ static InterpretResult run(VM* vm) {
             vm->current_frame = frame;
             base = callee_slot;
             bp = stack + base;
-            sp = bp + function->max_regs;  // spill base for the callee frame
             // Enter callee
             vm->chunk = &function->chunk;
             constants = vm->chunk->constants.values;
@@ -2434,7 +2389,7 @@ static InterpretResult run(VM* vm) {
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        int needed_top = callee_slot + function->max_regs + function->spill_count;
+        int needed_top = callee_slot + function->max_regs;
         if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
             if (!growStackForCall(vm, needed_top, NULL)) {
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
@@ -2457,91 +2412,8 @@ static InterpretResult run(VM* vm) {
         vm->current_frame = frame;
         base = callee_slot;
         bp = stack + base;
-        sp = bp + function->max_regs;  // spill base for the CALL_SELF callee
         ip = function->chunk.code;
         DISPATCH();
-    }
-    OP(CALL_ARG_PREP) {
-        // Initialize the spread-call argument cursor to point at the slot
-        // immediately after the n_fixed fixed args already laid out by the
-        // compiler at [call_base+1 .. call_base+n_fixed].
-        int call_base = base + REG_A(instr);
-        uint16_t n_fixed = REG_Bx(instr);
-        vm->call_arg_top = call_base + 1 + n_fixed;
-        // Track in stack_top so GC sees the pre-laid-out fixed args as roots
-        // even if call_arg_top later grows past stack_top via spreads.
-        if (vm->call_arg_top > vm->stack_top) {
-            vm->stack_top = vm->call_arg_top;
-        }
-        DISPATCH();
-    }
-    OP(CALL_ARG_SPREAD) {
-        // Append every element of the source list into the active spread-call
-        // argument region, advancing vm->call_arg_top. Must be preceded for
-        // this call site by CALL_ARG_PREP.
-        Value source_val = bp[REG_A(instr)];
-        if (!IS_LIST(source_val)) {
-            STORE_IP(); runtimeError(vm, "Spread argument must be a list.");
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-        ObjList* source = AS_LIST(source_val);
-        int extra = source->items.count;
-        int needed = vm->call_arg_top + extra;
-        if (__builtin_expect(needed > vm->stack_capacity, 0)) {
-            if (!growStackForCall(vm, needed, NULL)) {
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
-            RELOAD_STACK();
-            // Re-fetch the source pointer after potential GC/realloc walk:
-            // the list's items array is independently heap-allocated and
-            // unaffected by stack reallocation, but a future GC inside
-            // growStackForCall could move objects -- re-read defensively.
-            source_val = bp[REG_A(instr)];
-            source = AS_LIST(source_val);
-        }
-        for (int i = 0; i < extra; i++) {
-            vm->stack[vm->call_arg_top++] = source->items.values[i];
-        }
-        if (vm->call_arg_top > vm->stack_top) {
-            vm->stack_top = vm->call_arg_top;
-        }
-        DISPATCH();
-    }
-    OP(CALL_ARG_PUSH) {
-        // Append a single value into the active spread-call argument region.
-        // Used (alongside CALL_ARG_SPREAD) to allow fixed args interleaved with
-        // or following spreads, e.g. `f(...a, b, ...c, d)`. Must be preceded for
-        // this call site by CALL_ARG_PREP.
-        int needed = vm->call_arg_top + 1;
-        if (__builtin_expect(needed > vm->stack_capacity, 0)) {
-            if (!growStackForCall(vm, needed, NULL)) {
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-            }
-            RELOAD_STACK();
-        }
-        vm->stack[vm->call_arg_top++] = bp[REG_A(instr)];
-        if (vm->call_arg_top > vm->stack_top) {
-            vm->stack_top = vm->call_arg_top;
-        }
-        DISPATCH();
-    }
-    OP(CALL_VAR) {
-        // Runtime-arg-count call: derive arg_count from vm->call_arg_top,
-        // repack the instruction into a CALL-shaped opcode word, and fall
-        // through into the OP(CALL) handler so all downstream behavior
-        // (dispatcher resolution, arity check, frame setup, native fast
-        // path, etc.) is shared with the static-count CALL.
-        int callee_slot = base + REG_A(instr);
-        int arg_count_int = vm->call_arg_top - callee_slot - 1;
-        if (arg_count_int < 0) arg_count_int = 0;
-        if (arg_count_int > 0xFFFF) {
-            STORE_IP(); runtimeError(vm, "Too many spread arguments (max 65535).");
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
-        }
-        instr = (uint32_t)CALL
-              | ((uint32_t)REG_A(instr) << 8)
-              | ((uint32_t)arg_count_int << 16);
-        goto CASE_CALL;
     }
     OP(TAIL_CALL) {
         int callee_slot = base + REG_A(instr);
@@ -2580,7 +2452,7 @@ static InterpretResult run(VM* vm) {
             // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
             CallFrame* current_frame = vm->current_frame;
             int frame_base = current_frame->stack_base;
-            int needed_top = frame_base + function->max_regs + function->spill_count;
+            int needed_top = frame_base + function->max_regs;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 needed_top += (arg_count - function->arity);
             }
@@ -2612,9 +2484,6 @@ static InterpretResult run(VM* vm) {
             vm->chunk = &function->chunk;
             constants = vm->chunk->constants.values;
             ip    = function->chunk.code;
-            // base/bp unchanged (frame reused), but the new function may have
-            // a different max_regs — recompute the spill base for the callee.
-            sp = bp + function->max_regs;
 
             DISPATCH();
         }
@@ -2652,22 +2521,16 @@ static InterpretResult run(VM* vm) {
                 LOAD_STATE(); DISPATCH();
             }
 
-            // Tail position: return the native's result from the current frame.
-            // Note: close upvalues only for the callee's own locals (stack_base + 1
-            // upward). `stack_base` itself is the caller's slot that will receive
-            // the return value -- closing an upvalue on that slot here would
-            // capture the callee value (e.g. the loaded function) instead of the
-            // return value written immediately below.
+            // Tail position: return the native's result from the current frame
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
-                                vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
-                closeUpvalues(vm, &stack[frame->stack_base + 1]);
+                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base]);
             }
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-            RELOAD_SP();  // returning to caller frame: recompute spill base
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
@@ -2743,21 +2606,16 @@ static InterpretResult run(VM* vm) {
                 LOAD_STATE(); DISPATCH();
             }
 
-            // Tail position: return the native closure's result from the current frame.
-            // See OP(RET) / native tail-return note: `stack_base` is the caller's
-            // result slot; only close upvalues at `stack_base + 1` and above so
-            // the upvalue for `var x = native_closure()` doesn't snapshot the
-            // callee before the return value is written.
+            // Tail position: return the native closure's result from the current frame
             CallFrame* frame = vm->current_frame;
             if (__builtin_expect(vm->open_upvalues != NULL &&
-                                vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
-                closeUpvalues(vm, &stack[frame->stack_base + 1]);
+                                vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+                closeUpvalues(vm, &stack[frame->stack_base]);
             }
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-            RELOAD_SP();  // returning to caller frame: recompute spill base
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
@@ -2804,7 +2662,7 @@ static InterpretResult run(VM* vm) {
         stack[callee_slot] = OBJ_VAL(closure);
 
         int frame_base = current_frame->stack_base;
-        int needed_top = frame_base + function->max_regs + function->spill_count;
+        int needed_top = frame_base + function->max_regs;
 
         if (__builtin_expect(needed_top > STACK_MAX, 0)) {
             STORE_IP(); runtimeError(vm, "Stack overflow.");
@@ -2842,44 +2700,10 @@ static InterpretResult run(VM* vm) {
                            : stack[frame->stack_base + ret_reg];
 
         // Before we pop the frame, close any upvalues pointing to its stack slots.
-        // IMPORTANT: `frame->stack_base` is the caller's slot that receives the
-        // return value below (`stack[frame->stack_base] = return_value`). If an
-        // upvalue is open on that exact slot (e.g. caller did `var m = mk()` and
-        // the CALL optimization placed both the callee load and the result in
-        // m's register), closing it here would snapshot the *callee* value
-        // (loaded into the slot just before CALL) rather than the upcoming
-        // return value -- so any enclosed closure would observe `m` as the
-        // function it called, not the value the function returned. The callee's
-        // own locals begin at `stack_base + 1`, so we bound the close at that
-        // address and use strict `>` in the fast-path predicate to match.
         // Fast path: skip the function call if no open upvalues reach into this frame.
         if (__builtin_expect(vm->open_upvalues != NULL &&
-                            vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
-            closeUpvalues(vm, &stack[frame->stack_base + 1]);
-        }
-
-        // Public-API boundary frame: the C caller (zym_call_execute) is
-        // waiting just below. Place the return value at the frame's
-        // stack_base (so zym_call_getResult can find it), pop the
-        // boundary frame, and exit `run()` cleanly. Without this, OP(RET)
-        // would fall through to api_trampoline's RET, which would in
-        // turn pop and NULL-write the suspended caller frames' stack
-        // slots — corrupting the script-side locals of whoever was
-        // mid-execution when this re-entrant call happened.
-        if (__builtin_expect((frame->flags & FRAME_FLAG_API_BOUNDARY) != 0, 0)) {
-            stack[frame->stack_base] = return_value;
-            vm->frame_count--;
-            // Restore base/current_frame to whatever was active before
-            // zym_call_execute pushed this boundary; the C side will
-            // overwrite vm->current_frame from its saved snapshot.
-            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
-            bp = stack + base;
-            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-            if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
-                vm->preemption_disable_depth--;
-            }
-            STORE_STATE();
-            return INTERPRET_OK;
+                            vm->open_upvalues->location >= &stack[frame->stack_base], 0)) {
+            closeUpvalues(vm, &stack[frame->stack_base]);
         }
 
         // Now pop the callee frame
@@ -2887,7 +2711,6 @@ static InterpretResult run(VM* vm) {
         base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
         bp = stack + base;
         vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-        RELOAD_SP();  // returning to caller frame: recompute spill base
 
         if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
             vm->preemption_disable_depth--;
@@ -3688,20 +3511,6 @@ static InterpretResult run(VM* vm) {
 
         DISPATCH();
     }
-    // Register spill: load spill slot Bx into register A.
-    // Spill area lives at sp[0..spill_count); sp is cached at every frame
-    // transition (see RELOAD_SP / LOAD_STATE / per-call updates below) so
-    // these handlers do zero pointer-chasing — just two memory accesses,
-    // matching the cost of a plain MOVE.
-    OP(SPILL_LOAD) {
-        bp[REG_A(instr)] = sp[REG_Bx(instr)];
-        DISPATCH();
-    }
-    // Register spill: evict register A to spill slot Bx.
-    OP(SPILL_STORE) {
-        sp[REG_Bx(instr)] = bp[REG_A(instr)];
-        DISPATCH();
-    }
 #undef OP
 #undef DISPATCH
 #undef CUR_BASE
@@ -3710,7 +3519,6 @@ static InterpretResult run(VM* vm) {
 #undef STORE_IP
 #undef STORE_STATE
 #undef LOAD_STATE
-#undef RELOAD_SP
 }
 
 InterpretResult runVM(VM* vm) {
@@ -3737,58 +3545,15 @@ InterpretResult runChunk(VM* vm, Chunk* chunk) {
     return run(vm);
 }
 
-// Resolve `functionName` against the runtime's three storage paths in
-// order: fixed mangled (`name@argc`), variadic mangled (`name@vF` with the
-// largest F ≤ argc — most specific accepting overload first), and the
-// bare-name binding (closures defined via `zym_defineGlobal`, e.g. the
-// cross-VM bridge's `registerNative` path). Mirrors what `zym_canCallWith`
-// answers, but returns the actual callable to invoke.
-static bool zym_call_prepare_lookup(VM* vm, const char* functionName, int arity, Value* out) {
-    char mangled[256];
-    Value v;
-
-    // 1. Fixed mangled: name@arity
-    int n = snprintf(mangled, sizeof(mangled), "%s@%d", functionName, arity);
-    if (n > 0 && n < (int)sizeof(mangled)) {
-        ObjString* nameObj = copyString(vm, mangled, (int)strlen(mangled));
-        if (globalGet(vm, nameObj, &v) &&
-            (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) || IS_NATIVE_CLOSURE(v))) {
-            *out = v;
-            return true;
-        }
-    }
-
-    // 2. Variadic mangled: prefer the most-specific accepting prefix
-    //    (largest F ≤ arity). The variadic prologue packs the remaining
-    //    args into the rest parameter, so any F ≤ arity is callable.
-    int upper = arity < MAX_NATIVE_ARITY ? arity : MAX_NATIVE_ARITY;
-    for (int fixed = upper; fixed >= 0; fixed--) {
-        n = snprintf(mangled, sizeof(mangled), "%s@v%d", functionName, fixed);
-        if (n <= 0 || n >= (int)sizeof(mangled)) continue;
-        ObjString* nameObj = copyString(vm, mangled, (int)strlen(mangled));
-        if (globalGet(vm, nameObj, &v) &&
-            (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) || IS_NATIVE_CLOSURE(v))) {
-            *out = v;
-            return true;
-        }
-    }
-
-    // 3. Bare-name binding (zym_defineGlobal): closure / native closure /
-    //    native function / dispatcher stored under the unmangled name.
-    ObjString* bareName = copyString(vm, functionName, (int)strlen(functionName));
-    if (globalGet(vm, bareName, &v) &&
-        (IS_CLOSURE(v) || IS_NATIVE_FUNCTION(v) ||
-         IS_NATIVE_CLOSURE(v) || IS_DISPATCHER(v))) {
-        *out = v;
-        return true;
-    }
-
-    return false;
-}
-
 bool zym_call_prepare(VM* vm, const char* functionName, int arity) {
+    // Mangle the name provided by the C host to match the compiler's internal name.
+    char mangled[256];
+    sprintf(mangled, "%s@%d", functionName, arity);
+
     Value func_val;
-    if (!zym_call_prepare_lookup(vm, functionName, arity, &func_val)) {
+    ObjString* name_obj = copyString(vm, mangled, strlen(mangled));
+
+    if (!globalGet(vm, name_obj, &func_val) || !IS_CLOSURE(func_val)) {
         fprintf(stderr, "Error: Function '%s' with arity %d not found.\n", functionName, arity);
         return false;
     }
@@ -3813,19 +3578,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     ObjClosure* closure = AS_CLOSURE(callee);
     ObjFunction* function = closure->function;
 
-    // Mirror OP(CALL)'s arity-check logic: variadic closures accept any
-    // arg count >= fixed_arity (the trailing args are packed into the rest
-    // parameter by the callee's prologue). The earlier strict equality check
-    // here rejected legitimate C-API invocations of script-side variadic
-    // closures (e.g., parent `func(...parts)` invoked via `zym_callClosurev`).
-    if (function->is_variadic) {
-        if (argCount < function->fixed_arity) {
-            runtimeError(vm, "Expected at least %d arguments but got %d.",
-                         function->fixed_arity, argCount);
-            vm->api_stack_top = frame_base;
-            return INTERPRET_RUNTIME_ERROR;
-        }
-    } else if (argCount != function->arity) {
+    if (argCount != function->arity) {
         runtimeError(vm, "Expected %d arguments but got %d.", function->arity, argCount);
         vm->api_stack_top = frame_base;
         return INTERPRET_RUNTIME_ERROR;
@@ -3838,11 +3591,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     }
 
     // Calculate required stack size for this call
-    // Mirror OP(CALL): variadic functions with extra args need additional slots.
-    int needed_top = frame_base + function->max_regs + function->spill_count;
-    if (function->is_variadic && argCount > function->arity) {
-        needed_top += (argCount - function->arity);
-    }
+    int needed_top = frame_base + function->max_regs;
 
     // Grow stack if needed (same logic as OP(CALL))
     if (needed_top > vm->stack_capacity) {
@@ -3878,57 +3627,23 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
         vm->stack_top = needed_top;
     }
 
-    // Save outer state BEFORE pushing the boundary frame, so that
-    // restoration after `run()` is independent of how many frames
-    // got popped inside (in particular, our API_BOUNDARY exit path
-    // pops the boundary frame from inside `run()` itself).
-    uint32_t* saved_ip            = vm->ip;
-    Chunk*    saved_chunk         = vm->chunk;
-    int       saved_cur_base      = vm->cur_base;
-    int       saved_frame_count   = vm->frame_count;
-    CallFrame* saved_current_frame = vm->current_frame;
-
     // Push frame just like OP(CALL)
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure      = closure;
     frame->stack_base   = frame_base;
-    // Mark as the public-API boundary so OP(RET) knows to stop here
-    // when this frame returns, instead of cascading through any
-    // already-suspended caller frames (re-entrant case).
-    frame->flags        = FRAME_FLAG_API_BOUNDARY;
+    frame->flags        = 0;
     frame->arg_count    = (uint16_t)argCount;
 
     // On return, resume at the API trampoline, not bytecode.
     frame->ip           = vm->api_trampoline.code;
-    // GC ROOT: point `caller_chunk` at the outer chunk we just suspended
-    // (`saved_chunk`), NOT at the trampoline. `markRoots` walks
-    // `vm->frames[i].caller_chunk`, so this is what keeps the outer
-    // chunk's constants table (and every Obj it references) reachable
-    // for the duration of this re-entrant call.
-    //
-    // Without this, if the outer chunk is a top-level chunk that runs
-    // with `frame_count==0` (the `runChunk` path), it has no frame
-    // entry — its only roots are `vm->chunk`, which we're about to
-    // overwrite below with `&function->chunk`. A GC anywhere inside
-    // the re-entrant call (e.g. a `newClosure` inside an ImGui body
-    // callback) would then sweep the outer chunk's string constants
-    // and crash on the next `markChunk` walk after returning.
-    //
-    // The API_BOUNDARY exit path in `run()` (vm.c ~2833) does NOT use
-    // `caller_chunk` to restore `vm->chunk` (the C side does that from
-    // `saved_chunk`), so changing this field doesn't affect return
-    // semantics. It only changes which chunk stack traces attribute the
-    // boundary frame to — which is arguably more correct anyway, since
-    // the trampoline is a synthetic 1-instruction stub.
-    //
-    // `saved_chunk` may be NULL if the very first call into the VM is
-    // through `zym_call_execute` (no chunk had been set yet); in that
-    // case leave `caller_chunk` NULL and let the existing NULL-tolerant
-    // paths (markRoots, stack traces) handle it.
-    frame->caller_chunk = saved_chunk;
+    frame->caller_chunk = &vm->api_trampoline;
 
     vm->current_frame = frame;
     vm->cur_base = frame_base;
+    uint32_t* saved_ip = vm->ip;
+    Chunk* saved_chunk = vm->chunk;
+    int saved_cur_base = vm->cur_base;
+    CallFrame* saved_current_frame = vm->current_frame;
 
     // Enter the callee
     vm->chunk = &function->chunk;
@@ -3936,15 +3651,9 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     InterpretResult result = run(vm);
 
-    // Restore the outer state. `run()` may have already popped the
-    // boundary frame via the FRAME_FLAG_API_BOUNDARY exit path; in
-    // any case, we want frame_count / current_frame to reflect what
-    // existed BEFORE this re-entrant call so the caller's bytecode
-    // can resume normally.
-    vm->ip            = saved_ip;
-    vm->chunk         = saved_chunk;
-    vm->cur_base      = saved_cur_base;
-    vm->frame_count   = saved_frame_count;
+    vm->ip    = saved_ip;
+    vm->chunk = saved_chunk;
+    vm->cur_base = saved_cur_base;
     vm->current_frame = saved_current_frame;
 
     // Result is placed in stack[frame_base] by OP(RET); expose that at API top.

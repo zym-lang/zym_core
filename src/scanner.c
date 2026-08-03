@@ -4,31 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "./trivia.h"
-
-void initScanner(Scanner* scanner, const char* source,
-                 const SourceMap* source_map, ZymFileId file_id) {
-    scanner->base = source;
-    scanner->file_id = file_id;
+void initScanner(Scanner* scanner, const char* source, const LineMap* line_map) {
     scanner->start = source;
     scanner->current = source;
-    scanner->start_byte = 0;
-    scanner->start_line = 1;
-    scanner->start_column = 1;
-    scanner->current_line = 1;
-    scanner->current_column = 1;
     scanner->line = 1;
-    scanner->source_map = source_map;
-    scanner->trivia = NULL;
-    scanner->vm = NULL;
-}
-
-// Phase 2.3: opt-in trivia capture. Callers that want doc-comments /
-// folding / hover attach a TriviaBuffer (owned by the parse tree). The
-// scanner records into it via trivia_append from skipWhitespace().
-void scannerAttachTrivia(Scanner* scanner, VM* vm, TriviaBuffer* trivia) {
-    scanner->trivia = trivia;
-    scanner->vm = vm;
+    scanner->line_map = line_map;
 }
 
 bool isAlpha(char c) {
@@ -43,21 +23,9 @@ static bool isAtEnd(Scanner* scanner) {
     return *scanner->current == '\0';
 }
 
-// advance() moves the cursor by one byte and keeps line/column state in
-// sync. `\n` bumps the line and resets the column to 1. Columns are
-// counted in UTF-8 bytes (§1.4 of core_changes.md) — conversion to UTF-16
-// or UTF-32 code units is a tooling-layer concern, done on demand.
 static char advance(Scanner* scanner) {
-    char c = scanner->current[0];
     scanner->current++;
-    if (c == '\n') {
-        scanner->current_line++;
-        scanner->current_column = 1;
-    } else {
-        scanner->current_column++;
-    }
-    scanner->line = scanner->current_line;
-    return c;
+    return scanner->current[-1];
 }
 
 static char peek(Scanner* scanner) {
@@ -72,26 +40,8 @@ static char peekNext(Scanner* scanner) {
 static bool match(Scanner* scanner, char expected) {
     if (isAtEnd(scanner)) return false;
     if (*scanner->current != expected) return false;
-    advance(scanner);
+    scanner->current++;
     return true;
-}
-
-// Resolves a scanner's current expanded-buffer byte offset to the
-// corresponding original-source line number via the SourceMap. Preserves
-// the pre-1.6 behavior where tokens emitted from preprocessed source
-// report the user's line, not the expanded-buffer line. Without a map
-// (raw unpreprocessed input) the scanner's own line number is returned.
-static int mappedLine(const Scanner* scanner, int scanner_line, int start_byte) {
-    if (scanner->source_map == NULL || scanner->source_map->count == 0) {
-        return scanner_line;
-    }
-    const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, start_byte);
-    if (seg == NULL) {
-        // Token's byte is past the mapped range (e.g. trailing synthetic
-        // content at EOF) — fall back to the last segment's origin line.
-        seg = &scanner->source_map->segments[scanner->source_map->count - 1];
-    }
-    return seg->originLine;
 }
 
 static Token makeToken(Scanner* scanner, TokenType type) {
@@ -100,36 +50,15 @@ static Token makeToken(Scanner* scanner, TokenType type) {
     token.start = scanner->start;
     token.length = (int)(scanner->current - scanner->start);
 
-    // Legacy `line` field: mapped through the SourceMap so existing
-    // diagnostics continue to print the user-source line.
-    token.line = mappedLine(scanner, scanner->start_line, scanner->start_byte);
-
-    // Phase 1.1 canonical span: fileId + byte offset into the preprocessed
-    // buffer the scanner walks.
-    token.fileId = scanner->file_id;
-    token.startByte = scanner->start_byte;
-    token.startLine = scanner->start_line;
-    token.startColumn = scanner->start_column;
-    token.endLine = scanner->current_line;
-    token.endColumn = scanner->current_column;
-
-    // Phase 1.2: resolve origin via SourceMap if present; otherwise
-    // fall back to reporting the scanned file as the origin.
-    if (scanner->source_map != NULL) {
-        const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, scanner->start_byte);
-        if (seg != NULL) {
-            token.originFileId = seg->originFileId;
-            token.originStartByte = seg->originStartByte;
-            token.originLength = seg->originLength;
+    if (scanner->line_map != NULL && scanner->line_map->count > 0) {
+        int map_index = scanner->line - 1;
+        if (map_index < scanner->line_map->count) {
+            token.line = scanner->line_map->lines[map_index];
         } else {
-            token.originFileId = scanner->file_id;
-            token.originStartByte = scanner->start_byte;
-            token.originLength = token.length;
+            token.line = scanner->line_map->lines[scanner->line_map->count - 1];
         }
     } else {
-        token.originFileId = scanner->file_id;
-        token.originStartByte = scanner->start_byte;
-        token.originLength = token.length;
+        token.line = scanner->line;
     }
     return token;
 }
@@ -140,57 +69,17 @@ static Token errorToken(Scanner* scanner, const char* message) {
     token.start = message;
     token.length = (int)strlen(message);
 
-    token.line = mappedLine(scanner, scanner->current_line,
-                            (int)(scanner->current - scanner->base));
-
-    // Error tokens don't correspond to a contiguous byte range in the
-    // source; we report the current scan position as a zero-length span.
-    token.fileId = scanner->file_id;
-    token.startByte = (int)(scanner->current - scanner->base);
-    token.startLine = scanner->current_line;
-    token.startColumn = scanner->current_column;
-    token.endLine = scanner->current_line;
-    token.endColumn = scanner->current_column;
-
-    if (scanner->source_map != NULL) {
-        const SourceMapSegment* seg = sourcemap_lookup(scanner->source_map, token.startByte);
-        if (seg != NULL) {
-            token.originFileId = seg->originFileId;
-            token.originStartByte = seg->originStartByte;
-            token.originLength = 0;
+    if (scanner->line_map != NULL && scanner->line_map->count > 0) {
+        int map_index = scanner->line - 1;
+        if (map_index < scanner->line_map->count) {
+            token.line = scanner->line_map->lines[map_index];
         } else {
-            token.originFileId = scanner->file_id;
-            token.originStartByte = token.startByte;
-            token.originLength = 0;
+            token.line = scanner->line_map->lines[scanner->line_map->count - 1];
         }
     } else {
-        token.originFileId = scanner->file_id;
-        token.originStartByte = token.startByte;
-        token.originLength = 0;
+        token.line = scanner->line;
     }
     return token;
-}
-
-// Snapshot the scanner's current position as a starting point for a
-// trivia piece. Used below where a comment begins.
-static void triviaSnapshot(const Scanner* s, int* out_byte, int* out_line, int* out_col) {
-    *out_byte = (int)(s->current - s->base);
-    *out_line = s->current_line;
-    *out_col  = s->current_column;
-}
-
-static void triviaRecord(Scanner* s, TriviaKind kind,
-                         int start_byte, int start_line, int start_col) {
-    if (s->trivia == NULL || s->vm == NULL) return;
-    int end_byte = (int)(s->current - s->base);
-    TriviaPiece p;
-    p.kind = kind;
-    p.fileId = s->file_id;
-    p.startByte = start_byte;
-    p.length = end_byte - start_byte;
-    p.startLine = start_line;
-    p.startColumn = start_col;
-    trivia_append(s->vm, s->trivia, &p);
 }
 
 static void skipWhitespace(Scanner* scanner) {
@@ -200,55 +89,25 @@ static void skipWhitespace(Scanner* scanner) {
             case ' ':
             case '\r':
             case '\t':
+                advance(scanner);
+                break;
             case '\n':
-                // Whitespace is intentionally not recorded; see trivia.h
-                // for the rationale (reconstructable from adjacent token
-                // gaps, would dominate retained-tree footprint).
+                scanner->line++;
                 advance(scanner);
                 break;
             case '/':
                 if (peekNext(scanner) == '/') {
-                    int sb, sl, sc;
-                    triviaSnapshot(scanner, &sb, &sl, &sc);
-                    // consume the two slashes
-                    advance(scanner);
-                    advance(scanner);
-                    // `///` is a doc line comment; `//` is a plain
-                    // comment. `////` (and longer) is treated as a
-                    // plain comment — matches Rust/Swift convention.
-                    TriviaKind kind = TRIVIA_COMMENT_LINE;
-                    if (peek(scanner) == '/' && peekNext(scanner) != '/') {
-                        advance(scanner); // consume the third /
-                        kind = TRIVIA_DOC_LINE;
-                    }
                     while (peek(scanner) != '\n' && !isAtEnd(scanner)) advance(scanner);
-                    triviaRecord(scanner, kind, sb, sl, sc);
                 } else if (peekNext(scanner) == '*') {
-                    int sb, sl, sc;
-                    triviaSnapshot(scanner, &sb, &sl, &sc);
-                    advance(scanner); // '/'
-                    advance(scanner); // '*'
-                    // `/**` starts a doc block (provided it's not the
-                    // empty `/**/`); `/*` is a plain block comment.
-                    TriviaKind kind = TRIVIA_COMMENT_BLOCK;
-                    if (peek(scanner) == '*' && peekNext(scanner) != '/') {
-                        // Leading '*' belongs to the doc marker; leave
-                        // it in place — downstream trivia consumers
-                        // strip the prefix themselves.
-                        kind = TRIVIA_DOC_BLOCK;
-                    }
+                    advance(scanner);
+                    advance(scanner);
                     while (!(peek(scanner) == '*' && peekNext(scanner) == '/')) {
-                        if (isAtEnd(scanner)) {
-                            // Unterminated block comment: still record
-                            // what we have so tooling can surface it.
-                            triviaRecord(scanner, kind, sb, sl, sc);
-                            return;
-                        }
+                        if (isAtEnd(scanner)) return;
+                        if (peek(scanner) == '\n') scanner->line++;
                         advance(scanner);
                     }
-                    advance(scanner); // '*'
-                    advance(scanner); // '/'
-                    triviaRecord(scanner, kind, sb, sl, sc);
+                    advance(scanner);
+                    advance(scanner);
                 } else {
                     return;
                 }
@@ -370,9 +229,9 @@ static Token number(Scanner* scanner) {
 
 static Token string(Scanner* scanner) {
     while (peek(scanner) != '"' && !isAtEnd(scanner)) {
+        if (peek(scanner) == '\n') scanner->line++;
         if (peek(scanner) == '\\') {
             advance(scanner);
-            if (isAtEnd(scanner)) break;
         }
         advance(scanner);
     }
@@ -383,44 +242,10 @@ static Token string(Scanner* scanner) {
     return makeToken(scanner, TOKEN_STRING);
 }
 
-// Triple-quoted multiline string: """...""".
-// Entered after the opening three `"` have already been consumed by
-// scanToken. Scans until a closing run of three consecutive `"` is
-// found, allowing real newlines and lone/double `"` inside. A literal
-// triple quote can be embedded by escaping at least one of the three
-// quotes (e.g. `\"""`). Escape sequences are processed later by the
-// compiler via processEscapeSequences, same as regular strings.
-static Token tripleString(Scanner* scanner) {
-    for (;;) {
-        if (isAtEnd(scanner)) {
-            return errorToken(scanner, "Unterminated triple-quoted string.");
-        }
-        if (peek(scanner) == '\\') {
-            advance(scanner);
-            if (isAtEnd(scanner)) {
-                return errorToken(scanner, "Unterminated triple-quoted string.");
-            }
-            advance(scanner);
-            continue;
-        }
-        if (peek(scanner) == '"' && peekNext(scanner) == '"'
-            && scanner->current[2] == '"') {
-            advance(scanner);
-            advance(scanner);
-            advance(scanner);
-            return makeToken(scanner, TOKEN_STRING);
-        }
-        advance(scanner);
-    }
-}
-
 
 Token scanToken(Scanner* scanner) {
     skipWhitespace(scanner);
     scanner->start = scanner->current;
-    scanner->start_byte = (int)(scanner->current - scanner->base);
-    scanner->start_line = scanner->current_line;
-    scanner->start_column = scanner->current_column;
 
     if (isAtEnd(scanner)) return makeToken(scanner, TOKEN_EOF);
 
@@ -496,19 +321,14 @@ Token scanToken(Scanner* scanner) {
             }
             return makeToken(scanner, match(scanner, '=') ? TOKEN_GREATER_EQUAL : TOKEN_GREATER);
 
-        case '"':
-            if (peek(scanner) == '"' && peekNext(scanner) == '"') {
-                advance(scanner);
-                advance(scanner);
-                return tripleString(scanner);
-            }
-            return string(scanner);
+        case '"': return string(scanner);
     }
 
+    static char error_buf[64];
     if (c >= 32 && c < 127) {
-        snprintf(scanner->error_buf, sizeof(scanner->error_buf), "Unexpected character '%c'.", c);
+        snprintf(error_buf, sizeof(error_buf), "Unexpected character '%c'.", c);
     } else {
-        snprintf(scanner->error_buf, sizeof(scanner->error_buf), "Unexpected character (code %d).", (unsigned char)c);
+        snprintf(error_buf, sizeof(error_buf), "Unexpected character (code %d).", (unsigned char)c);
     }
-    return errorToken(scanner, scanner->error_buf);
+    return errorToken(scanner, error_buf);
 }

@@ -6,8 +6,7 @@
 #include "module_loader.h"
 #include "vm.h"
 #include "memory.h"
-#include "sourcemap.h"
-#include "utils.h"
+#include "linemap.h"
 
 static char* normalize_path(ZymAllocator* alloc, const char* path) {
     if (!path) return NULL;
@@ -80,62 +79,39 @@ static unsigned int hash_path(const char* path) {
     return hash;
 }
 
-/*
- * Single source of truth for the module-path <-> identifier escape table.
- * Both the encoder here and `decodeModulePath` in utils.c iterate over
- * this table -- to add a new escapable character, add one row and both
- * sides stay in sync automatically.
- *
- * Note: '\\' is encoded as "_slash_" (same token as '/') intentionally;
- * the decoder maps "_slash_" back to '/' only, which is the desired
- * canonicalization (Windows-style separators collapse to POSIX).
- */
-const ModulePathEscape MODULE_PATH_ESCAPES[] = {
-    { '/',  "_slash_",  7 },
-    { '\\', "_slash_",  7 },  /* encode-only alias for '/' */
-    { '.',  "_dot_",    5 },
-    { '-',  "_dash_",   6 },
-    { ' ',  "_space_",  7 },
-    { ':',  "_colon_",  7 },
-    { '@',  "_at_",     4 },
-    { '$',  "_dollar_", 8 },
-    { '#',  "_hash_",   6 },
-    { '%',  "_pct_",    5 },
-    { '&',  "_amp_",    5 },
-    { '*',  "_star_",   6 },
-    { '~',  "_tilde_",  7 },
-    { '!',  "_bang_",   6 },
-};
-const size_t MODULE_PATH_ESCAPES_COUNT =
-    sizeof(MODULE_PATH_ESCAPES) / sizeof(MODULE_PATH_ESCAPES[0]);
-
 /* "src/math.zym" -> "src_slash_math_dot_zym" */
 static char* encode_path_to_identifier(ZymAllocator* alloc, const char* path) {
     size_t len = strlen(path);
     size_t result_len = 0;
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
-        size_t add = 1;
-        for (size_t k = 0; k < MODULE_PATH_ESCAPES_COUNT; k++) {
-            if (MODULE_PATH_ESCAPES[k].ch == c) {
-                add = MODULE_PATH_ESCAPES[k].token_len;
-                break;
-            }
-        }
-        result_len += add;
+        if (c == '/' || c == '\\') result_len += 7;
+        else if (c == '.') result_len += 5;
+        else if (c == '-') result_len += 6;
+        else if (c == ' ') result_len += 7;
+        else if (c == ':') result_len += 7;
+        else result_len += 1;
     }
 
     char* result = (char*)ZYM_ALLOC(alloc, result_len + 1);
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         char c = path[i];
-        const ModulePathEscape* esc = NULL;
-        for (size_t k = 0; k < MODULE_PATH_ESCAPES_COUNT; k++) {
-            if (MODULE_PATH_ESCAPES[k].ch == c) { esc = &MODULE_PATH_ESCAPES[k]; break; }
-        }
-        if (esc) {
-            memcpy(result + j, esc->token, esc->token_len);
-            j += esc->token_len;
+        if (c == '/' || c == '\\') {
+            memcpy(result + j, "_slash_", 7);
+            j += 7;
+        } else if (c == '.') {
+            memcpy(result + j, "_dot_", 5);
+            j += 5;
+        } else if (c == '-') {
+            memcpy(result + j, "_dash_", 6);
+            j += 6;
+        } else if (c == ' ') {
+            memcpy(result + j, "_space_", 7);
+            j += 7;
+        } else if (c == ':') {
+            memcpy(result + j, "_colon_", 7);
+            j += 7;
         } else {
             result[j++] = c;
         }
@@ -144,6 +120,38 @@ static char* encode_path_to_identifier(ZymAllocator* alloc, const char* path) {
 
     return result;
 }
+
+/* "src_slash_math_dot_zym" -> "src/math.zym" */
+#if 0
+static char* decode_identifier_to_path(const char* encoded, int length) {
+    char* result = (char*)malloc(length + 1);
+    size_t j = 0;
+
+    for (int i = 0; i < length; ) {
+        if (i + 7 <= length && memcmp(encoded + i, "_slash_", 7) == 0) {
+            result[j++] = '/';
+            i += 7;
+        } else if (i + 5 <= length && memcmp(encoded + i, "_dot_", 5) == 0) {
+            result[j++] = '.';
+            i += 5;
+        } else if (i + 6 <= length && memcmp(encoded + i, "_dash_", 6) == 0) {
+            result[j++] = '-';
+            i += 6;
+        } else if (i + 7 <= length && memcmp(encoded + i, "_space_", 7) == 0) {
+            result[j++] = ' ';
+            i += 7;
+        } else if (i + 7 <= length && memcmp(encoded + i, "_colon_", 7) == 0) {
+            result[j++] = ':';
+            i += 7;
+        } else {
+            result[j++] = encoded[i++];
+        }
+    }
+    result[j] = '\0';
+
+    return result;
+}
+#endif
 
 typedef struct {
     ZymAllocator* alloc;
@@ -378,23 +386,17 @@ typedef struct {
     int capacity;
 } StringMap;
 
-// Per-module SourceMap + origin fileId, keyed by module path. The
-// loader keeps these alongside `StringMap` of module sources so the
-// combined-buffer SourceMap can be reconstructed with per-expanded-line
-// granularity (one segment per newline of each module's transformed
-// text).
 typedef struct {
     char* key;
-    SourceMap* source_map;
-    ZymFileId file_id;
-} SourceMapEntry;
+    LineMap* value;
+} LineMapEntry;
 
 typedef struct {
     ZymAllocator* alloc;
-    SourceMapEntry* entries;
+    LineMapEntry* entries;
     int count;
     int capacity;
-} SourceMapMap;
+} LineMapMap;
 
 static void map_init(StringMap* map, ZymAllocator* alloc) {
     map->alloc = alloc;
@@ -443,28 +445,26 @@ static void map_free(StringMap* map) {
     map->capacity = 0;
 }
 
-static void sourcemap_map_init(SourceMapMap* map, ZymAllocator* alloc) {
+static void linemap_map_init(LineMapMap* map, ZymAllocator* alloc) {
     map->alloc = alloc;
     map->capacity = 16;
     map->count = 0;
-    map->entries = (SourceMapEntry*)ZYM_ALLOC(alloc, sizeof(SourceMapEntry) * map->capacity);
+    map->entries = (LineMapEntry*)ZYM_ALLOC(alloc, sizeof(LineMapEntry) * map->capacity);
 }
 
-static SourceMapEntry* sourcemap_map_get(SourceMapMap* map, const char* key) {
+static LineMap* linemap_map_get(LineMapMap* map, const char* key) {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].key, key) == 0) {
-            return &map->entries[i];
+            return map->entries[i].value;
         }
     }
     return NULL;
 }
 
-static void sourcemap_map_set(SourceMapMap* map, const char* key,
-                              SourceMap* source_map, ZymFileId file_id) {
+static void linemap_map_set(LineMapMap* map, const char* key, LineMap* value) {
     for (int i = 0; i < map->count; i++) {
         if (strcmp(map->entries[i].key, key) == 0) {
-            map->entries[i].source_map = source_map;
-            map->entries[i].file_id = file_id;
+            map->entries[i].value = value;
             return;
         }
     }
@@ -472,26 +472,23 @@ static void sourcemap_map_set(SourceMapMap* map, const char* key,
     if (map->count >= map->capacity) {
         int old = map->capacity;
         map->capacity *= 2;
-        map->entries = (SourceMapEntry*)ZYM_REALLOC(map->alloc, map->entries,
-            sizeof(SourceMapEntry) * old,
-            sizeof(SourceMapEntry) * map->capacity);
+        map->entries = (LineMapEntry*)ZYM_REALLOC(map->alloc, map->entries, sizeof(LineMapEntry) * old, sizeof(LineMapEntry) * map->capacity);
     }
 
     map->entries[map->count].key = zym_strdup(map->alloc, key);
-    map->entries[map->count].source_map = source_map;
-    map->entries[map->count].file_id = file_id;
+    map->entries[map->count].value = value;
     map->count++;
 }
 
-static void sourcemap_map_free(VM* vm, SourceMapMap* map) {
+static void linemap_map_free(VM* vm, LineMapMap* map) {
     for (int i = 0; i < map->count; i++) {
         ZYM_FREE_STR(map->alloc, map->entries[i].key);
-        if (map->entries[i].source_map) {
-            freeSourceMap(vm, map->entries[i].source_map);
-            ZYM_FREE(map->alloc, map->entries[i].source_map, sizeof(SourceMap));
+        if (map->entries[i].value) {
+            freeLineMap(vm, map->entries[i].value);
+            ZYM_FREE(map->alloc, map->entries[i].value, sizeof(LineMap));
         }
     }
-    ZYM_FREE(map->alloc, map->entries, sizeof(SourceMapEntry) * map->capacity);
+    ZYM_FREE(map->alloc, map->entries, sizeof(LineMapEntry) * map->capacity);
     map->entries = NULL;
     map->count = 0;
     map->capacity = 0;
@@ -675,70 +672,18 @@ static void stack_free(ImportStack* stack) {
     stack->capacity = 0;
 }
 
-// Resolve an import `spec` (raw, as it appeared in source) against an
-// `importer` (canonical path of the module that issued the import, or
-// NULL for the entry module's own deps) into the canonical key the
-// loader will use for cycle detection, caching, and `read_callback`.
-//
-// If a `resolve_callback` is installed and returns non-NULL, that value
-// is the canonical key (copied into allocator-owned storage). If the
-// resolver returns NULL — or none is installed — fall back to the
-// default `resolve_module_path(importer_dir, spec)` behavior. The
-// returned string is always allocator-owned; the caller must
-// `ZYM_FREE_STR` it.
-static char* resolve_import_spec(VM* vm,
-                                 const char* spec,
-                                 const char* importer,
-                                 ModuleResolveCallback resolve_callback,
-                                 void* user_data,
-                                 ImportStack* import_stack) {
-    if (resolve_callback) {
-        // Expose the active import stack to the resolver so it can call
-        // `vm.moduleLoader.getCaller()` / `getStack()` while deciding.
-        // Depth is set to `count + 1` so `getCaller()` (which returns
-        // depth-2, with depth-1 being the "currently loading") lands on
-        // the real importer rather than one above it.
-        void* saved_stack = vm->current_import_stack;
-        int saved_count = vm->current_import_count;
-        vm->current_import_stack = import_stack;
-        vm->current_import_count = import_stack ? import_stack->count + 1 : 1;
-
-        const char* rebound = resolve_callback(spec, importer, user_data);
-
-        vm->current_import_stack = saved_stack;
-        vm->current_import_count = saved_count;
-
-        if (rebound) {
-            return zym_strdup(&vm->allocator, rebound);
-        }
-    }
-    // Default fallback. `importer` is the canonical path of the importer
-    // (a file, not a dir); `resolve_module_path` strips to its dir and
-    // joins. For the entry module's deps there is no importer; in that
-    // case the caller passes the entry's own path so deps resolve
-    // relative to it (matches pre-resolver behavior).
-    return resolve_module_path(&vm->allocator, importer ? importer : "", spec);
-}
-
 static bool load_module_recursive(
     VM* vm,
     const char* module_path,
     ModuleReadCallback read_callback,
-    ModuleResolveCallback resolve_callback,
     void* user_data,
     StringSet* loaded_modules,
     ImportStack* import_stack,
     StringMap* module_sources,
-    SourceMapMap* module_source_maps,
+    LineMapMap* module_linemaps,
     SymbolMap* symbol_map,
     char** error_msg)
 {
-    // `module_path` is already the canonical key — the caller resolved
-    // the (spec, importer) pair via `resolve_import_spec` before
-    // recursing. We do NOT call the resolver again here; doing so would
-    // double-resolve and break script-side resolvers that produce
-    // synthetic keys (e.g. `<builtin>/json`) which won't round-trip.
-
     if (stack_contains(import_stack, module_path)) {
         int cycle_start = -1;
         for (int i = 0; i < import_stack->count; i++) {
@@ -784,20 +729,7 @@ static bool load_module_recursive(
 
     stack_push(import_stack, module_path);
 
-    // Expose the active ImportStack to the VM so callbacks (and anything
-    // reachable from them) can answer "who asked?" via the public
-    // `zym_currentImport*` accessors. Save/restore around the call to
-    // support nested loadModules calls on the same VM and to ensure the
-    // VM fields are NULL/0 once the callback returns.
-    void* saved_stack = vm->current_import_stack;
-    int saved_count = vm->current_import_count;
-    vm->current_import_stack = import_stack;
-    vm->current_import_count = import_stack->count;
-
     ModuleReadResult read_result = read_callback(module_path, user_data);
-
-    vm->current_import_stack = saved_stack;
-    vm->current_import_count = saved_count;
     if (!read_result.source) {
         size_t error_size = 256 + strlen(module_path);
         *error_msg = (char*)ZYM_ALLOC(&vm->allocator, error_size);
@@ -807,8 +739,7 @@ static bool load_module_recursive(
     }
 
     map_set(module_sources, module_path, read_result.source);
-    sourcemap_map_set(module_source_maps, module_path,
-                      read_result.source_map, read_result.file_id);
+    linemap_map_set(module_linemaps, module_path, read_result.line_map);
     set_add(loaded_modules, module_path);
 
     ModuleQueue deps;
@@ -821,19 +752,11 @@ static bool load_module_recursive(
 
     while (!queue_empty(&deps)) {
         ModuleQueueItem item = queue_pop(&deps);
-        // Resolve (spec, importer) via the resolver callback first;
-        // fall back to the default directory-join behavior only if the
-        // resolver is absent or returns NULL. `module_path` here is the
-        // canonical path of the importer (the module we're currently
-        // processing) — it's what the resolver and the default
-        // `resolve_module_path` both consume as the importer side.
-        char* resolved_path = resolve_import_spec(
-            vm, item.module_path, module_path,
-            resolve_callback, user_data, import_stack);
+        char* resolved_path = resolve_module_path(&vm->allocator, item.base_path, item.module_path);
 
-        if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
+        if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    loaded_modules, import_stack, module_sources,
-                                   module_source_maps, symbol_map, error_msg)) {
+                                   module_linemaps, symbol_map, error_msg)) {
             ZYM_FREE_STR(&vm->allocator, resolved_path);
             ZYM_FREE_STR(&vm->allocator, item.module_path);
             ZYM_FREE_STR(&vm->allocator, item.base_path);
@@ -864,80 +787,20 @@ static int count_newlines(const char* str) {
 }
 #endif
 
-// Appends one SourceMap segment per `\n` found in `text`, translating
-// each expanded-buffer line's origin through the per-module source map.
-// `combined_byte_cursor` is the byte offset at which `text` starts in
-// the combined buffer; it is advanced to point past `text` on return.
-// `source_line_idx` is the per-module expanded-line counter used to
-// index the module's source map (post-coalesce-removal, one segment per
-// expanded newline, so direct indexing is valid).
-static void add_mapped_lines(VM* vm,
-                             const char* text,
-                             const SourceMap* source_source_map,
-                             ZymFileId source_file_id,
-                             SourceMap* combined_source_map,
-                             int* combined_byte_cursor,
-                             int* source_line_idx) {
-    int line_start = 0;
-    int i = 0;
-    for (; text[i] != '\0'; i++) {
-        if (text[i] == '\n') {
-            int expanded_start = *combined_byte_cursor + line_start;
-            int expanded_length = (i + 1) - line_start;
-
-            ZymFileId origin_fid = source_file_id;
-            int origin_start = -1;
-            int origin_length = 0;
-            int origin_line = 0;
-            if (source_source_map &&
-                *source_line_idx < source_source_map->count) {
-                const SourceMapSegment* seg =
-                    &source_source_map->segments[*source_line_idx];
-                origin_fid = seg->originFileId;
-                origin_start = seg->originStartByte;
-                origin_length = seg->originLength;
-                origin_line = seg->originLine;
+static void add_mapped_lines(VM* vm, const char* text, LineMap* source_linemap, LineMap* combined_linemap, int* source_line_idx) {
+    const char* p = text;
+    while (*p) {
+        if (*p == '\n') {
+            int original_line = 0;
+            if (source_linemap && *source_line_idx < source_linemap->count) {
+                original_line = source_linemap->lines[*source_line_idx];
             }
             (*source_line_idx)++;
 
-            appendSourceMapSegment(vm, combined_source_map,
-                                   expanded_start, expanded_length,
-                                   origin_fid, origin_start, origin_length,
-                                   origin_line);
-            line_start = i + 1;
+            addLineMapping(vm, combined_linemap, original_line);
         }
+        p++;
     }
-    *combined_byte_cursor += i;
-}
-
-// Appends `str` to the combined buffer AND emits one synthetic
-// SourceMap segment per `\n` contained in it. Loader-inserted scaffolding
-// (`func __module_...() {`, `var __module_... = ...()\n`, closing
-// braces, etc.) has no originating user source, so each synthetic
-// segment is recorded with originFileId=INVALID and originLine=0; the
-// scanner falls back to its own expanded-buffer line for tokens that
-// land in such a range (rare — none of the synthetic scaffolding
-// parses to anything but whitespace + keywords the user never typed).
-static void sb_append_synth(VM* vm,
-                            StringBuilder* sb,
-                            const char* str,
-                            SourceMap* combined_source_map,
-                            int* combined_byte_cursor) {
-    size_t len = strlen(str);
-    int line_start = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (str[i] == '\n') {
-            int expanded_length = (int)(i + 1) - line_start;
-            appendSourceMapSegment(vm, combined_source_map,
-                                   *combined_byte_cursor, expanded_length,
-                                   ZYM_FILE_ID_INVALID, -1, 0, 0);
-            *combined_byte_cursor += expanded_length;
-            line_start = (int)(i + 1);
-        }
-    }
-    int tail = (int)len - line_start;
-    if (tail > 0) *combined_byte_cursor += tail;
-    sb_append(sb, str);
 }
 
 static bool is_fresh_module(const char* source) {
@@ -946,33 +809,8 @@ static bool is_fresh_module(const char* source) {
     return strncmp(p, "\"use fresh\"", 11) == 0;
 }
 
-// Returns a pointer into `source` past a leading `"use fresh"` directive
-// (and any trailing whitespace/newline on that line). If the directive is
-// not present, returns `source` unchanged. Used so the directive itself
-// doesn't leak into the wrapped function body of a fresh module.
-static const char* skip_fresh_directive(const char* source) {
-    const char* p = source;
-    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
-    if (strncmp(p, "\"use fresh\"", 11) != 0) return source;
-    p += 11;
-    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
-    if (*p == ';') p++;
-    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
-    if (*p == '\n') p++;
-    return p;
-}
-
-// `vm`, `resolve_callback`, `user_data` are threaded so the call-site
-// rewrite can consult the same resolver the loader used at load time.
-// This keeps the encoded identifier at every `import("spec")` call site
-// in sync with the encoded identifier of the module that was actually
-// loaded for `(spec, importer)` — otherwise scripts that return
-// synthetic keys from the resolver would emit references to modules
-// that don't exist. `vm` is allowed to be NULL only when no resolver is
-// installed (the default fallback path doesn't need it).
-static char* transform_imports(VM* vm, ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
-                               SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules,
-                               ModuleResolveCallback resolve_callback, void* user_data) {
+static char* transform_imports(ZymAllocator* alloc, const char* source, const char* base_path, StringSet* loaded_modules,
+                               SymbolMap* symbol_map, bool debug_names, StringSet* fresh_modules) {
     StringBuilder sb;
     sb_init(&sb, alloc);
 
@@ -1056,16 +894,7 @@ static char* transform_imports(VM* vm, ZymAllocator* alloc, const char* source, 
                         if (*p == ')') {
                             p++;
 
-                            // Use the same resolver the loader used.
-                            // `base_path` is the canonical path of the
-                            // module containing this `import("...")`
-                            // call site (the importer). If no resolver
-                            // is installed, this falls back to
-                            // `resolve_module_path(base_path, path)` —
-                            // byte-identical to the previous behavior.
-                            char* resolved = resolve_import_spec(
-                                vm, path, base_path,
-                                resolve_callback, user_data, NULL);
+                            char* resolved = resolve_module_path(alloc, base_path, path);
 
                             if (debug_names) {
                                 sb_append(&sb, "__module_");
@@ -1149,27 +978,9 @@ static char* transform_imports(VM* vm, ZymAllocator* alloc, const char* source, 
 ModuleLoadResult* loadModules(
     VM* vm,
     const char* entry_source,
-    SourceMap* entry_source_map,
+    LineMap* entry_line_map,
     const char* entry_path,
     ModuleReadCallback read_callback,
-    void* user_data,
-    bool debug_names,
-    bool write_debug_output,
-    const char* debug_output_path)
-{
-    // Thin wrapper: existing embedders see byte-identical behavior.
-    return loadModulesEx(vm, entry_source, entry_source_map, entry_path,
-                         read_callback, /*resolve_callback=*/NULL, user_data,
-                         debug_names, write_debug_output, debug_output_path);
-}
-
-ModuleLoadResult* loadModulesEx(
-    VM* vm,
-    const char* entry_source,
-    SourceMap* entry_source_map,
-    const char* entry_path,
-    ModuleReadCallback read_callback,
-    ModuleResolveCallback resolve_callback,
     void* user_data,
     bool debug_names,
     bool write_debug_output,
@@ -1178,7 +989,7 @@ ModuleLoadResult* loadModulesEx(
     ZymAllocator* alloc = &vm->allocator;
     ModuleLoadResult* result = (ModuleLoadResult*)ZYM_ALLOC(alloc, sizeof(ModuleLoadResult));
     result->combined_source = NULL;
-    result->source_map = NULL;
+    result->line_map = NULL;
     result->module_paths = NULL;
     result->module_count = 0;
     result->has_error = false;
@@ -1190,8 +1001,8 @@ ModuleLoadResult* loadModulesEx(
     StringMap module_sources;
     map_init(&module_sources, alloc);
 
-    SourceMapMap module_source_maps;
-    sourcemap_map_init(&module_source_maps, alloc);
+    LineMapMap module_linemaps;
+    linemap_map_init(&module_linemaps, alloc);
 
     ImportStack import_stack;
     stack_init(&import_stack, alloc);
@@ -1215,15 +1026,11 @@ ModuleLoadResult* loadModulesEx(
 
     while (!queue_empty(&entry_deps)) {
         ModuleQueueItem item = queue_pop(&entry_deps);
-        // Resolve (spec, importer=entry_path) via the resolver first;
-        // fall back to default directory-join behavior if absent / NULL.
-        char* resolved_path = resolve_import_spec(
-            vm, item.module_path, entry_path,
-            resolve_callback, user_data, &import_stack);
+        char* resolved_path = resolve_module_path(alloc, item.base_path, item.module_path);
 
-        if (!load_module_recursive(vm, resolved_path, read_callback, resolve_callback, user_data,
+        if (!load_module_recursive(vm, resolved_path, read_callback, user_data,
                                    &loaded_modules, &import_stack, &module_sources,
-                                   &module_source_maps, &symbol_map, &result->error_message)) {
+                                   &module_linemaps, &symbol_map, &result->error_message)) {
             result->has_error = true;
             ZYM_FREE_STR(alloc, resolved_path);
             ZYM_FREE_STR(alloc, item.module_path);
@@ -1242,36 +1049,10 @@ ModuleLoadResult* loadModulesEx(
     StringBuilder combined;
     sb_init(&combined, alloc);
 
-    // Combined-buffer SourceMap: populated in lockstep with `combined`.
-    // Every `\n` appended (whether from module text or loader
-    // scaffolding) produces exactly one segment; per-line granularity
-    // lets the scanner binary-search by byte offset to recover the
-    // originating file/line for any token.
-    SourceMap* combined_source_map = (SourceMap*)ZYM_ALLOC(alloc, sizeof(SourceMap));
-    initSourceMap(combined_source_map);
-    int combined_byte_cursor = 0;
+    LineMap* combined_linemap = (LineMap*)ZYM_ALLOC(alloc, sizeof(LineMap));
+    initLineMap(combined_linemap);
 
-    // Pre-scan every loaded module for the `"use fresh"` directive so
-    // `fresh_modules` is fully populated before any `transform_imports`
-    // call runs. Without this, a module emitted earlier in the loop (a
-    // parent) that imports a fresh module emitted later (a child) sees
-    // an empty `fresh_modules` set and rewrites the call site to the
-    // cache variable instead of the direct function call.
     for (int i = 0; i < loaded_modules.count; i++) {
-        const char* module_path = loaded_modules.items[i];
-        if (strcmp(module_path, entry_path) == 0) continue;
-        char* source = map_get(&module_sources, module_path);
-        if (!source) continue;
-        if (is_fresh_module(source)) {
-            set_add(&fresh_modules, module_path);
-        }
-    }
-
-    // Emit modules in dependency-first order: BFS added parents before
-    // children, so iterating in reverse gives leaves first. This
-    // guarantees a non-fresh module's `var __module_X = __module_X_init()`
-    // initializer runs before any parent `_init` that references X.
-    for (int i = loaded_modules.count - 1; i >= 0; i--) {
         const char* module_path = loaded_modules.items[i];
 
         if (strcmp(module_path, entry_path) == 0) {
@@ -1279,22 +1060,23 @@ ModuleLoadResult* loadModulesEx(
         }
 
         char* source = map_get(&module_sources, module_path);
-        SourceMapEntry* source_entry = sourcemap_map_get(&module_source_maps, module_path);
-        SourceMap* source_source_map = source_entry ? source_entry->source_map : NULL;
-        ZymFileId source_file_id = source_entry ? source_entry->file_id : ZYM_FILE_ID_INVALID;
+        LineMap* source_linemap = linemap_map_get(&module_linemaps, module_path);
         if (!source) continue;
 
-        bool is_fresh = set_contains(&fresh_modules, module_path);
+        bool is_fresh = is_fresh_module(source);
+        if (is_fresh) {
+            set_add(&fresh_modules, module_path);
+        }
 
         if (debug_names) {
             char* encoded = encode_path_to_identifier(alloc, module_path);
             if (is_fresh) {
-                sb_append_synth(vm, &combined, "func __module_", combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
+                sb_append(&combined, "func __module_");
+                sb_append(&combined, encoded);
             } else {
-                sb_append_synth(vm, &combined, "func __module_", combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, "_init", combined_source_map, &combined_byte_cursor);
+                sb_append(&combined, "func __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, "_init");
             }
             ZYM_FREE_STR(alloc, encoded);
         } else {
@@ -1304,73 +1086,56 @@ ModuleLoadResult* loadModulesEx(
             } else {
                 snprintf(hash_str, sizeof(hash_str), "func _%x_init", hash_path(module_path));
             }
-            sb_append_synth(vm, &combined, hash_str, combined_source_map, &combined_byte_cursor);
+            sb_append(&combined, hash_str);
         }
 
-        sb_append_synth(vm, &combined, "() {\n", combined_source_map, &combined_byte_cursor);
+        sb_append(&combined, "() {\n");
+        addLineMapping(vm, combined_linemap, 0);
 
-        // For fresh modules, drop the leading `"use fresh"` directive
-        // so it doesn't end up as a stray string-expression statement
-        // inside the wrapped function body. Count how many source lines
-        // we skipped so `source_line_idx` still indexes the right per-
-        // module SourceMap segment for what's actually emitted.
-        const char* source_for_transform = source;
+        char* transformed = transform_imports(alloc, source, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
+
         int source_line_idx = 0;
-        if (is_fresh) {
-            source_for_transform = skip_fresh_directive(source);
-            for (const char* q = source; q < source_for_transform; q++) {
-                if (*q == '\n') source_line_idx++;
-            }
-        }
-        char* transformed = transform_imports(vm, alloc, source_for_transform, module_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules, resolve_callback, user_data);
-        add_mapped_lines(vm, transformed, source_source_map, source_file_id,
-                         combined_source_map, &combined_byte_cursor, &source_line_idx);
+        add_mapped_lines(vm, transformed, source_linemap, combined_linemap, &source_line_idx);
 
         sb_append(&combined, transformed);
         ZYM_FREE_STR(alloc, transformed);
 
-        sb_append_synth(vm, &combined, "\n}\n", combined_source_map, &combined_byte_cursor);
+        sb_append(&combined, "\n}\n");
+        addLineMapping(vm, combined_linemap, 0);
+        addLineMapping(vm, combined_linemap, 0);
 
         if (!is_fresh) {
             if (debug_names) {
                 char* encoded = encode_path_to_identifier(alloc, module_path);
-                sb_append_synth(vm, &combined, "var __module_", combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, " = __module_", combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, encoded, combined_source_map, &combined_byte_cursor);
-                sb_append_synth(vm, &combined, "_init()\n", combined_source_map, &combined_byte_cursor);
+                sb_append(&combined, "var __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, " = __module_");
+                sb_append(&combined, encoded);
+                sb_append(&combined, "_init()\n");
                 ZYM_FREE_STR(alloc, encoded);
             } else {
                 char hash_str[64];
                 snprintf(hash_str, sizeof(hash_str), "var _%x = _%x_init()\n",
                          hash_path(module_path), hash_path(module_path));
-                sb_append_synth(vm, &combined, hash_str, combined_source_map, &combined_byte_cursor);
+                sb_append(&combined, hash_str);
             }
+            addLineMapping(vm, combined_linemap, 0);
         }
 
-        sb_append_synth(vm, &combined, "\n", combined_source_map, &combined_byte_cursor);
+        sb_append(&combined, "\n");
+        addLineMapping(vm, combined_linemap, 0);
     }
 
-    char* transformed_entry = transform_imports(vm, alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules, resolve_callback, user_data);
-
-    // Resolve entry module's own file_id so the entry SourceMap can be
-    // copied into the combined map with the correct originFileId on
-    // every segment even when the caller passes a NULL `entry_source_map`.
-    ZymFileId entry_file_id = ZYM_FILE_ID_INVALID;
-    {
-        SourceMapEntry* entry_entry = sourcemap_map_get(&module_source_maps, entry_path);
-        if (entry_entry) entry_file_id = entry_entry->file_id;
-    }
+    char* transformed_entry = transform_imports(alloc, entry_source, entry_path, &loaded_modules, &symbol_map, debug_names, &fresh_modules);
 
     int entry_line_idx = 0;
-    add_mapped_lines(vm, transformed_entry, entry_source_map, entry_file_id,
-                     combined_source_map, &combined_byte_cursor, &entry_line_idx);
+    add_mapped_lines(vm, transformed_entry, entry_line_map, combined_linemap, &entry_line_idx);
 
     sb_append(&combined, transformed_entry);
     ZYM_FREE_STR(alloc, transformed_entry);
 
     result->combined_source = combined.buffer;
-    result->source_map = combined_source_map;
+    result->line_map = combined_linemap;
     combined.buffer = NULL;
     sb_free(&combined);
 
@@ -1398,7 +1163,7 @@ ModuleLoadResult* loadModulesEx(
 cleanup:
     set_free(&loaded_modules);
     map_free(&module_sources);
-    sourcemap_map_free(vm, &module_source_maps);
+    linemap_map_free(vm, &module_linemaps);
     stack_free(&import_stack);
     symbolmap_free(&symbol_map);
     set_free(&fresh_modules);
@@ -1412,9 +1177,9 @@ void freeModuleLoadResult(VM* vm, ModuleLoadResult* result) {
 
     ZYM_FREE_STR(alloc, result->combined_source);
 
-    if (result->source_map) {
-        freeSourceMap(vm, result->source_map);
-        ZYM_FREE(alloc, result->source_map, sizeof(SourceMap));
+    if (result->line_map) {
+        freeLineMap(vm, result->line_map);
+        ZYM_FREE(alloc, result->line_map, sizeof(LineMap));
     }
 
     for (int i = 0; i < result->module_count; i++) {
@@ -1424,34 +1189,4 @@ void freeModuleLoadResult(VM* vm, ModuleLoadResult* result) {
 
     ZYM_FREE_STR(alloc, result->error_message);
     ZYM_FREE(alloc, result, sizeof(ModuleLoadResult));
-}
-
-// =============================================================================
-// Public runtime introspection accessors (see module_loader.h)
-// =============================================================================
-
-int zym_currentImportDepth(VM* vm) {
-    if (!vm || !vm->current_import_stack) return 0;
-    return vm->current_import_count;
-}
-
-const char* zym_currentImportPathAt(VM* vm, int i) {
-    if (!vm || !vm->current_import_stack) return NULL;
-    ImportStack* s = (ImportStack*)vm->current_import_stack;
-    if (i < 0 || i >= vm->current_import_count) return NULL;
-    if (i >= s->count) return NULL;
-    return s->modules[i];
-}
-
-const char* zym_currentImportCaller(VM* vm) {
-    if (!vm || !vm->current_import_stack) return NULL;
-    // The currently-loading module is at depth-1; its caller is at
-    // depth-2. depth == 1 means we're loading the entry module: no
-    // caller.
-    int d = vm->current_import_count;
-    if (d < 2) return NULL;
-    ImportStack* s = (ImportStack*)vm->current_import_stack;
-    int idx = d - 2;
-    if (idx < 0 || idx >= s->count) return NULL;
-    return s->modules[idx];
 }
