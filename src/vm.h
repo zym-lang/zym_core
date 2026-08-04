@@ -5,7 +5,11 @@
 #include "./table.h"
 #include <stdint.h>
 #include "./config.h"
+#include "zym/config.h" /* ZYM_HAS_* feature flags */
 #include "./allocator.h"
+#include "./source_file.h"
+#include "./diagnostics.h"
+#include <signal.h> /* sig_atomic_t for compile cancellation flag */
 
 /*
  * VM Configuration Limits
@@ -30,8 +34,12 @@
  *   - Captured continuations are heap-allocated, not limited by these values
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
  */
-#define FRAMES_MAX 512
+#ifndef FRAMES_MAX
+#define FRAMES_MAX 256
+#endif
+#ifndef STACK_MAX
 #define STACK_MAX 65536
+#endif
 #define STACK_INITIAL 256
 #define MAX_PROMPTS 64
 #define DEFAULT_TIMESLICE 10000
@@ -39,6 +47,14 @@
 #define MAX_WITH_PROMPT_DEPTH 64
 #define FRAME_FLAG_PREEMPT 0x01
 #define FRAME_FLAG_DISABLE_PREEMPT 0x02
+// Re-entrant API boundary: this frame was pushed by a public API call
+// (`zym_call`/`zym_callClosurev` -> `zym_call_execute`) into a VM that
+// may already be mid-bytecode execution. When OP(RET) pops a frame
+// carrying this flag, control must return to the C caller of
+// `zym_call_execute` immediately, **without** falling through into the
+// api_trampoline's RET (which would cascade-pop every suspended caller
+// frame, NULL-ing their stack_base slots and corrupting their locals).
+#define FRAME_FLAG_API_BOUNDARY 0x04
 
 typedef struct ObjPromptTag ObjPromptTag;
 
@@ -81,6 +97,11 @@ typedef struct VM {
     Value* stack;
     int stack_capacity;
     int stack_top;
+    // Cursor used by the spread-call layout sequence
+    // (CALL_ARG_PREP / CALL_ARG_SPREAD / CALL_VAR). Holds the absolute
+    // stack index of the next free argument slot during a spread call.
+    // Outside of that opcode triple it is meaningless.
+    int call_arg_top;
     Table globals;
     ValueArray globalSlots;
     Table strings;
@@ -138,6 +159,43 @@ typedef struct VM {
     // Error callback (NULL = default fprintf to stderr)
     ErrorCallback error_callback;
     void* error_user_data;
+
+    // Phase 1.1: per-VM registry of source files whose bytes scanner tokens
+    // (and future diagnostics / parse tree / symbol table) reference by id.
+    SourceFileRegistry source_files;
+
+    // Phase 1.3: structured diagnostics sink. Populated by the frontend
+    // (parser/compiler/…) via pushDiagnostic(); drained by embedders via
+    // zymGetDiagnostics() / zymClearDiagnostics().
+    DiagnosticSink diagnostics;
+
+    // Phase 1.5: cooperative cancellation flag for the frontend pipeline.
+    // `volatile sig_atomic_t` is the minimum C99 primitive that is safe
+    // to read/write across threads without a full atomics dependency —
+    // the parser and compiler only need to observe a monotonic 0 → 1
+    // transition, never a tearing read. Flipped by zymRequestCancel()
+    // from an arbitrary thread; reset to 0 by zymClearCancel() before
+    // starting a new compile. Parser polls at every declaration boundary;
+    // compiler polls at every statement-emit boundary.
+    volatile sig_atomic_t compile_cancelled;
+
+    // Module loader: pointer to the *currently active* ImportStack (an
+    // opaque struct defined in module_loader.c) and its current depth, set
+    // by `load_module_recursive` around each `read_callback` invocation
+    // and cleared on return. Used by the public `zym_currentImport*`
+    // accessors so an embedder's read_callback can answer "who asked?"
+    // without changing the callback signature. NULL / 0 outside an active
+    // read_callback frame. The pointer is borrowed (never owned by VM).
+    void* current_import_stack;
+    int current_import_count;
+
+#if ZYM_HAS_BUILD_TESTING
+    // Phase 4.5: compiler resolution-trace buffer used by the parity test
+    // between `resolver.c` and `compiler.c`. Non-NULL only between
+    // zym_compilerTraceBegin() and zym_compilerTraceEnd(). Shipping builds
+    // do not have this field.
+    struct ZymResolutionTrace* active_trace;
+#endif
 } VM;
 
 typedef enum {

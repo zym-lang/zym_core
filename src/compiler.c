@@ -12,6 +12,40 @@
 #include "./utils.h"
 #include "gc.h"
 #include "./native.h"
+#include "./diagnostics.h"
+#include "./trivia.h"
+#include "./parse_tree.h"
+#include "zym/config.h"
+
+/* Phase 4.5 compiler resolution-trace hook — test-only. When
+ * ZYM_HAS_BUILD_TESTING=1, each classified identifier emits one trace
+ * record; otherwise the macro expands to nothing so shipping builds pay
+ * nothing. See zym/compiler_trace.h for the test API. */
+#if ZYM_HAS_BUILD_TESTING
+#  include "zym/compiler_trace.h"
+void zym_compilerTrace_record(VM* vm,
+                              ZymFileId fileId,
+                              int byteOffset,
+                              int length,
+                              ZymResolutionKind kind,
+                              int slotOrIndex,
+                              int isLocalUpvalue);
+#  define COMPILER_TRACE_TOK(compiler, tok, kind, slot, is_local_upv)           \
+    do {                                                                       \
+        const Token* _ct_t = (tok);                                            \
+        if (_ct_t) {                                                           \
+            zym_compilerTrace_record((compiler)->vm,                           \
+                                     _ct_t->fileId,                            \
+                                     _ct_t->startByte,                         \
+                                     _ct_t->length,                            \
+                                     (kind),                                   \
+                                     (slot),                                   \
+                                     (is_local_upv));                          \
+        }                                                                      \
+    } while (0)
+#else
+#  define COMPILER_TRACE_TOK(compiler, tok, kind, slot, is_local_upv) ((void)0)
+#endif
 
 #define OPCODE(i) ((i) & 0xFF)
 
@@ -56,6 +90,8 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg);
 static int compile_sub_expression(Compiler* c, Expr* e);
 static int reserve_register(Compiler* compiler);
 static void free_register(Compiler* compiler);
+static int resolve_local_index(Compiler* compiler, Token* name);
+static inline int phys_local_count(Compiler* compiler);
 static int emit_jump_instruction(Compiler* compiler, OpCode opcode, int reg, int line);
 static void patch_jump(Compiler* compiler, int jump_address);
 static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclStmt* stmt);
@@ -109,12 +145,21 @@ static void emit_load_const(Compiler* c, int reg, int const_idx, int line) {
     emit_instruction(c, PACK_ABx(LOAD_CONST, reg, const_idx), line);
 }
 
-static void emit_get_global(Compiler* c, int reg, int name_const, int line) {
+static void emit_get_global(Compiler* c, int reg, int name_const, int line, const Token* tok) {
     emit_instruction(c, PACK_ABx(GET_GLOBAL, reg, name_const), line);
+    /* Phase 4.5 GLOBAL parity: tok is the user-written identifier whose
+     * resolution fell through to the global namespace. Keying on the user
+     * Token's byte range (not the mangled name constant) makes parity
+     * matching with the resolver's ZymReferenceInfo automatic — both sides
+     * index into the same source bytes. Dispatcher/overload expansion may
+     * emit multiple traces for one user identifier; the parity test
+     * tolerates that via find_trace_at. Pass NULL at the function-decl
+     * storage site (resolver emits a DEFINITION, not a reference). */
+    COMPILER_TRACE_TOK(c, tok, ZYM_RES_GLOBAL, name_const, -1);
 }
-
-static void emit_set_global(Compiler* c, int reg, int name_const, int line) {
+static void emit_set_global(Compiler* c, int reg, int name_const, int line, const Token* tok) {
     emit_instruction(c, PACK_ABx(SET_GLOBAL, reg, name_const), line);
+    COMPILER_TRACE_TOK(c, tok, ZYM_RES_GLOBAL, name_const, -1);
 }
 
 static void emit_get_upvalue(Compiler* c, int reg, int upvalue_idx, int line) {
@@ -129,53 +174,54 @@ static void emit_closure(Compiler* c, int reg, int const_idx, int line) {
     emit_instruction(c, PACK_ABx(CLOSURE, reg, const_idx), line);
 }
 
-static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
+// Low-level compiler-diagnostic emitter. If `tok` is non-NULL, its byte span
+// (fileId/startByte/length/startColumn) is attached to the diagnostic so
+// LSP-style range reporting works; otherwise only `line` is carried (legacy
+// "I don't have the originating token" path — kept for diagnostics raised
+// from post-parse stages like register allocation).
+static void compiler_error_emit(Compiler* compiler, const Token* tok, int line,
+                                const char* format, va_list args) {
     compiler->has_error = true;
 
+    // Phase 1.7: the sink carries fileId/byte-span/line/column as fields;
+    // presentation (CLI / LSP) builds "[file] line N: ..." headers from
+    // those. The message is now just the bare sentence.
+    char msg_buf[1024];
+    vsnprintf(msg_buf, sizeof(msg_buf), format, args);
+
+    // Phase 1.7: report the *origin* (pre-preprocess) span. The token's
+    // primary `fileId/startByte/length` track the post-preprocess buffer
+    // the scanner walked; routing those to the diagnostic sink would
+    // make the renderer pull a snippet from the preprocessed buffer
+    // while the SourceMap-mapped `line` belongs to the user-visible
+    // origin file — the two would not align. The `originFileId` is set
+    // to the user's source by the scanner via SourceMap lookup, with a
+    // graceful fallback to the scanned file when no mapping exists.
+    ZymFileId fileId = tok ? tok->originFileId    : ZYM_FILE_ID_INVALID;
+    int startByte    = tok ? tok->originStartByte : -1;
+    int length       = tok ? tok->originLength    : 0;
+    int column       = tok ? tok->startColumn     : -1;
+
+    pushDiagnostic(compiler->vm,
+                   ZYM_DIAG_ERROR,
+                   fileId, startByte, length,
+                   line, column,
+                   "%s", msg_buf);
+}
+
+static void compiler_error(Compiler* compiler, int line, const char* format, ...) {
     va_list args;
     va_start(args, format);
-
-    if (compiler->vm->error_callback) {
-        char msg_buf[1024];
-        vsnprintf(msg_buf, sizeof(msg_buf), format, args);
-
-        const char* file = NULL;
-        if (compiler->current_module_name) {
-            file = compiler->current_module_name->chars;
-        }
-
-        char full_buf[1280];
-        if (file) {
-            snprintf(full_buf, sizeof(full_buf), "[%s] line %d: %s", file, line, msg_buf);
-        } else {
-            snprintf(full_buf, sizeof(full_buf), "[line %d]: %s", line, msg_buf);
-        }
-
-        compiler->vm->error_callback(compiler->vm, ZYM_STATUS_COMPILE_ERROR, file, line, full_buf, compiler->vm->error_user_data);
-    } else {
-        if (compiler->current_module_name) {
-            fprintf(stderr, "[%.*s] line %d: ",
-                    compiler->current_module_name->length,
-                    compiler->current_module_name->chars,
-                    line);
-        } else {
-            fprintf(stderr, "[line %d]: ", line);
-        }
-        vfprintf(stderr, format, args);
-        fprintf(stderr, "\n");
-    }
-
+    compiler_error_emit(compiler, NULL, line, format, args);
     va_end(args);
 }
 
-static void compiler_error_and_exit(int line, const char* format, ...) {
-    fprintf(stderr, "Error at line %d: ", line);
+static void compiler_error_at(Compiler* compiler, const Token* tok,
+                              const char* format, ...) {
     va_list args;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    compiler_error_emit(compiler, tok, tok ? tok->line : -1, format, args);
     va_end(args);
-    fprintf(stderr, "\n");
-    exit(1);
 }
 
 static bool tokens_equal(const Token* a, const Token* b) {
@@ -247,8 +293,12 @@ static int identifier_constant(Compiler* compiler, Token* name) {
 }
 
 static Local* get_local_by_reg(Compiler* c, int reg) {
+    // Spilled locals have reg == -1; ignore them here. Callers use this
+    // helper to find a local by its physical register slot (e.g. capture
+    // resolution, struct-type look-up), which never applies to spills.
+    if (reg < 0) return NULL;
     for (int i = 0; i < c->local_count; i++) {
-        if (c->locals[i].reg == reg) {
+        if (!c->locals[i].is_spilled && c->locals[i].reg == reg) {
             return &c->locals[i];
         }
     }
@@ -260,12 +310,20 @@ static int is_local_reg(Compiler* c, int r) {
 }
 
 static int alloc_temp(Compiler* c) {
-    if (c->next_register < c->local_count) {
-        c->next_register = c->local_count;
+    // Bump next_register past the highest reg occupied by a live local.
+    // Spilled locals occupy no physical reg, so they don't contribute.
+    int phys_locals = phys_local_count(c);
+    if (c->next_register < phys_locals) {
+        c->next_register = phys_locals;
     }
 
-    if (c->next_register >= MAX_PHYSICAL_REGS) {
-        compiler_error(c, -1, "Too many registers in use (%d). Maximum is %d.", c->next_register + 1, MAX_PHYSICAL_REGS);
+    // Temps stay stack-disciplined and cannot spill — see the design note:
+    // long-lived pressure belongs to locals, which get the spill path.
+    // Temps may use the full window including the SPILL_SCRATCH_COUNT
+    // headroom above local_alloc_cap (that's its purpose: keep spill
+    // loads viable even when locals fill their cap).
+    if (c->next_register >= c->temp_alloc_cap) {
+        compiler_error(c, c->current_line, "Too many registers in use (%d). Maximum is %d.", c->next_register + 1, c->temp_alloc_cap);
         return 0;
     }
 
@@ -278,34 +336,62 @@ static inline int save_temp_top(Compiler* c) {
     return c->next_register;
 }
 
+// Temp-reclamation floor — the lowest register a new temp can use
+// without clobbering a live local. In function bodies locals are
+// declared at the bottom of the window contiguously (Pass 1 pre-decl),
+// so this is just local_count. But in top-level / nested-scope chunks
+// locals are declared mid-stream and may sit at arbitrary regs above
+// other live state (e.g. a while-condition temp consumed reg 0 before
+// the body's `var x` got reg 1). We scan non-spilled locals and use
+// the highest reg in use, plus one. Spilled locals occupy no physical
+// reg, so they don't raise the floor.
+static inline int phys_local_count(Compiler* c) {
+    int floor = 0;
+    for (int i = 0; i < c->local_count; i++) {
+        if (!c->locals[i].is_spilled && c->locals[i].reg >= floor) {
+            floor = c->locals[i].reg + 1;
+        }
+    }
+    if (floor > c->local_alloc_cap) floor = c->local_alloc_cap;
+    return floor;
+}
+
 static inline void restore_temp_top(Compiler* c, int saved_top) {
-    if (saved_top >= c->local_count && saved_top <= c->next_register) {
+    int floor = phys_local_count(c);
+    if (saved_top >= floor && saved_top <= c->next_register) {
         c->next_register = saved_top;
     }
 }
 
 static inline void restore_temp_top_preserve(Compiler* c, int saved_top, int target_reg) {
+    int floor = phys_local_count(c);
     int safe_top = saved_top;
 
-    if (target_reg >= c->local_count) {
+    if (target_reg >= floor) {
         int min_for_preserve = target_reg + 1;
         if (saved_top < min_for_preserve) {
             safe_top = min_for_preserve;
         }
     }
 
-    if (safe_top < c->local_count) {
-        safe_top = c->local_count;
+    if (safe_top < floor) {
+        safe_top = floor;
     }
 
-    if (safe_top >= c->local_count && safe_top <= c->next_register) {
+    if (safe_top >= floor && safe_top <= c->next_register) {
         c->next_register = safe_top;
     }
 }
 
 static int reserve_register(Compiler* c) {
-    if (c->next_register >= MAX_PHYSICAL_REGS) {
-        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.", c->next_register + 1, MAX_LOCALS);
+    // NOTE: Only used by paths that *must* have a physical register
+    // (function self-slot R0, parameter binding, call-site arg setup).
+    // Local-declaration paths must use reserve_local_register() instead,
+    // which falls back to the spill area when the window is exhausted.
+    // The local-alloc cap leaves SPILL_SCRATCH_COUNT regs reserved at
+    // the top of the window for spill loads.
+    if (c->next_register >= c->local_alloc_cap) {
+        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.", c->next_register + 1, c->local_alloc_cap);
         return 0;
     }
 
@@ -313,6 +399,66 @@ static int reserve_register(Compiler* c) {
     if (r > c->max_register_seen) c->max_register_seen = r;
 
     return r;
+}
+
+// Allocate storage for a newly-declared local variable. Returns a
+// physical register if one is available within the cap; otherwise
+// allocates a fresh spill slot. The local-declaration site reads
+// `*out_reg` (when !*out_spilled) or `*out_slot` (when *out_spilled)
+// to know where the value lives.
+//
+// Returns 0 on success and -1 on hard failure (both register and
+// spill space exhausted). A failure emits its own diagnostic.
+static int reserve_local_register(Compiler* c, int* out_reg, bool* out_spilled, uint16_t* out_slot) {
+    if (c->next_register < c->local_alloc_cap) {
+        int r = c->next_register++;
+        if (r > c->max_register_seen) c->max_register_seen = r;
+        *out_reg = r;
+        *out_spilled = false;
+        *out_slot = 0;
+        return 0;
+    }
+    // Cap exhausted — spill the new local to a fresh slot.
+    if (c->spill_count >= 0xFFFF) {
+        compiler_error(c, -1,
+            "Too many spilled local variables in function (%d). Maximum is %d.",
+            c->spill_count + 1, 0xFFFF);
+        return -1;
+    }
+    uint16_t slot = (uint16_t)c->spill_count++;
+    if (c->spill_count > c->peak_concurrent_spills) {
+        c->peak_concurrent_spills = c->spill_count;
+    }
+    *out_reg = -1;
+    *out_spilled = true;
+    *out_slot = slot;
+    return 0;
+}
+
+// Emit SPILL_LOAD `dst <- spill[slot]`.
+static inline void emit_spill_load(Compiler* c, int dst_reg, uint16_t slot, int line) {
+    emit_instruction(c, PACK_ABx(SPILL_LOAD, dst_reg, slot), line);
+    c->spill_loads_emitted++;
+}
+
+// Emit SPILL_STORE `spill[slot] <- src`.
+static inline void emit_spill_store(Compiler* c, int src_reg, uint16_t slot, int line) {
+    emit_instruction(c, PACK_ABx(SPILL_STORE, src_reg, slot), line);
+    c->spill_stores_emitted++;
+}
+
+// If `name` resolves to a spilled local, emit SPILL_STORE to write the
+// new value (currently held in `result_reg`) back to the spill slot.
+// No-op for non-spilled locals — writing to local->reg already updated
+// the live storage. Callers: read-modify-write paths (PRE_INC, POST_INC,
+// PRE_DEC, POST_DEC) where the codegen uses the local's reg as both
+// input and output operand and resolve_local already arranged the
+// SPILL_LOAD into a scratch.
+static void maybe_writeback_spilled_local(Compiler* c, Token* name, int result_reg, int line) {
+    int idx = resolve_local_index(c, name);
+    if (idx != -1 && c->locals[idx].is_spilled) {
+        emit_spill_store(c, result_reg, c->locals[idx].spill_slot, line);
+    }
 }
 
 /*
@@ -505,14 +651,61 @@ static int resolve_hoisted_name(Compiler* compiler, Token* name) {
     }
 }
 
-static int resolve_local(Compiler* compiler, Token* name) {
+// Returns the local *index* (into compiler->locals[]) of `name`, or -1.
+// Pure lookup — never emits. Used by paths that need to inspect the
+// Local directly (write paths checking is_spilled, capture detection).
+static int resolve_local_index(Compiler* compiler, Token* name) {
     for (int i = compiler->local_count - 1; i >= 0; i--) {
         Local* local = &compiler->locals[i];
         if (tokens_equal(name, &local->name)) {
-            return local->reg;
+            return i;
         }
     }
     return -1;
+}
+
+// Sentinel returned by resolve_local_impl when the name resolved to
+// a local that has been spilled. Distinct from -1 (not a local) so
+// callers can give an accurate diagnostic instead of falling through
+// to the upvalue/global resolution paths.
+#define RESOLVE_LOCAL_SPILLED (-2)
+
+// Internal lookup that does NOT emit any code. Returns the local's
+// physical register slot if it has one, RESOLVE_LOCAL_SPILLED if the
+// name matched a spilled local (caller must handle), or -1 if no
+// matching local exists.
+//
+// Used by the capture path (resolve_upvalue_impl) which calls into the
+// *enclosing* compiler and must not emit into that compiler's chunk.
+static int resolve_local_impl(Compiler* compiler, Token* name) {
+    int idx = resolve_local_index(compiler, name);
+    if (idx == -1) return -1;
+    Local* local = &compiler->locals[idx];
+    if (local->is_spilled) return RESOLVE_LOCAL_SPILLED;
+    return local->reg;
+}
+
+/* Phase 4.5 tracing wrapper. Internal recursive paths call _impl directly
+ * so intermediate lookups don't produce spurious trace records. Only the
+ * top-level "compile this identifier" callers see the wrapper.
+ *
+ * Transparently materializes spilled locals into a scratch temp via
+ * SPILL_LOAD. The scratch lives as a normal temp and is reclaimed by
+ * the enclosing statement's save/restore_temp_top discipline. */
+static int resolve_local(Compiler* compiler, Token* name) {
+    int idx = resolve_local_index(compiler, name);
+    if (idx == -1) return -1;
+    Local* local = &compiler->locals[idx];
+    int r;
+    if (local->is_spilled) {
+        int scratch = alloc_temp(compiler);
+        emit_spill_load(compiler, scratch, local->spill_slot, compiler->current_line);
+        r = scratch;
+    } else {
+        r = local->reg;
+    }
+    COMPILER_TRACE_TOK(compiler, name, ZYM_RES_LOCAL, r, -1);
+    return r;
 }
 
 static int add_upvalue(Compiler* compiler, uint8_t index, bool is_local, ObjStructSchema* struct_type) {
@@ -584,10 +777,27 @@ static int resolve_mangled_local_by_base(Compiler* c, const Token* base) {
     return (found_count == 1) ? found_reg : -1;
 }
 
-static int resolve_upvalue(Compiler* compiler, Token* name) {
+static int resolve_upvalue_impl(Compiler* compiler, Token* name) {
     if (compiler->enclosing == NULL) return -1;
 
-    int local = resolve_local(compiler->enclosing, name);
+    /* NOTE: intermediate chain-walk uses resolve_local_impl (no tracing)
+     * so only the outermost user-facing resolve_upvalue wrapper emits one
+     * UPVALUE trace entry for the source identifier. */
+    int local = resolve_local_impl(compiler->enclosing, name);
+    if (local == RESOLVE_LOCAL_SPILLED) {
+        // The enclosing scope's variable was register-spilled, which means
+        // it has no stable physical register slot for the upvalue
+        // mechanism to point at. We refuse to capture it (refuse-to-spill
+        // captured locals, expressed inversely from the capture site).
+        // In practice this only triggers when the outer function has more
+        // declared locals than the register window allows AND an inner
+        // closure tries to close over one of the overflow locals — rare.
+        compiler_error(compiler, -1,
+            "Cannot capture variable '%.*s' from enclosing function: target is in spill area. "
+            "Consider refactoring the outer function to reduce local-variable pressure.",
+            name->length, name->start);
+        return -1;
+    }
     if (local != -1) {
         Local* parent_local = get_local_by_reg(compiler->enclosing, local);
         if (parent_local) parent_local->is_captured = true;
@@ -603,13 +813,24 @@ static int resolve_upvalue(Compiler* compiler, Token* name) {
         return add_upvalue(compiler, (uint8_t)mlocal, true, struct_type);
     }
 
-    int up = resolve_upvalue(compiler->enclosing, name);
+    int up = resolve_upvalue_impl(compiler->enclosing, name);
     if (up != -1) {
         ObjStructSchema* struct_type = compiler->enclosing->upvalues[up].struct_type;
         return add_upvalue(compiler, (uint8_t)up, false, struct_type);
     }
 
     return -1;
+}
+
+/* Phase 4.5 tracing wrapper. See `resolve_local` above. */
+static int resolve_upvalue(Compiler* compiler, Token* name) {
+    int r = resolve_upvalue_impl(compiler, name);
+    if (r != -1) {
+        int is_local = (r < compiler->upvalue_count
+                        && compiler->upvalues[r].is_local) ? 1 : 0;
+        COMPILER_TRACE_TOK(compiler, name, ZYM_RES_UPVALUE, r, is_local);
+    }
+    return r;
 }
 
 static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
@@ -623,9 +844,35 @@ static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
     local->reg = reg;
     local->is_initialized = true;
     local->is_captured = false;
+    local->is_spilled = false;
+    local->spill_slot = 0;
     local->struct_type = NULL;
 }
 
+// Variant of add_local_at_reg for a local that lives in the spill area
+// rather than a physical register. Used by the STMT_VAR_DECLARATION
+// branch when reserve_local_register reports the new local was spilled.
+static void add_local_spilled(Compiler* compiler, Token name, uint16_t slot) {
+    if (compiler->local_count >= MAX_LOCALS) {
+        compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
+        return;
+    }
+    Local* local = &compiler->locals[compiler->local_count++];
+    local->name = name;
+    local->depth = compiler->scope_depth;
+    local->reg = -1;            // not in a physical register
+    local->is_initialized = true;
+    local->is_captured = false;
+    local->is_spilled = true;
+    local->spill_slot = slot;
+    local->struct_type = NULL;
+}
+
+// Reserve a *physical-only* local slot. Used by paths that bind a name
+// to a fixed register (hoisted-function self-slots, etc.) where the
+// caller stores the returned reg as a constant identity reference.
+// Spillable locals go through reserve_local_register + add_local_spilled
+// in STMT_VAR_DECLARATION instead.
 static int add_local(Compiler* compiler, Token name) {
     if (compiler->local_count >= MAX_LOCALS) {
         compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
@@ -637,6 +884,8 @@ static int add_local(Compiler* compiler, Token name) {
     local->reg = compiler->next_register;
     local->is_initialized = false;
     local->is_captured = false;
+    local->is_spilled = false;
+    local->spill_slot = 0;
     local->struct_type = NULL;
     return reserve_register(compiler);
 }
@@ -680,6 +929,7 @@ static ObjEnumSchema* get_enum_schema(Compiler* compiler, const Token* name) {
     return NULL;
 }
 
+
 static void record_global_type(Compiler* compiler, ObjString* var_name, ObjStructSchema* schema) {
     Compiler* root = compiler;
     while (root->enclosing) root = root->enclosing;
@@ -716,7 +966,10 @@ static ObjStructSchema* get_global_type(Compiler* compiler, const Token* name) {
 }
 
 static inline bool can_use_target_directly(Compiler* c, int target_reg) {
-    return target_reg >= c->local_count;
+    // The "safe to write" boundary is the top of the locals' *physical*
+    // region (highest local reg in use + 1). Spilled locals occupy no
+    // physical reg so they don't shrink the safe zone.
+    return target_reg >= phys_local_count(c);
 }
 
 static int compile_sub_expression_to(Compiler* c, Expr* e, int preferred_target) {
@@ -771,10 +1024,18 @@ static bool find_hoisted_function(Compiler* c, const Token* name, int arity, Hoi
         }
 
         case HOISTED_LOCAL: {
-            for (int i = 0; i < c->local_hoisted_count; i++) {
-                if (c->local_hoisted[i].is_variadic) continue;
-                if (c->local_hoisted[i].arity == arity && tokens_equal(&c->local_hoisted[i].name, name)) {
-                    return true;
+            // Walk current compiler and the enclosing chain so that nested
+            // function bodies (e.g. overloaded `func` declarations inside a
+            // module body) can still find sibling overloads declared in an
+            // outer scope. Without this, an unmangled name resolution path
+            // would capture the wrong overload as an upvalue.
+            for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+                for (int i = 0; i < cur->local_hoisted_count; i++) {
+                    if (cur->local_hoisted[i].is_variadic) continue;
+                    if (cur->local_hoisted[i].arity == arity &&
+                        tokens_equal(&cur->local_hoisted[i].name, name)) {
+                        return true;
+                    }
                 }
             }
             return false;
@@ -822,9 +1083,12 @@ static bool has_variadic_hoisted_global(Compiler* c, const Token* name) {
 }
 
 static bool has_variadic_hoisted_local(Compiler* c, const Token* name) {
-    for (int i = 0; i < c->local_hoisted_count; i++) {
-        if (c->local_hoisted[i].is_variadic && tokens_equal(&c->local_hoisted[i].name, name)) {
-            return true;
+    // Walk the enclosing chain — see is_hoisted_local for rationale.
+    for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+        for (int i = 0; i < cur->local_hoisted_count; i++) {
+            if (cur->local_hoisted[i].is_variadic && tokens_equal(&cur->local_hoisted[i].name, name)) {
+                return true;
+            }
         }
     }
     return false;
@@ -839,8 +1103,11 @@ static bool has_any_hoisted_global(Compiler* c, const Token* name) {
 }
 
 static bool has_any_hoisted_local(Compiler* c, const Token* name) {
-    for (int i = 0; i < c->local_hoisted_count; i++) {
-        if (tokens_equal(&c->local_hoisted[i].name, name)) return true;
+    // Walk the enclosing chain — see is_hoisted_local for rationale.
+    for (Compiler* cur = c; cur != NULL; cur = cur->enclosing) {
+        for (int i = 0; i < cur->local_hoisted_count; i++) {
+            if (tokens_equal(&cur->local_hoisted[i].name, name)) return true;
+        }
     }
     return false;
 }
@@ -1035,7 +1302,18 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
         ScopedString mangled = scoped_mangle(compiler, name, arg_count);
         Token mangled_token = { .start = mangled.str, .length = (int)strlen(mangled.str), .line = name->line };
         reg = resolve_local(compiler, &mangled_token);
-        scoped_string_free(&mangled);
+        if (reg == -1) {
+            // Overload lives in an enclosing scope — capture mangled name as
+            // upvalue (mirrors the fix in resolve_and_load_function).
+            int up = resolve_upvalue(compiler, &mangled_token);
+            scoped_string_free(&mangled);
+            if (up != -1) {
+                emit_get_upvalue(compiler, call_base, up, line);
+                return;
+            }
+        } else {
+            scoped_string_free(&mangled);
+        }
     }
     // 1b. No exact local match, but local has variadic — needs dispatcher
     if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
@@ -1077,7 +1355,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
                 emit_get_upvalue(compiler, call_base, reg, line);
             } else {
                 int name_const = identifier_constant(compiler, name);
-                emit_get_global(compiler, call_base, name_const, line);
+                emit_get_global(compiler, call_base, name_const, line, name);
             }
         }
     } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
@@ -1119,10 +1397,10 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
             int name_const = make_constant(compiler, OBJ_VAL(str));
             popTempRoot(compiler->vm);
             scoped_string_free(&mangled);
-            emit_get_global(compiler, call_base, name_const, line);
+            emit_get_global(compiler, call_base, name_const, line, name);
         } else {
             int name_const = identifier_constant(compiler, name);
-            emit_get_global(compiler, call_base, name_const, line);
+            emit_get_global(compiler, call_base, name_const, line, name);
         }
     }
 }
@@ -1177,6 +1455,17 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
             // TCO_AGGRESSIVE: Non-variable callee (e.g., arr[0], obj.method, lambda)
             compile_expression(compiler, callee, call_base);
         }
+    } else {
+        /* Phase 4.5d scope-aware TAIL_CALL_SELF parity: same rationale as
+         * the non-TCO CALL_SELF site — the codegen skips the callee load,
+         * but the resolver classifies the identifier according to where
+         * the self-function was declared. Emit a matching trace so the
+         * parity test sees classification agreement. */
+        COMPILER_TRACE_TOK(compiler, &callee->as.variable.name,
+            is_hoisted_in_enclosing(compiler, &callee->as.variable.name, arg_count)
+                ? ZYM_RES_UPVALUE
+                : ZYM_RES_GLOBAL,
+            -1, -1);
     }
 
     // Compile arguments into temporary registers first to avoid overwriting current parameters
@@ -1270,7 +1559,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
 
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, k, line);
+                    emit_get_global(compiler, temp_reg, k, line, name);
                     variadic_reg = temp_reg;
                 } else {
                     // Fixed-arity overload
@@ -1282,12 +1571,11 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                     scoped_string_free(&mangled);
 
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, k, line);
+                    emit_get_global(compiler, temp_reg, k, line, name);
                     overload_regs[overload_count++] = temp_reg;
                 }
             }
         }
-
         // Also collect native functions from vm->globals
         char buf[256 + 8];
         // Native fixed-arity overloads (name@0 .. name@MAX_NATIVE_ARITY)
@@ -1299,7 +1587,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
             if (tableGet(&compiler->vm->globals, key, &val) && IS_NATIVE_FUNCTION(val)) {
                 int k = make_constant(compiler, OBJ_VAL(key));
                 int temp_reg = alloc_temp(compiler);
-                emit_get_global(compiler, temp_reg, k, line);
+                emit_get_global(compiler, temp_reg, k, line, name);
                 overload_regs[overload_count++] = temp_reg;
             }
             popTempRoot(compiler->vm);
@@ -1317,7 +1605,7 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
                         variadic_min_arity = fixed;
                         int k = make_constant(compiler, OBJ_VAL(key));
                         int temp_reg = alloc_temp(compiler);
-                        emit_get_global(compiler, temp_reg, k, line);
+                        emit_get_global(compiler, temp_reg, k, line, name);
                         variadic_reg = temp_reg;
                         popTempRoot(compiler->vm);
                         break;
@@ -1352,7 +1640,23 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
         char* mangled = mangle_name(compiler, name, arg_count);
         Token mangled_token = { .start = mangled, .length = (int)strlen(mangled), .line = name->line };
         reg = resolve_local(compiler, &mangled_token);
-        FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+        if (reg == -1) {
+            // The overload lives in an enclosing scope (e.g. a sibling `func`
+            // declared at module scope, referenced from inside another
+            // overload's body). Capture the mangled name as an upvalue so the
+            // correct overload is bound instead of falling through to the
+            // unmangled name and accidentally capturing whichever overload
+            // happens to be visible (often the enclosing function itself via
+            // recursive self-binding).
+            int up = resolve_upvalue(compiler, &mangled_token);
+            FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+            if (up != -1) {
+                emit_instruction(compiler, PACK_ABx(GET_UPVALUE, target_reg, up), line);
+                return true;
+            }
+        } else {
+            FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
+        }
     }
     // 1b. If no exact local match, check if local has variadic — needs dispatcher
     if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
@@ -1401,7 +1705,7 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             } else {
                 // Treat as global
                 int name_const = identifier_constant(compiler, name);
-                emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+                emit_get_global(compiler, target_reg, name_const, line, name);
                 return true;
             }
         }
@@ -1448,20 +1752,27 @@ static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_c
             int name_const = make_constant(compiler, OBJ_VAL(str));
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, mangled, strlen(mangled) + 1);
-            emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+            emit_get_global(compiler, target_reg, name_const, line, name);
         } else {
             int name_const = identifier_constant(compiler, name);
-            emit_instruction(compiler, PACK_ABx(GET_GLOBAL, target_reg, name_const), line);
+            emit_get_global(compiler, target_reg, name_const, line, name);
         }
         return true;
     }
 }
 
 static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
+    // Track the current line for synthetic emits that don't have a direct
+    // line at hand (e.g. SPILL_LOAD inside resolve_local). Best-effort —
+    // line attribution is only used for diagnostics, never correctness.
+    if (expr != NULL) compiler->current_line = expr->line;
+
     // Defensive check: if expr is NULL, report error and emit null constant
     if (expr == NULL) {
         compiler->has_error = true;
-        fprintf(stderr, "Internal compiler error: NULL expression encountered\n");
+        pushDiagnostic(compiler->vm, ZYM_DIAG_ERROR,
+                       ZYM_FILE_ID_INVALID, -1, 0, -1, -1,
+                       "Internal compiler error: NULL expression encountered");
         // Emit a null constant as a safe fallback
         Value null_val = NULL_VAL;
         int const_idx = make_constant(compiler, null_val);
@@ -1522,14 +1833,14 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     int k = make_constant(compiler, OBJ_VAL(str));
                     popTempRoot(compiler->vm);
                     scoped_string_free(&mangled);
-                    emit_get_global(compiler, target_reg, k, expr->line);
+                    emit_get_global(compiler, target_reg, k, expr->line, &name);
                 } else if (ar == -2) {
                     // Multiple global overloads exist - create a dispatcher
                     emit_dispatcher(compiler, &name, target_reg, expr->line, false);
                 } else {
                     // No overloads found
                     int k = identifier_constant(compiler, &name);
-                    emit_get_global(compiler, target_reg, k, expr->line);
+                    emit_get_global(compiler, target_reg, k, expr->line, &name);
                 }
             }
             break;
@@ -1552,6 +1863,21 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // Handle compound assignment for variables
             if (is_compound && expr->as.assign.target->type == EXPR_VARIABLE) {
                 Token name = expr->as.assign.target->as.variable.name;
+                // For spilled locals, do the load-op-store dance explicitly
+                // so the new value is written back to the spill slot.
+                int local_idx = resolve_local_index(compiler, &name);
+                if (local_idx != -1 && compiler->locals[local_idx].is_spilled) {
+                    Local* local = &compiler->locals[local_idx];
+                    int scratch = alloc_temp(compiler);
+                    emit_spill_load(compiler, scratch, local->spill_slot, expr->line);
+                    int value_reg = alloc_temp(compiler);
+                    COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
+                    emit_instruction(compiler, PACK_ABC(binary_op, scratch, scratch, value_reg), expr->line);
+                    emit_spill_store(compiler, scratch, local->spill_slot, expr->line);
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, scratch, expr->line);
+                    restore_temp_top_preserve(compiler, saved_top, target_reg);
+                    break;
+                }
                 int target_var_reg = resolve_local(compiler, &name);
 
                 if (target_var_reg != -1) {
@@ -1573,11 +1899,11 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global compound assignment - need to load, modify, store
                     int name_const = identifier_constant(compiler, &name);
                     int temp_reg = alloc_temp(compiler);
-                    emit_get_global(compiler, temp_reg, name_const, expr->line);
+                    emit_get_global(compiler, temp_reg, name_const, expr->line, &name);
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value->as.binary.right, value_reg);
                     emit_instruction(compiler, PACK_ABC(binary_op, temp_reg, temp_reg, value_reg), expr->line);
-                    emit_set_global(compiler, temp_reg, name_const, expr->line);
+                    emit_set_global(compiler, temp_reg, name_const, expr->line, &name);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, temp_reg, expr->line);
                 }
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
@@ -1620,7 +1946,26 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // simple variable
             if (expr->as.assign.target->type == EXPR_VARIABLE) {
                 Token name = expr->as.assign.target->as.variable.name;
-                int reg = resolve_local(compiler, &name);
+                // Inspect the local directly: for a spilled target we
+                // want to write through SPILL_STORE, not read via
+                // SPILL_LOAD that resolve_local would emit.
+                int local_idx = resolve_local_index(compiler, &name);
+                int reg;
+                if (local_idx != -1) {
+                    Local* local = &compiler->locals[local_idx];
+                    if (local->is_spilled) {
+                        int scratch = alloc_temp(compiler);
+                        COMPILE_REQUIRED(compiler, expr->as.assign.value, scratch);
+                        emit_spill_store(compiler, scratch, local->spill_slot, expr->line);
+                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, scratch, expr->line);
+                        restore_temp_top_preserve(compiler, saved_top, target_reg);
+                        break;
+                    }
+                    reg = local->reg;
+                    COMPILER_TRACE_TOK(compiler, &name, ZYM_RES_LOCAL, reg, -1);
+                } else {
+                    reg = -1;
+                }
 
                 if (reg != -1) {
                     // Normal variable: compile value directly into its register
@@ -1637,7 +1982,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     int value_reg = alloc_temp(compiler);
                     COMPILE_REQUIRED(compiler, expr->as.assign.value, value_reg);
                     int name_const = identifier_constant(compiler, &name);
-                    emit_set_global(compiler, value_reg, name_const, expr->line);
+                    emit_set_global(compiler, value_reg, name_const, expr->line, &name);
                     EMIT_MOVE_IF_NEEDED(compiler, target_reg, value_reg, expr->line);
                 }
             }
@@ -1662,9 +2007,43 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     break;
                 }
                 case TOKEN_STRING: {
-                    // Process escape sequences in string literals
-                    const char* raw_str = expr->as.literal.literal.start + 1;  // Skip opening quote
-                    int raw_len = expr->as.literal.literal.length - 2;         // Skip both quotes
+                    // Process escape sequences in string literals. Triple-quoted
+                    // strings ("""...""") use three quote chars on each side
+                    // instead of one; additionally, a single leading newline
+                    // immediately after the opening `"""` is stripped so users
+                    // can put the content on the next line without picking up
+                    // an extra `\n` at the start, and symmetrically a single
+                    // trailing newline immediately before the closing `"""`
+                    // is stripped so the closing delimiter can sit on its own
+                    // line without adding an extra `\n` at the end. Only the
+                    // *first* leading and the *last* trailing newline are
+                    // stripped — any further blank lines / spacing the user
+                    // wrote are preserved verbatim.
+                    const char* lit_start = expr->as.literal.literal.start;
+                    int lit_len = expr->as.literal.literal.length;
+                    bool is_triple = (lit_len >= 6
+                                      && lit_start[0] == '"' && lit_start[1] == '"' && lit_start[2] == '"');
+                    const char* raw_str;
+                    int raw_len;
+                    if (is_triple) {
+                        raw_str = lit_start + 3;
+                        raw_len = lit_len - 6;
+                        if (raw_len > 0 && raw_str[0] == '\n') {
+                            raw_str += 1;
+                            raw_len -= 1;
+                        } else if (raw_len >= 2 && raw_str[0] == '\r' && raw_str[1] == '\n') {
+                            raw_str += 2;
+                            raw_len -= 2;
+                        }
+                        if (raw_len >= 2 && raw_str[raw_len - 2] == '\r' && raw_str[raw_len - 1] == '\n') {
+                            raw_len -= 2;
+                        } else if (raw_len >= 1 && raw_str[raw_len - 1] == '\n') {
+                            raw_len -= 1;
+                        }
+                    } else {
+                        raw_str = lit_start + 1;  // Skip opening quote
+                        raw_len = lit_len - 2;    // Skip both quotes
+                    }
 
                     int processed_len;
                     const char* error_msg = NULL;
@@ -1915,17 +2294,150 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             const int arg_count = expr->as.call.arg_count;
             Expr* callee = expr->as.call.callee;
 
+            // Detect spread arguments. When any argument is a spread (`...x`),
+            // the call's runtime arity isn't known until execution, so we take
+            // a dedicated code path that emits CALL_ARG_PREP + per-arg
+            // CALL_ARG_PUSH / CALL_ARG_SPREAD + CALL_VAR. The fast static path
+            // below stays untouched for all existing (non-spread) call sites.
+            //
+            // Universal-cursor design: rather than splitting args into a fixed
+            // prefix (compile-time slots) and a spread tail (runtime cursor),
+            // *every* arg in a spread call is appended at runtime. This makes
+            // arbitrary interleaving like `f(...a, b, ...c, ...d, e)` trivial
+            // and removes the need for ordering checks.
+            bool has_spread = false;
+            for (int i = 0; i < arg_count; i++) {
+                if (expr->as.call.args[i]->type == EXPR_SPREAD) {
+                    has_spread = true;
+                    break;
+                }
+            }
+
+            if (has_spread) {
+                // Reject spread for struct positional initialization (v1).
+                bool struct_target = false;
+                if (callee->type == EXPR_VARIABLE) {
+                    Token* name = &callee->as.variable.name;
+                    Compiler* search_compiler = compiler;
+                    while (search_compiler != NULL && !struct_target) {
+                        for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
+                            if (tokens_equal(name, &search_compiler->struct_schemas[i].name)) {
+                                struct_target = true;
+                                break;
+                            }
+                        }
+                        search_compiler = search_compiler->enclosing;
+                    }
+                }
+                if (struct_target) {
+                    compiler_error(compiler, expr->line,
+                                   "Spread arguments are not supported in struct positional initialization.");
+                    restore_temp_top_preserve(compiler, saved_top, target_reg);
+                    break;
+                }
+
+                // Layout strategy: to avoid the runtime arg cursor corrupting
+                // the per-arg source-value registers as it grows, we compile
+                // *every* arg source into its own pre-allocated temp register
+                // FIRST (left-to-right), THEN reserve the callee slot ABOVE
+                // all those temps. The cursor (call_base+1, ...) then grows
+                // strictly above the temp region and never overlaps it.
+                //
+                //  Layout (registers, low -> high):
+                //    [ T[0], T[1], ..., T[N-1], callee, arg1, arg2, ... ]
+                //                                ^ call_base   ^ runtime cursor region
+                //
+                // Reentrant safety: inner spread calls fully execute (their
+                // own PREP/PUSH/SPREAD/VAR) during the COMPILE of an arg
+                // source, BEFORE this outer call's CALL_ARG_PREP runs, so
+                // the single-cursor scheme remains correct under nesting.
+                int n_args = arg_count;
+                int* temp_regs = NULL;
+                if (n_args > 0) {
+                    temp_regs = (int*)malloc(sizeof(int) * n_args);
+                }
+                for (int i = 0; i < n_args; i++) {
+                    int src_reg = alloc_temp(compiler);
+                    temp_regs[i] = src_reg;
+                    Expr* arg = expr->as.call.args[i];
+                    Expr* arg_expr = (arg->type == EXPR_SPREAD)
+                                     ? arg->as.spread.expression : arg;
+                    COMPILE_REQUIRED(compiler, arg_expr, src_reg);
+                }
+
+                // Now reserve the callee slot above all temps.
+                int call_base = compiler->next_register;
+                compiler->next_register += 1;
+                if (compiler->next_register > compiler->max_register_seen) {
+                    compiler->max_register_seen = compiler->next_register;
+                }
+
+                // Load callee. We can't use resolve_and_load_function because it
+                // mangles the global lookup with a compile-time arity (e.g.,
+                // `sum3@3`), but with spreads we don't know the arity yet.
+                // Strategy: if the name has any hoisted local/global form,
+                // emit a dispatcher (it groups all overloads + variadic
+                // fallback; OP(CALL) picks one at runtime via resolveOverload).
+                // Otherwise fall back to plain local/upvalue/global lookup
+                // by unmangled name (covers closures-in-vars, native singletons).
+                if (callee->type == EXPR_VARIABLE) {
+                    Token* cname = &callee->as.variable.name;
+                    if (has_any_hoisted_local(compiler, cname)) {
+                        emit_dispatcher(compiler, cname, call_base, callee->line, true);
+                    } else if (has_any_hoisted_global(compiler, cname)) {
+                        emit_dispatcher(compiler, cname, call_base, callee->line, false);
+                    } else {
+                        int reg = resolve_local(compiler, cname);
+                        if (reg != -1) {
+                            emit_move(compiler, call_base, reg, callee->line);
+                        } else if ((reg = resolve_upvalue(compiler, cname)) != -1) {
+                            emit_instruction(compiler, PACK_ABx(GET_UPVALUE, call_base, reg), callee->line);
+                        } else {
+                            int name_const = identifier_constant(compiler, cname);
+                            emit_get_global(compiler, call_base, name_const, callee->line, cname);
+                        }
+                    }
+                } else {
+                    COMPILE_REQUIRED(compiler, callee, call_base);
+                }
+
+                // Initialize the runtime arg cursor at call_base+1 (above all temps).
+                emit_instruction(compiler, PACK_ABx(CALL_ARG_PREP, call_base, 0), expr->line);
+
+                // Emit one PUSH/SPREAD per pre-compiled temp.
+                for (int i = 0; i < n_args; i++) {
+                    Expr* arg = expr->as.call.args[i];
+                    OpCode op = (arg->type == EXPR_SPREAD) ? CALL_ARG_SPREAD : CALL_ARG_PUSH;
+                    emit_instruction(compiler, PACK_ABx(op, temp_regs[i], 0), arg->line);
+                }
+                if (temp_regs) free(temp_regs);
+
+                // Perform the call.
+                emit_instruction(compiler, PACK_ABx(CALL_VAR, call_base, 0), expr->line);
+
+                if (call_base != target_reg) {
+                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, call_base, expr->line);
+                }
+                restore_temp_top_preserve(compiler, saved_top, target_reg);
+                break;
+            }
+
             // Check if this is actually a struct instantiation: StructName(args...)
             if (callee->type == EXPR_VARIABLE) {
                 Token* name = &callee->as.variable.name;
 
                 // Look up if this name refers to a struct schema (check current and enclosing scopes)
                 ObjStructSchema* schema = NULL;
+                Compiler* schema_owner = NULL;
+                int schema_depth = 0;
+                (void)schema_owner; (void)schema_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
                 Compiler* search_compiler = compiler;
                 while (search_compiler != NULL && schema == NULL) {
                     for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
                         if (tokens_equal(name, &search_compiler->struct_schemas[i].name)) {
                             schema = search_compiler->struct_schemas[i].schema;
+                            schema_owner = search_compiler;
+                            schema_depth = search_compiler->struct_schemas[i].depth;
                             break;
                         }
                     }
@@ -1934,6 +2446,18 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                 // If it's a struct schema, handle as positional struct instantiation
                 if (schema) {
+                    /* Phase 4.5c HARD parity: schema constant emission matches the
+                     * resolver's classification of the type-name reference.
+                     *   root compiler + depth 0       -> GLOBAL (top-level decl)
+                     *   declared in current frame     -> LOCAL  (nested decl, same fn)
+                     *   declared in ancestor fn frame -> UPVALUE (cross-fn access)
+                     * This mirrors resolve_local/resolve_upvalue for regular
+                     * identifiers; without it, a function-local struct would
+                     * mismatch the resolver's nested STRUCT reference. */
+                    COMPILER_TRACE_TOK(compiler, name,
+                        (schema_owner->enclosing == NULL && schema_depth == 0) ? ZYM_RES_GLOBAL
+                        : (schema_owner == compiler) ? ZYM_RES_LOCAL
+                        : ZYM_RES_UPVALUE, -1, -1);
                     // Validate argument count matches field count
                     if (arg_count != schema->field_count) {
                         compiler_error(compiler, expr->line,
@@ -2061,6 +2585,20 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 } else {
                     COMPILE_REQUIRED(compiler, callee, call_base);
                 }
+            } else {
+                /* Phase 4.5d scope-aware CALL_SELF parity: CALL_SELF optimizes
+                 * away the callee load (VM uses the frame's current callee).
+                 * The resolver classifies this identifier based on where the
+                 * self-function was declared — top-level func → GLOBAL, nested
+                 * func (declared inside an enclosing function) → UPVALUE.
+                 * Mirror resolve_and_load_function's decision tree so the
+                 * parity trace matches the resolver even though the codegen
+                 * optimization skipped the actual resolution. */
+                COMPILER_TRACE_TOK(compiler, &callee->as.variable.name,
+                    is_hoisted_in_enclosing(compiler, &callee->as.variable.name, arg_count)
+                        ? ZYM_RES_UPVALUE
+                        : ZYM_RES_GLOBAL,
+                    -1, -1);
             }
 
             // Compile arguments - simple pass-by-value
@@ -2175,11 +2713,16 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             // Lookup struct schema (check current and enclosing scopes)
             ObjStructSchema* schema = NULL;
+            Compiler* schema_owner = NULL;
+            int schema_depth = 0;
+            (void)schema_owner; (void)schema_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
             Compiler* search_compiler = compiler;
             while (search_compiler != NULL && schema == NULL) {
                 for (int i = search_compiler->struct_schema_count - 1; i >= 0; i--) {
                     if (tokens_equal(&struct_expr->struct_name, &search_compiler->struct_schemas[i].name)) {
                         schema = search_compiler->struct_schemas[i].schema;
+                        schema_owner = search_compiler;
+                        schema_depth = search_compiler->struct_schemas[i].depth;
                         break;
                     }
                 }
@@ -2187,10 +2730,19 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             }
 
             if (!schema) {
-                compiler_error(compiler, expr->line, "Undefined struct '%.*s'", struct_expr->struct_name.length, struct_expr->struct_name.start);
+                compiler_error_at(compiler, &struct_expr->struct_name, "Undefined struct '%.*s'", struct_expr->struct_name.length, struct_expr->struct_name.start);
                 restore_temp_top_preserve(compiler, saved_top, target_reg);
                 break;
             }
+
+            /* Phase 4.5c HARD parity: schema constant emission matches the
+             * resolver's classification of the type-name reference (GLOBAL
+             * for root+depth0, LOCAL for current-frame decl, UPVALUE for
+             * ancestor-frame decl). See EXPR_CALL struct-call site for rationale. */
+            COMPILER_TRACE_TOK(compiler, &struct_expr->struct_name,
+                (schema_owner->enclosing == NULL && schema_depth == 0) ? ZYM_RES_GLOBAL
+                : (schema_owner == compiler) ? ZYM_RES_LOCAL
+                : ZYM_RES_UPVALUE, -1, -1);
 
             // Add schema to constants
             int schema_const = make_constant(compiler, OBJ_VAL(schema));
@@ -2249,7 +2801,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     }
 
                     if (field_index == -1) {
-                        compiler_error(compiler, expr->line, "Unknown field '%.*s' in struct '%.*s'",
+                        compiler_error_at(compiler, &struct_expr->field_names[i], "Unknown field '%.*s' in struct '%.*s'",
                                        struct_expr->field_names[i].length, struct_expr->field_names[i].start,
                                        schema->name->length, schema->name->chars);
                         continue;
@@ -2257,7 +2809,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
                     // Check for duplicate field initialization
                     if (field_initialized[field_index]) {
-                        compiler_error(compiler, expr->line, "Duplicate field '%.*s' in struct initialization",
+                        compiler_error_at(compiler, &struct_expr->field_names[i], "Duplicate field '%.*s' in struct initialization",
                                        struct_expr->field_names[i].length, struct_expr->field_names[i].start);
                         continue;
                     }
@@ -2326,9 +2878,34 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // First, check if this is actually an enum value access (EnumName.VARIANT)
             if (get_expr->object->type == EXPR_VARIABLE) {
                 Token* enum_name = &get_expr->object->as.variable.name;
-                ObjEnumSchema* enum_schema = get_enum_schema(compiler, enum_name);
+                /* Walk enclosing compilers to locate the declaring frame (needed
+                 * for Phase 4.5c HARD parity trace kind). */
+                ObjEnumSchema* enum_schema = NULL;
+                Compiler* enum_owner = NULL;
+                int enum_depth = 0;
+                (void)enum_owner; (void)enum_depth;  /* used by COMPILER_TRACE_TOK when ZYM_HAS_BUILD_TESTING=1 */
+                for (Compiler* c = compiler; c != NULL && enum_schema == NULL; c = c->enclosing) {
+                    for (int i = c->enum_schema_count - 1; i >= 0; i--) {
+                        if (tokens_equal(enum_name, &c->enum_schemas[i].name)) {
+                            enum_schema = c->enum_schemas[i].schema;
+                            enum_owner = c;
+                            enum_depth = c->enum_schemas[i].depth;
+                            break;
+                        }
+                    }
+                }
 
                 if (enum_schema) {
+                    /* Phase 4.5c HARD parity: enum value materialization matches
+                     * the resolver's classification of the enum type name
+                     * (GLOBAL for root+depth0, LOCAL for current-frame decl,
+                     * UPVALUE for ancestor-frame decl). The variant name is bound
+                     * to a VARIANT child symbol by the resolver and is currently
+                     * skipped by the parity test (PROPERTY trace follow-up). */
+                    COMPILER_TRACE_TOK(compiler, enum_name,
+                        (enum_owner->enclosing == NULL && enum_depth == 0) ? ZYM_RES_GLOBAL
+                        : (enum_owner == compiler) ? ZYM_RES_LOCAL
+                        : ZYM_RES_UPVALUE, -1, -1);
                     // This is an enum value access, not a property access
                     Token* variant_name = &get_expr->name;
 
@@ -2345,7 +2922,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     }
 
                     if (variant_index == -1) {
-                        compiler_error(compiler, expr->line, "Undefined variant '%.*s' in enum '%.*s'",
+                        compiler_error_at(compiler, variant_name, "Undefined variant '%.*s' in enum '%.*s'",
                                      variant_name->length, variant_name->start,
                                      enum_name->length, enum_name->start);
                         restore_temp_top_preserve(compiler, saved_top, target_reg);
@@ -2548,6 +3125,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: PRE_INC directly on register
                     emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, reg, 0), expr->line);
+                    // Spilled-local writeback: reg is a scratch with the
+                    // new value; push it back to the spill slot.
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, increment, store back
                     int temp = alloc_temp(compiler);
@@ -2558,9 +3138,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, increment, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_INC, target_reg, temp, 0), expr->line);
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, target_reg, name_const), expr->line);
+                    emit_set_global(compiler, target_reg, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
@@ -2595,7 +3175,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Pre-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2612,6 +3192,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: POST_INC directly on register
                     emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, reg, 0), expr->line);
+                    // Spilled-local writeback: reg (scratch) now holds the
+                    // new value; target_reg holds the old value returned
+                    // to the caller. We must persist the new value.
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, increment, store back
                     int temp = alloc_temp(compiler);
@@ -2623,10 +3207,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, increment, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_INC, target_reg, temp, 0), expr->line);
                     // POST_INC returns old value, temp now has incremented value
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, temp, name_const), expr->line);
+                    emit_set_global(compiler, temp, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]++
@@ -2661,7 +3245,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Post-increment operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2678,6 +3262,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: PRE_DEC directly on register
                     emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, reg, 0), expr->line);
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, decrement, store back
                     int temp = alloc_temp(compiler);
@@ -2688,9 +3273,9 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, decrement, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(PRE_DEC, target_reg, temp, 0), expr->line);
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, target_reg, name_const), expr->line);
+                    emit_set_global(compiler, target_reg, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]--
@@ -2728,7 +3313,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, target_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Pre-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2745,6 +3330,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (reg != -1) {
                     // Local variable: POST_DEC directly on register
                     emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, reg, 0), expr->line);
+                    maybe_writeback_spilled_local(compiler, name, reg, expr->line);
                 } else if ((reg = resolve_upvalue(compiler, name)) != -1) {
                     // Upvalue: load, decrement, store back
                     int temp = alloc_temp(compiler);
@@ -2756,10 +3342,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                     // Global: load, decrement, store back
                     int name_const = identifier_constant(compiler, name);
                     int temp = alloc_temp(compiler);
-                    emit_get_global(compiler, temp, name_const, expr->line);
+                    emit_get_global(compiler, temp, name_const, expr->line, name);
                     emit_instruction(compiler, PACK_ABC(POST_DEC, target_reg, temp, 0), expr->line);
                     // POST_DEC returns old value, temp now has decremented value
-                    emit_instruction(compiler, PACK_ABx(SET_GLOBAL, temp, name_const), expr->line);
+                    emit_set_global(compiler, temp, name_const, expr->line, name);
                 }
             } else if (target_expr->type == EXPR_SUBSCRIPT) {
                 // Subscript: arr[i]--
@@ -2797,7 +3383,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 emit_instruction(compiler, PACK_ABC(SET_MAP_PROPERTY_L, obj_reg, 0, val_reg), expr->line);
                 writeInstruction(compiler->vm, compiler->compiling_chunk, (uint32_t)key_const, expr->line);
             } else {
-                compiler_error_and_exit(expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
+                compiler_error(compiler, expr->line, "Post-decrement operator can only be applied to variables, subscripts, or properties.");
             }
             restore_temp_top_preserve(compiler, saved_top, target_reg);
             break;
@@ -2913,7 +3499,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
     // Defensive check: if stmt is NULL, report error and return
     if (stmt == NULL) {
         compiler->has_error = true;
-        fprintf(stderr, "Internal compiler error: NULL statement encountered\n");
+        pushDiagnostic(compiler->vm, ZYM_DIAG_ERROR,
+                       ZYM_FILE_ID_INVALID, -1, 0, -1, -1,
+                       "Internal compiler error: NULL statement encountered");
         return false;
     }
 
@@ -2938,16 +3526,37 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 VarDecl* var = &var_stmt->variables[i];
                 if (compiler->scope_depth > 0) { // Local variable
                     declare_variable(compiler, &var->name);
-                    int value_reg = reserve_register(compiler);
-                    if (var->initializer) {
-                        compile_expression(compiler, var->initializer, value_reg);
-                    } else {
-                        int null_const = make_constant(compiler, NULL_VAL);
-                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                    int value_reg = -1;
+                    bool spilled = false;
+                    uint16_t spill_slot = 0;
+                    if (reserve_local_register(compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                        // diagnostic already emitted
+                        break;
                     }
-                    add_local_at_reg(compiler, var->name, value_reg);
+                    if (spilled) {
+                        // No physical reg for this local — compile the
+                        // initializer into a scratch temp and evict it
+                        // to the spill slot.
+                        int scratch = alloc_temp(compiler);
+                        if (var->initializer) {
+                            compile_expression(compiler, var->initializer, scratch);
+                        } else {
+                            int null_const = make_constant(compiler, NULL_VAL);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), stmt->line);
+                        }
+                        emit_spill_store(compiler, scratch, spill_slot, stmt->line);
+                        add_local_spilled(compiler, var->name, spill_slot);
+                    } else {
+                        if (var->initializer) {
+                            compile_expression(compiler, var->initializer, value_reg);
+                        } else {
+                            int null_const = make_constant(compiler, NULL_VAL);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), stmt->line);
+                        }
+                        add_local_at_reg(compiler, var->name, value_reg);
+                    }
 
-                    // Check for struct type
+                    // Check for struct type (applies whether spilled or not)
                     if (var->initializer && var->initializer->type == EXPR_STRUCT_INST) {
                         ObjStructSchema* struct_schema = get_struct_schema(compiler, &var->initializer->as.struct_inst.struct_name);
                         if (struct_schema) {
@@ -3168,7 +3777,9 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 emit_move(compiler, name_ident, closure_reg, stmt->line);
             } else {
                 // For a global function, update the global variable.
-                emit_set_global(compiler, closure_reg, name_ident, stmt->line);
+                /* Phase 4.5: declaration site — resolver emits a DEFINITION,
+                 * not a reference. Pass NULL to skip GLOBAL trace emission. */
+                emit_set_global(compiler, closure_reg, name_ident, stmt->line, NULL);
             }
             return false;
         }
@@ -3223,11 +3834,24 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     for (int j = 0; j < var_stmt->count; j++) {
                         VarDecl* var = &var_stmt->variables[j];
                         declare_variable(compiler, &var->name);
-                        int value_reg = reserve_register(compiler);
-                        // Initialize to null for now; actual initializer will be evaluated later
+                        int value_reg = -1;
+                        bool spilled = false;
+                        uint16_t spill_slot = 0;
+                        if (reserve_local_register(compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                            break;  // diagnostic already emitted
+                        }
                         int null_const = make_constant(compiler, NULL_VAL);
-                        emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), block->statements[i]->line);
-                        add_local_at_reg(compiler, var->name, value_reg);
+                        if (spilled) {
+                            int saved_top = save_temp_top(compiler);
+                            int scratch = alloc_temp(compiler);
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), block->statements[i]->line);
+                            emit_spill_store(compiler, scratch, spill_slot, block->statements[i]->line);
+                            add_local_spilled(compiler, var->name, spill_slot);
+                            restore_temp_top(compiler, saved_top);
+                        } else {
+                            emit_instruction(compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), block->statements[i]->line);
+                            add_local_at_reg(compiler, var->name, value_reg);
+                        }
                     }
                 }
             }
@@ -3272,24 +3896,33 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     VarDeclStmt* var_stmt = &s->as.var_declaration;
                     for (int j = 0; j < var_stmt->count; j++) {
                         VarDecl* var = &var_stmt->variables[j];
-                        int var_reg = resolve_local(compiler, &var->name);
+                        // Look up the local directly so we can branch on
+                        // is_spilled without resolve_local emitting a
+                        // SPILL_LOAD we don't actually need (we want to
+                        // *write* the initializer, not read the slot).
+                        int idx = resolve_local_index(compiler, &var->name);
+                        if (idx == -1) continue;
+                        Local* local = &compiler->locals[idx];
 
-                        if (var_reg != -1) {
-                            // Variable was pre-declared - just compile the initializer
+                        if (local->is_spilled) {
+                            int scratch = alloc_temp(compiler);
+                            if (var->initializer) {
+                                compile_expression(compiler, var->initializer, scratch);
+                            } else {
+                                int null_const = make_constant(compiler, NULL_VAL);
+                                emit_instruction(compiler, PACK_ABx(LOAD_CONST, scratch, null_const), s->line);
+                            }
+                            emit_spill_store(compiler, scratch, local->spill_slot, s->line);
+                        } else {
+                            int var_reg = local->reg;
                             if (var->initializer) {
                                 compile_expression(compiler, var->initializer, var_reg);
                             } else {
                                 int null_const = make_constant(compiler, NULL_VAL);
                                 emit_instruction(compiler, PACK_ABx(LOAD_CONST, var_reg, null_const), s->line);
                             }
-                            // Mark as initialized
-                            for (int k = 0; k < compiler->local_count; k++) {
-                                if (compiler->locals[k].reg == var_reg) {
-                                    compiler->locals[k].is_initialized = true;
-                                    break;
-                                }
-                            }
                         }
+                        local->is_initialized = true;
                     }
                     continue;
                 }
@@ -3305,6 +3938,19 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                     terminates = true;
                     // Note: We still compile remaining statements for error checking
                     // but we know the block terminates
+                }
+
+                // Reclaim temps the statement allocated but didn't release.
+                // Mirrors the function-body Pass 3 reset (scope_depth==1)
+                // so deeply nested blocks don't pin next_register at the
+                // cap. Floor is the top-of-locals-physical-area; spilled
+                // locals don't shrink the safe zone.
+                {
+                    int floor = phys_local_count(compiler);
+                    if (compiler->next_register > floor) {
+                        compiler->next_register = floor;
+                    }
+                    compiler->temp_free_top = 0;
                 }
             }
 
@@ -3334,12 +3980,25 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                 // Check if we are assigning to a simple local variable.
                 if (assign->target->type == EXPR_VARIABLE) {
                     Token name = assign->target->as.variable.name;
-                    int reg = resolve_local(compiler, &name);
-                    if (reg != -1) {
-                        // Compile the value directly into the variable's home register.
-                        // We don't need to ask for the result in a new temp register.
-                        compile_expression(compiler, assign->value, reg);
-                        return false; // Optimization complete, statement does not terminate.
+                    // For spilled locals we can't use resolve_local's
+                    // SPILL_LOAD-into-scratch read path here — the assign
+                    // is a *write*, so we want the value in a scratch
+                    // and then SPILL_STORE, not a load first.
+                    int local_idx = resolve_local_index(compiler, &name);
+                    if (local_idx != -1) {
+                        Local* local = &compiler->locals[local_idx];
+                        if (local->is_spilled) {
+                            int saved_top = save_temp_top(compiler);
+                            int scratch = alloc_temp(compiler);
+                            compile_expression(compiler, assign->value, scratch);
+                            emit_spill_store(compiler, scratch, local->spill_slot, stmt->line);
+                            restore_temp_top(compiler, saved_top);
+                            return false;
+                        }
+                        // Non-spilled local: compile straight into its register.
+                        compile_expression(compiler, assign->value, local->reg);
+                        COMPILER_TRACE_TOK(compiler, &name, ZYM_RES_LOCAL, local->reg, -1);
+                        return false;
                     }
                 }
             }
@@ -3639,7 +4298,7 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             // Check if label already exists
             if (find_label(compiler, label_name)) {
-                compiler_error(compiler, stmt->line, "Label '%.*s' already defined", label_name->length, label_name->start);
+                compiler_error_at(compiler, label_name, "Label '%.*s' already defined", label_name->length, label_name->start);
                 break;
             }
 
@@ -3841,6 +4500,14 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->max_register_seen = 0;
     compiler->temp_free_top = 0;
 
+    compiler->local_alloc_cap = MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT;
+    compiler->temp_alloc_cap = MAX_PHYSICAL_REGS;
+    compiler->spill_count = 0;
+    compiler->peak_concurrent_spills = 0;
+    compiler->spill_loads_emitted = 0;
+    compiler->spill_stores_emitted = 0;
+    compiler->current_line = -1;
+
     compiler->local_count = 0;
     compiler->scope_depth = 0;
 
@@ -3926,16 +4593,16 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
             memcmp(compiler->hoisted[i].name.start, func_stmt->name.start, func_stmt->name.length) == 0) {
             // Variadic: only one variadic per base name
             if (is_variadic && compiler->hoisted[i].is_variadic) {
-                fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start);
-                exit(1);
+                compiler_error_at(compiler, &func_stmt->name,
+                    "Variadic function '%.*s' is already defined.",
+                    func_stmt->name.length, func_stmt->name.start);
             }
             // Non-variadic: check same arity
             if (!is_variadic && !compiler->hoisted[i].is_variadic &&
                 compiler->hoisted[i].arity == func_stmt->param_count) {
-                fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
-                exit(1);
+                compiler_error_at(compiler, &func_stmt->name,
+                    "Function '%.*s' with %d parameter(s) is already defined.",
+                    func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
             }
         }
     }
@@ -3954,16 +4621,17 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
         Value existing;
         if (tableGet(&compiler->vm->globals, check_str, &existing) &&
             (IS_NATIVE_FUNCTION(existing) || IS_NATIVE_CLOSURE(existing))) {
-            if (is_variadic) {
-                fprintf(stderr, "Error at line %d: Cannot redefine native variadic function '%.*s'.\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start);
-            } else {
-                fprintf(stderr, "Error at line %d: Cannot redefine native function '%.*s' with %d parameter(s).\n",
-                        stmt->line, func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
-            }
             popTempRoot(compiler->vm);
             FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
-            exit(1);
+            if (is_variadic) {
+                compiler_error_at(compiler, &func_stmt->name,
+                    "Cannot redefine native variadic function '%.*s'.",
+                    func_stmt->name.length, func_stmt->name.start);
+            } else {
+                compiler_error_at(compiler, &func_stmt->name,
+                    "Cannot redefine native function '%.*s' with %d parameter(s).",
+                    func_stmt->name.length, func_stmt->name.start, func_stmt->param_count);
+            }
         }
         popTempRoot(compiler->vm);
         FREE_ARRAY(compiler->vm, char, check_mangled, strlen(check_mangled) + 1);
@@ -4016,15 +4684,15 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
                     if (c->local_hoisted[i].name.length == fd->name.length &&
                         memcmp(c->local_hoisted[i].name.start, fd->name.start, fd->name.length) == 0) {
                         if (is_variadic && c->local_hoisted[i].is_variadic) {
-                            fprintf(stderr, "Error at line %d: Variadic function '%.*s' is already defined in this scope.\n",
-                                    s->line, fd->name.length, fd->name.start);
-                            exit(1);
+                            compiler_error_at(c, &fd->name,
+                                "Variadic function '%.*s' is already defined in this scope.",
+                                fd->name.length, fd->name.start);
                         }
                         if (!is_variadic && !c->local_hoisted[i].is_variadic &&
                             c->local_hoisted[i].arity == fd->param_count) {
-                            fprintf(stderr, "Error at line %d: Function '%.*s' with %d parameter(s) is already defined in this scope.\n",
-                                    s->line, fd->name.length, fd->name.start, fd->param_count);
-                            exit(1);
+                            compiler_error_at(c, &fd->name,
+                                "Function '%.*s' with %d parameter(s) is already defined in this scope.",
+                                fd->name.length, fd->name.start, fd->param_count);
                         }
                     }
                 }
@@ -4220,6 +4888,11 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     Compiler fn_compiler = {0};  // Zero-initialize to prevent garbage values during GC
     init_compiler(&fn_compiler, current_compiler->vm, current_compiler);
 
+    // Inherit the spill-test register caps from the enclosing compiler
+    // so nested functions exercise the same forced-spill window.
+    fn_compiler.local_alloc_cap = current_compiler->local_alloc_cap;
+    fn_compiler.temp_alloc_cap  = current_compiler->temp_alloc_cap;
+
     // Create a new function object for the body we are about to compile.
     ObjFunction* function = newFunction(fn_compiler.vm);
 
@@ -4241,9 +4914,23 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     if (stmt->name.length > 9 && memcmp(stmt->name.start, "__module_", 9) == 0) {
         // Case 1: We are compiling a Module Factory.
         // Decode encoded path: "__module_src_slash_math_dot_zym" -> "src/math.zym"
-        char* decoded_path = decodeModulePath(&fn_compiler.vm->allocator, stmt->name.start + 9, stmt->name.length - 9);
+        // Non-fresh modules are emitted by module_loader as a wrapper
+        // function named `__module_<encoded>_init` whose return value is
+        // cached in `var __module_<encoded> = __module_<encoded>_init()`.
+        // The trailing `_init` is purely an emission artifact -- strip it
+        // (only when it is the LAST segment of the encoded portion) so
+        // runtime error frames report `[localModuleOne.zym]` rather than
+        // `[localModuleOne.zym_init]`. A module whose real path happens to
+        // contain "init" elsewhere (e.g. `init_helpers.zym`) is unaffected
+        // because we only chop a trailing `_init` suffix.
+        int enc_len = stmt->name.length - 9;
+        const char* enc_start = stmt->name.start + 9;
+        if (enc_len > 5 && memcmp(enc_start + enc_len - 5, "_init", 5) == 0) {
+            enc_len -= 5;
+        }
+        char* decoded_path = decodeModulePath(&fn_compiler.vm->allocator, enc_start, enc_len);
         fn_compiler.current_module_name = copyString(fn_compiler.vm, decoded_path, strlen(decoded_path));
-        ZYM_FREE(&fn_compiler.vm->allocator, decoded_path, stmt->name.length - 9 + 1);
+        ZYM_FREE(&fn_compiler.vm->allocator, decoded_path, enc_len + 1);
     }
     else if (current_compiler->current_module_name != NULL) {
         // Case 2: We are inside a module (e.g. 'sum' inside 'array_utils'). Inherit it.
@@ -4341,17 +5028,40 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
             for (int j = 0; j < var_stmt->count; j++) {
                 VarDecl* var = &var_stmt->variables[j];
                 declare_variable(&fn_compiler, &var->name);
-                int value_reg = reserve_register(&fn_compiler);
-                if (has_closures || var->initializer == NULL) {
-                    // Initialize to null when:
-                    // 1. Closures exist: closures compiled in Pass 2 may capture this variable
-                    //    before its initializer runs in Pass 3, so it must have a defined value.
-                    // 2. No initializer: "var x" with no initializer must be null, and there's
-                    //    no Pass 3 initializer to overwrite it.
-                    int null_const = make_constant(&fn_compiler, NULL_VAL);
-                    emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                int value_reg = -1;
+                bool spilled = false;
+                uint16_t spill_slot = 0;
+                if (reserve_local_register(&fn_compiler, &value_reg, &spilled, &spill_slot) != 0) {
+                    break;
                 }
-                add_local_at_reg(&fn_compiler, var->name, value_reg);
+                bool need_init = (has_closures || var->initializer == NULL);
+                if (spilled) {
+                    // Always null-initialize spilled locals: even when Pass 3
+                    // will overwrite the slot, the spill area's contents at
+                    // function entry are whatever the previous frame left
+                    // (or whatever stack growth zeroed). Leaving them
+                    // uninitialized would break Pass 2's closure compilation
+                    // path if it ever reads through the spill before Pass 3
+                    // runs.
+                    int saved_top = save_temp_top(&fn_compiler);
+                    int scratch = alloc_temp(&fn_compiler);
+                    int null_const = make_constant(&fn_compiler, NULL_VAL);
+                    emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, scratch, null_const), body->statements[i]->line);
+                    emit_spill_store(&fn_compiler, scratch, spill_slot, body->statements[i]->line);
+                    add_local_spilled(&fn_compiler, var->name, spill_slot);
+                    restore_temp_top(&fn_compiler, saved_top);
+                } else {
+                    if (need_init) {
+                        // Initialize to null when:
+                        // 1. Closures exist: closures compiled in Pass 2 may capture this variable
+                        //    before its initializer runs in Pass 3, so it must have a defined value.
+                        // 2. No initializer: "var x" with no initializer must be null, and there's
+                        //    no Pass 3 initializer to overwrite it.
+                        int null_const = make_constant(&fn_compiler, NULL_VAL);
+                        emit_instruction(&fn_compiler, PACK_ABx(LOAD_CONST, value_reg, null_const), body->statements[i]->line);
+                    }
+                    add_local_at_reg(&fn_compiler, var->name, value_reg);
+                }
             }
         }
     }
@@ -4396,18 +5106,17 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
                 // Normal variable - just evaluate the initializer
                 if (var->initializer) {
-                    int var_reg = resolve_local(&fn_compiler, &var->name);
-                    if (var_reg != -1) {
-                        compile_expression(&fn_compiler, var->initializer, var_reg);
-
-                        // Mark the variable as initialized
-                        for (int k = 0; k < fn_compiler.local_count; k++) {
-                            if (fn_compiler.locals[k].reg == var_reg) {
-                                fn_compiler.locals[k].is_initialized = true;
-                                break;
-                            }
-                        }
+                    int idx = resolve_local_index(&fn_compiler, &var->name);
+                    if (idx == -1) continue;
+                    Local* local = &fn_compiler.locals[idx];
+                    if (local->is_spilled) {
+                        int scratch = alloc_temp(&fn_compiler);
+                        compile_expression(&fn_compiler, var->initializer, scratch);
+                        emit_spill_store(&fn_compiler, scratch, local->spill_slot, s->line);
+                    } else {
+                        compile_expression(&fn_compiler, var->initializer, local->reg);
                     }
+                    local->is_initialized = true;
                 }
             }
         } else {
@@ -4416,7 +5125,10 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         }
 
         if (fn_compiler.scope_depth == 1) {
-            fn_compiler.next_register = fn_compiler.local_count;
+            // Reclaim temps allocated by this statement back down to the
+            // top of the locals' physical area. Spilled locals consume no
+            // physical reg, so they don't raise the floor.
+            fn_compiler.next_register = phys_local_count(&fn_compiler);
             fn_compiler.temp_free_top = 0;
         }
     }
@@ -4429,12 +5141,15 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         PendingGoto* pending = &fn_compiler.pending_gotos[i];
         if (!pending->is_resolved) {
             Token* target = &pending->target_label;
-            compiler_error(&fn_compiler, target->line, "goto to undefined label '%.*s'", target->length, target->start);
+            compiler_error_at(&fn_compiler, target, "goto to undefined label '%.*s'", target->length, target->start);
         }
     }
 
-    // Calculate max_regs: highest register used + 1
+    // Calculate max_regs: highest register used + 1.
+    // The spill area lives at [base+max_regs .. base+max_regs+spill_count)
+    // — see growStackForCall in vm.c which sizes the frame accordingly.
     fn_compiler.function->max_regs = fn_compiler.max_register_seen + 1;
+    fn_compiler.function->spill_count = fn_compiler.spill_count;
 
     fn_compiler.function->upvalue_count = fn_compiler.upvalue_count;
     if (fn_compiler.upvalue_count > 0) {
@@ -4474,13 +5189,148 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     return fn_compiler.function;
 }
 
-bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, const char* entry_file, CompilerConfig config) {
-    AstResult ast = parse(vm, source, line_map, entry_file);
-    if (ast.statements == NULL) return false;
+#if ZYM_HAS_PARSE_TREE_RETENTION
+// Phase 3 — Parse-only compile mode. Shares the sfr_reset +
+// sfr_register + trivia-alloc + parse() prologue with compile(), then
+// stops before any codegen. No Chunk is touched. On success the AST
+// is handed into a heap-allocated ZymParseTree that the caller owns.
+bool parseOnly(VM* vm, const char* source,
+               const SourceMap* source_map,
+               const char* entry_file,
+               ZymParseTree** out_tree) {
+    if (out_tree == NULL) return false;
+    *out_tree = NULL;
+
+    // Phase 1.7: do not wipe the registry — the embedder may have
+    // pre-registered origin source files whose ids the SourceMap's
+    // segments reference. See the matching note in `compile()`.
+    size_t source_length = source != NULL ? strlen(source) : 0;
+    ZymFileId file_id = sfr_register(vm, &vm->source_files,
+                                     entry_file, source, source_length);
+
+    // Always allocate a trivia buffer in PARSE_ONLY mode — the tree
+    // exists purely for tooling consumption, so trivia is part of the
+    // expected payload.
+    TriviaBuffer* trivia = ALLOCATE(vm, TriviaBuffer, 1);
+    trivia_init(trivia);
+
+    AstResult ast = parse(vm, source, source_map, entry_file, file_id, trivia);
+    if (ast.statements == NULL) {
+        trivia_free(vm, trivia);
+        FREE(vm, TriviaBuffer, trivia);
+        return false;
+    }
+
+    // Cancellation may have fired inside parse(); check and bail out
+    // with a retained diagnostic so hosts can distinguish cancel from
+    // a clean parse.
+    if (vm->compile_cancelled) {
+        pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                       -1, 0, -1, -1, "Compilation cancelled.");
+        for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
+        FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+        trivia_free(vm, trivia);
+        FREE(vm, TriviaBuffer, trivia);
+        return false;
+    }
+
+    *out_tree = parse_tree_new(vm, ast, file_id, trivia);
+    return true;
+}
+#endif
+
+#if ZYM_HAS_SYMBOL_TABLE
+#include "./resolver.h"
+
+bool checkCompile(VM* vm, const char* source,
+                  const SourceMap* source_map,
+                  const char* entry_file,
+                  ZymParseTree** out_tree,
+                  struct ZymSymbolTable** out_table) {
+    if (out_tree == NULL || out_table == NULL) return false;
+    *out_tree = NULL;
+    *out_table = NULL;
+
+    if (!parseOnly(vm, source, source_map, entry_file, out_tree)) {
+        return false;
+    }
+
+    ZymSymbolTable* table = symbol_table_new(vm);
+    if (!resolver_resolve_top_level(vm, *out_tree, table)) {
+        symbol_table_free(vm, table);
+        parse_tree_free(vm, *out_tree);
+        *out_tree = NULL;
+        return false;
+    }
+    *out_table = table;
+    return true;
+}
+#endif
+
+bool compile(VM* vm, const char* source, Chunk* chunk,
+             const SourceMap* source_map,
+             const char* entry_file, CompilerConfig config,
+             ZymParseTree** out_tree) {
+    if (out_tree) *out_tree = NULL;
+    // Phase 1.1 / 1.7: register the preprocessed source buffer with the
+    // VM's SourceFileRegistry so scanner tokens can refer back to it by
+    // ZymFileId. Embedders that drive the pipeline manually (CLI, LSP,
+    // batch tooling) typically register the *original* user-visible
+    // sources first (entry + each imported module) and pass their ids
+    // into `zym_preprocess`, which stamps every SourceMap segment with
+    // the matching origin id. We must not wipe those registrations here
+    // — the SourceMap segments would point at dead ids, and diagnostic
+    // renderers that look up the snippet via `d->fileId` would fall
+    // back to the post-preprocess buffer, producing the misaligned
+    // "line N from the origin file printed under preprocessed line N"
+    // bug. We therefore append the preprocessed buffer to whatever the
+    // caller already populated. When no caller pre-registered anything
+    // (legacy single-call sites that only invoke `compile`) the
+    // registry is naturally empty and this still gives the preprocessed
+    // buffer fileId 0, matching the pre-1.7 behavior.
+    size_t source_length = source != NULL ? strlen(source) : 0;
+    ZymFileId file_id = sfr_register(vm, &vm->source_files, entry_file, source, source_length);
+
+    // Phase 2.3: allocate a trivia side buffer iff the caller asked for
+    // a retained parse tree and the build has PARSE_TREE_RETENTION on.
+    // Otherwise `trivia` stays NULL and the scanner records nothing.
+    TriviaBuffer* trivia = NULL;
+#if ZYM_HAS_PARSE_TREE_RETENTION
+    if (out_tree != NULL) {
+        trivia = ALLOCATE(vm, TriviaBuffer, 1);
+        trivia_init(trivia);
+    }
+#endif
+
+    AstResult ast = parse(vm, source, source_map, entry_file, file_id, trivia);
+    if (ast.statements == NULL) {
+        if (trivia != NULL) {
+            trivia_free(vm, trivia);
+            FREE(vm, TriviaBuffer, trivia);
+        }
+        return false;
+    }
 
     // Use init_compiler to set up the top-level compiler correctly.
     Compiler compiler = {0};  // Zero-initialize to prevent garbage values during GC
     init_compiler(&compiler, vm, NULL); // The top-level script has no enclosing compiler.
+
+    // Debug knob: ZYM_FORCE_SPILL_AT=N lowers the per-function local-alloc
+    // cap to N (with SPILL_SCRATCH_COUNT regs of scratch headroom above
+    // for SPILL_LOAD targets). Lets the spill paths trigger on tiny test
+    // programs that would otherwise never exhaust the 256-reg window.
+    // The cap is inherited by all nested function compilers via
+    // compile_function_body.
+    {
+        const char* force_spill = getenv("ZYM_FORCE_SPILL_AT");
+        if (force_spill && force_spill[0]) {
+            int n = atoi(force_spill);
+            if (n > 0 && n <= MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT) {
+                compiler.local_alloc_cap = n;
+                compiler.temp_alloc_cap  = n + SPILL_SCRATCH_COUNT;
+            }
+        }
+    }
 
     // Register this compiler with the VM so GC can mark compiler roots
     vm->compiler = &compiler;
@@ -4502,6 +5352,15 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
     // --- PASS 1: DECLARATION ---
     // Find all function, struct, and enum declarations first to allow for hoisting.
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        // Phase 1.5: cooperative cancellation. Polling at every statement
+        // boundary in the top-level emit loops keeps worst-case
+        // latency bounded by the cost of compiling a single statement.
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type == STMT_FUNC_DECLARATION) {
             declare_function(&compiler, ast.statements[i]);
         } else if (ast.statements[i]->type == STMT_STRUCT_DECLARATION) {
@@ -4519,6 +5378,12 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
     // Pass 2a: Compile function definitions and process directives in source order.
     // This ensures directives affect functions that come after them.
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type == STMT_COMPILER_DIRECTIVE) {
             // Process directive immediately to affect subsequent functions
             CompilerDirectiveStmt* dir = &ast.statements[i]->as.compiler_directive;
@@ -4550,6 +5415,12 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
     // respecting scope-level directives.
     int last_line = 0;
     for (int i = 0; ast.statements[i] != NULL; i++) {
+        if (vm->compile_cancelled) {
+            pushDiagnostic(vm, ZYM_DIAG_ERROR, ZYM_FILE_ID_INVALID,
+                           -1, 0, -1, -1, "Compilation cancelled.");
+            compiler.has_error = true;
+            goto cleanup_on_error;
+        }
         if (ast.statements[i]->type != STMT_FUNC_DECLARATION &&
             ast.statements[i]->type != STMT_COMPILER_DIRECTIVE &&
             ast.statements[i]->type != STMT_STRUCT_DECLARATION &&
@@ -4580,7 +5451,7 @@ bool compile(VM* vm, const char* source, Chunk* chunk, const LineMap* line_map, 
         PendingGoto* pending = &compiler.pending_gotos[i];
         if (!pending->is_resolved) {
             Token* target = &pending->target_label;
-            compiler_error(&compiler, target->line, "goto to undefined label '%.*s'", target->length, target->start);
+            compiler_error_at(&compiler, target, "goto to undefined label '%.*s'", target->length, target->start);
         }
     }
 
@@ -4608,25 +5479,39 @@ cleanup_on_error:
         FREE_ARRAY(vm, PendingGoto, compiler.pending_gotos, compiler.pending_goto_capacity);
     }
 
-    // Check if any errors occurred during compilation
+    // Check if any errors occurred during compilation.
+    // Per-error diagnostics have already been pushed via pushDiagnostic();
+    // the embedder (CLI, LSP, …) is responsible for rendering the list and
+    // any "compilation failed" banner.
     bool success = !compiler.has_error;
-
-    // Report compilation status
-    if (!success) {
-        if (vm->error_callback) {
-            vm->error_callback(vm, ZYM_STATUS_COMPILE_ERROR, NULL, -1, "Compilation failed with errors.", vm->error_user_data);
-        } else {
-            fprintf(stderr, "\nCompilation failed with errors.\n");
-        }
-    }
 
     // NOTE: compiler.function is managed by the GC (it's in vm->objects list)
     // We don't manually free it here - the GC will handle cleanup
     // Manually freeing it would cause a double-free during freeVM()
 
-    // Free the AST
-    for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
-    FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+    // AST lifetime (Phase 2.1 / 2.2):
+    //   - Retention ON + caller requested retention + compile succeeded:
+    //       hand the AST off into a heap-allocated ZymParseTree; the
+    //       caller owns the lifetime and must release via
+    //       zym_freeParseTree / parse_tree_free.
+    //   - All other paths (retention disabled at compile time, caller
+    //       passed NULL out_tree, or compile failed): today's behavior —
+    //       walk the AST, free every node, free the root array.
+#if ZYM_HAS_PARSE_TREE_RETENTION
+    if (success && out_tree != NULL) {
+        *out_tree = parse_tree_new(vm, ast, file_id, trivia);
+        trivia = NULL; // ownership transferred to the tree
+    } else
+#endif
+    {
+        for (int i = 0; ast.statements[i] != NULL; i++) free_stmt(vm, ast.statements[i]);
+        FREE_ARRAY(vm, Stmt*, ast.statements, ast.capacity);
+        if (trivia != NULL) {
+            trivia_free(vm, trivia);
+            FREE(vm, TriviaBuffer, trivia);
+            trivia = NULL;
+        }
+    }
 
     // Deep copy the compiled chunk to the external chunk parameter
     // We compiled into compiler.function->chunk, but caller expects results in chunk parameter

@@ -41,3 +41,15 @@ char* processEscapeSequences(ZymAllocator* alloc, const char* input, int input_l
 // Decodes module identifier to file path: "src_slash_math_dot_zym" -> "src/math.zym"
 // Caller must free with the same allocator.
 char* decodeModulePath(ZymAllocator* alloc, const char* encoded, int length);
+
+// Single source of truth for the module-path <-> identifier escape table.
+// Defined in module_loader.c; consumed by both the encoder there and the
+// decoder in utils.c so they cannot drift out of sync.
+typedef struct {
+    char        ch;         // raw character (e.g. '/')
+    const char* token;      // its identifier-safe escape (e.g. "_slash_")
+    size_t      token_len;  // strlen(token), cached
+} ModulePathEscape;
+
+extern const ModulePathEscape MODULE_PATH_ESCAPES[];
+extern const size_t MODULE_PATH_ESCAPES_COUNT;

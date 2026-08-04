@@ -100,6 +100,11 @@ typedef struct ObjFunction {
     int fixed_arity;    // number of fixed params before rest param (== arity if not variadic)
     bool is_variadic;   // true if function has a rest parameter (...args)
     int max_regs;
+    // Number of spill slots used by this function. Spill slots live in the
+    // per-frame stack window immediately after the register area, at
+    // [bp+max_regs .. bp+max_regs+spill_count). Accessed only via the
+    // SPILL_LOAD / SPILL_STORE opcodes, which take a uint16 slot index.
+    int spill_count;
     Chunk chunk;
     ObjString* name;
     ObjString* module_name;
