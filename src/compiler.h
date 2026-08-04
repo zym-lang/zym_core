@@ -108,6 +108,14 @@ typedef struct {
 
 #define MAX_GLOBAL_DECLS 256
 
+// Symbol stripping (CompilerConfig.strip_symbols): one entry per
+// unit-defined top-level global base name, mapping it to the compact
+// symbol emitted in its place.
+typedef struct {
+    Token name;       // base-name token (points into the source buffer)
+    char symbol[24];  // replacement, e.g. "s3f2a_17"
+} StripName;
+
 
 
 typedef struct Compiler {
@@ -203,6 +211,35 @@ typedef struct Compiler {
     int global_decl_count;
 
     ObjString* current_module_name;
+
+    // Symbol stripping map — populated on the ROOT compiler only,
+    // before codegen; nested compilers reach it via root_compiler().
+    StripName* strip_names;
+    int strip_name_count;
+    int strip_names_cap;
+    int strip_symbol_next;
+
+    // Type names (struct/enum) get their OWN map: they live in a
+    // separate namespace from globals, so a `struct Point` and a
+    // `var Point` must not collapse onto one text-keyed entry.
+    StripName* strip_type_names;
+    int strip_type_name_count;
+    int strip_types_cap;
+    int strip_type_next;
+
+    // Borrowed for the duration of compile(): struct/enum declarations
+    // are collected lazily at their declaration site (they can appear at
+    // any depth), so the handlers need the strip flag and keep list.
+    const struct CompilerConfig* strip_config;
+
+    // Per-unit salt woven into every generated symbol. Without it, two
+    // independently compiled units both start numbering at 0, so their
+    // symbols collide if they are ever loaded into one VM — globals
+    // would silently clobber each other in vm->globals, and distinct
+    // struct types would satisfy the VM's name-based STRUCT_SPREAD
+    // compatibility fallback. Derived from the entry file name, so it
+    // stays deterministic.
+    char strip_salt[8];
 } Compiler;
 
 // Compiles `source` into `chunk`. `source_map`, when non-NULL, is the
