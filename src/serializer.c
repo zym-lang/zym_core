@@ -251,8 +251,21 @@ void serializeChunk(VM* vm, Chunk* chunk, CompilerConfig config, OutputBuffer* o
     vm->gc_debt = gc_saved_debt;
 }
 
+// Bytecode arriving here is untrusted: it can come from a downloaded
+// .zbc/.zpk or from a script handing bytes to vm.deserializeChunk() on a
+// nested VM. Every length, count and tag below is therefore validated
+// before it is used to allocate, index, or construct a Value. A rejected
+// load must return false — never allocate on an attacker's say-so (the
+// allocator aborts the process on failure), never recurse without bound,
+// and never build a Value the VM would misinterpret.
+#define ZYM_MAX_CHUNK_NESTING 200
+
 static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size,
-                                 ObjString** pool, int pool_count) {
+                                 ObjString** pool, int pool_count, int depth) {
+    if (depth > ZYM_MAX_CHUNK_NESTING) {
+        fprintf(stderr, "Chunk nesting exceeds %d levels\n", ZYM_MAX_CHUNK_NESTING);
+        return false;
+    }
     const uint8_t* p = buffer;
 
     #define READ_BYTES(dest, count) \
@@ -263,6 +276,22 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
             } \
             memcpy((dest), p, (count)); \
             p += (count); \
+        } while (0)
+
+    // Bytes still unread. Every count is checked against this before it
+    // sizes an allocation, so a crafted count can't request gigabytes
+    // (the allocator treats failure as fatal and exits the process).
+    #define REMAINING() (size - (size_t)(p - buffer))
+
+    // `count` elements of `elem_size` must at least fit in what's left.
+    // Division form so the bound cannot overflow on 32-bit size_t.
+    #define CHECK_COUNT(count, elem_size, on_fail) \
+        do { \
+            if ((count) < 0 || (size_t)(count) > REMAINING() / (elem_size)) { \
+                fprintf(stderr, "Invalid count %d (%zu bytes remain)\n", \
+                        (int)(count), REMAINING()); \
+                on_fail; \
+            } \
         } while (0)
 
     // Resolve an i32 pool reference: yields NULL for -1, fails the
@@ -280,6 +309,7 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
     int constant_count = 0;
     READ_BYTES(&constant_count, sizeof(int));
+    CHECK_COUNT(constant_count, 1, return false);
     for (int i = 0; i < constant_count; i++) {
         uint8_t tag = 0;
         READ_BYTES(&tag, sizeof(uint8_t));
@@ -331,6 +361,7 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
                 READ_BYTES_OR_FAIL(&fn->max_regs, sizeof(int));
                 READ_BYTES_OR_FAIL(&fn->spill_count, sizeof(int));
                 READ_BYTES_OR_FAIL(&fn->upvalue_count, sizeof(int));
+                CHECK_COUNT(fn->upvalue_count, sizeof(Upvalue), goto fn_deserialize_fail);
                 if (fn->upvalue_count > 0) {
                     fn->upvalues = ALLOCATE(vm, Upvalue, fn->upvalue_count);
                     fn->upvalue_capacity = fn->upvalue_count;
@@ -377,7 +408,8 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
                         goto fn_deserialize_fail;
                     }
 
-                    if (!deserializeChunkBody(vm, &fn->chunk, nestedStart, (size_t)nestedSize, pool, pool_count)) {
+                    if (!deserializeChunkBody(vm, &fn->chunk, nestedStart, (size_t)nestedSize,
+                                              pool, pool_count, depth + 1)) {
                         fprintf(stderr, "Function deserialization: recursive deserializeChunkBody failed for nested function\n");
                         goto fn_deserialize_fail;
                     }
@@ -401,12 +433,24 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
                 int field_count = 0;
                 READ_BYTES(&field_count, sizeof(int));
-                if (field_count < 0) return false;
+                CHECK_COUNT(field_count, sizeof(int), return false);
 
+                // Read the refs by hand rather than via READ_POOL_REF so a
+                // malformed entry can free this array instead of leaking it
+                // (ownership passes to the schema only on success).
                 ObjString** field_names = ALLOCATE(vm, ObjString*, field_count);
+                bool bad = false;
                 for (int f = 0; f < field_count; f++) {
-                    READ_POOL_REF(field_names[f]);
-                    if (field_names[f] == NULL) return false;
+                    int idx = 0;
+                    if (REMAINING() < sizeof(int)) { bad = true; break; }
+                    memcpy(&idx, p, sizeof(int));
+                    p += sizeof(int);
+                    if (idx < 0 || idx >= pool_count) { bad = true; break; }
+                    field_names[f] = pool[idx];
+                }
+                if (bad) {
+                    FREE_ARRAY(vm, ObjString*, field_names, field_count);
+                    return false;
                 }
 
                 ObjStructSchema* schema = newStructSchema(vm, name, field_names, field_count);
@@ -423,12 +467,21 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
                 int variant_count = 0;
                 READ_BYTES(&variant_count, sizeof(int));
-                if (variant_count < 0) return false;
+                CHECK_COUNT(variant_count, sizeof(int), return false);
 
                 ObjString** variant_names = ALLOCATE(vm, ObjString*, variant_count);
+                bool bad_variant = false;
                 for (int v = 0; v < variant_count; v++) {
-                    READ_POOL_REF(variant_names[v]);
-                    if (variant_names[v] == NULL) return false;
+                    int idx = 0;
+                    if (REMAINING() < sizeof(int)) { bad_variant = true; break; }
+                    memcpy(&idx, p, sizeof(int));
+                    p += sizeof(int);
+                    if (idx < 0 || idx >= pool_count) { bad_variant = true; break; }
+                    variant_names[v] = pool[idx];
+                }
+                if (bad_variant) {
+                    FREE_ARRAY(vm, ObjString*, variant_names, variant_count);
+                    return false;
                 }
 
                 ObjEnumSchema* schema = newEnumSchema(vm, name, variant_names, variant_count);
@@ -442,6 +495,21 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
                 int variant = 0;
                 READ_BYTES(&variant, sizeof(int));
 
+                // ENUM_VAL shifts these straight into a NaN-boxed Value.
+                // A negative field sign-extends through the cast and sets
+                // SIGN_BIT, which is exactly what IS_OBJ() tests — the
+                // Value then reads as an object pointer whose low bits the
+                // file controls, and the next GC mark writes through it.
+                // Both fields are read back as 16-bit (ENUM_TYPE_ID /
+                // ENUM_VARIANT), so anything wider is malformed anyway.
+                if (type_id < 0 || type_id > 0xFFFF ||
+                    variant < 0 || variant > 0xFFFF) {
+                    fprintf(stderr,
+                            "Invalid enum constant (type_id=%d, variant=%d)\n",
+                            type_id, variant);
+                    return false;
+                }
+
                 Value enum_val = ENUM_VAL(type_id, variant);
                 addConstant(vm, chunk, enum_val);
                 break;
@@ -453,7 +521,7 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
     int instruction_count = 0;
     READ_BYTES(&instruction_count, sizeof(int));
-    if (instruction_count < 0) return false;
+    CHECK_COUNT(instruction_count, sizeof(uint32_t), return false);
     if (instruction_count > 0) {
         chunk->capacity = instruction_count;
         chunk->code = GROW_ARRAY(vm, uint32_t, chunk->code, 0, chunk->capacity);
@@ -467,7 +535,7 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
     int line_count = 0;
     READ_BYTES(&line_count, sizeof(int));
-    if (line_count < 0) return false;
+    CHECK_COUNT(line_count, sizeof(int), return false);
     if (line_count > 0) {
         if (line_count != instruction_count) return false;
         READ_BYTES(chunk->lines, sizeof(int) * (size_t)line_count);
@@ -479,6 +547,8 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
 
     return true;
 
+    #undef CHECK_COUNT
+    #undef REMAINING
     #undef READ_POOL_REF
     #undef READ_BYTES
 }
@@ -545,7 +615,7 @@ bool deserializeChunk(VM* vm, Chunk* chunk, const uint8_t* buffer, size_t size) 
     if (entryIdx < -1 || entryIdx >= pool_count) goto done;
     vm->entry_file = (entryIdx >= 0) ? pool[entryIdx] : NULL;
 
-    ok = deserializeChunkBody(vm, chunk, p, size - (size_t)(p - buffer), pool, pool_count);
+    ok = deserializeChunkBody(vm, chunk, p, size - (size_t)(p - buffer), pool, pool_count, 0);
 
 done:
     if (pool) FREE_ARRAY(vm, ObjString*, pool, pool_count);

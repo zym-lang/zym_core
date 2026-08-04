@@ -211,6 +211,12 @@ static void markRoots(VM* vm) {
         markChunk(vm, vm->chunk);
     }
     markChunk(vm, &vm->api_trampoline);
+    // The entry file name is held only here and in the (weak) string
+    // intern table, so without this a collection can free it and leave
+    // runtime-error formatting reading freed memory.
+    if (vm->entry_file != NULL) {
+        markObject(vm, (Obj*)vm->entry_file);
+    }
     markValue(vm, vm->on_preempt_callback);
     #ifdef GC_DEBUG_FULL
     printf("Marking compiler roots (compiler=%p)\n", (void*)vm->compiler);
