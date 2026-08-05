@@ -141,30 +141,22 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         return false;
     }
 
-    if (needed_top > vm->stack_capacity) {
-        int new_capacity = vm->stack_capacity;
-        while (new_capacity < needed_top) {
-            new_capacity *= 2;
-            if (new_capacity > STACK_MAX) {
-                new_capacity = STACK_MAX;
-                break;
-            }
-        }
-
-        Value* old_stack = vm->stack;
-        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
-        vm->stack_capacity = new_capacity;
-
-        if (old_stack != vm->stack) {
-            updateStackReferences(vm, old_stack, vm->stack);
-        }
+    // growStackForCall disables the GC across the realloc and NULL-fills slots
+    // above the OLD capacity; the hand-rolled GROW_ARRAY this replaced did
+    // neither. Note the fill only covers newly added capacity -- slots already
+    // within capacity keep whatever they held, same as the CALL opcodes.
+    if (!growStackForCall(vm, needed_top, NULL)) {
+        return false;
     }
 
     cont->state = CONT_CONSUMED;
 
     int restore_base = vm->stack_top;
 
-    memcpy(&vm->stack[restore_base], cont->stack, cont->stack_size * sizeof(Value));
+    // cont->stack is NULL when nothing was captured; memcpy(dst, NULL, 0) is UB.
+    if (cont->stack_size > 0) {
+        memcpy(&vm->stack[restore_base], cont->stack, cont->stack_size * sizeof(Value));
+    }
     vm->stack_top = restore_base + cont->stack_size;
 
     for (int i = 0; i < cont->frame_count; i++) {
@@ -175,6 +167,10 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         dst->ip = src->ip;
         dst->caller_chunk = src->caller_chunk;
         dst->flags = src->flags;
+        // Capture preserved these; restoring only five of seven fields left the
+        // frame inheriting arg_count/preempt_id from whatever last used the slot.
+        dst->arg_count = src->arg_count;
+        dst->preempt_id = src->preempt_id;
 
         int original_offset = src->stack_base - cont->stack_base_offset;
         dst->stack_base = restore_base + original_offset;
@@ -189,6 +185,28 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
 
     int result_slot = restore_base + cont->return_slot;
     vm->stack[result_slot] = resume_value;
+
+    // The snapshot is dead the instant the state flips to CONT_CONSUMED: the
+    // guard at the top makes the continuation permanently unresumable, and
+    // everything it held now lives in the stack again. Release it here rather
+    // than waiting for a sweep -- blackenObject marks the captured stack with
+    // no state check, so a spent continuation left holding its snapshot pins
+    // its whole capture-time object graph for as long as script keeps the
+    // handle. Safe here: reallocate only collects when growing, so a free
+    // cannot re-enter the GC while the VM sits half-restored.
+    // Guarded on pointer AND count, matching freeObject: a mis-sized FREE_ARRAY
+    // would corrupt the allocator's accounting if that invariant ever slipped.
+    if (cont->frames != NULL && cont->frame_count > 0) {
+        FREE_ARRAY(vm, CallFrame, cont->frames, cont->frame_count);
+    }
+    cont->frames = NULL;
+    cont->frame_count = 0;
+
+    if (cont->stack != NULL && cont->stack_size > 0) {
+        FREE_ARRAY(vm, Value, cont->stack, cont->stack_size);
+    }
+    cont->stack = NULL;
+    cont->stack_size = 0;
 
     return true;
 }
@@ -320,26 +338,16 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
         return ZYM_ERROR;
     }
 
-    int needed_top = callee_slot + function->max_regs;
+    // Every other frame-push site sizes the window as max_regs + spill_count
+    // (vm.c:581 and the CALL opcodes). Omitting the spill area let SPILL_STORE
+    // write above stack_top, which markRoots never scans.
+    int needed_top = callee_slot + function->max_regs + function->spill_count;
     if (needed_top > STACK_MAX) {
         zym_runtimeError(vm, "Cont.withPrompt: stack overflow.");
         return ZYM_ERROR;
     }
-    if (needed_top > vm->stack_capacity) {
-        int new_capacity = vm->stack_capacity;
-        while (new_capacity < needed_top) {
-            new_capacity *= 2;
-            if (new_capacity > STACK_MAX) {
-                new_capacity = STACK_MAX;
-                break;
-            }
-        }
-        Value* old_stack = vm->stack;
-        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
-        vm->stack_capacity = new_capacity;
-        if (old_stack != vm->stack) {
-            updateStackReferences(vm, old_stack, vm->stack);
-        }
+    if (!growStackForCall(vm, needed_top, NULL)) {
+        return ZYM_ERROR;
     }
 
     vm->stack[callee_slot] = fn;
@@ -358,6 +366,8 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
     frame->stack_base = callee_slot;
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
+    frame->arg_count = 0;    // withPrompt requires arity 0
+    frame->preempt_id = 0;
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
@@ -408,6 +418,12 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         return ZYM_ERROR;
     }
 
+    // captureContinuation drops its own temp root before returning, so `cont` is
+    // just a C local until it reaches a stack slot below. Nothing in that window
+    // allocates today, but cont_shift roots it over the same span; match that
+    // rather than depend on the window staying allocation-free.
+    pushTempRoot(vm, (Obj*)cont);
+
     unwindFrames(vm, prompt->frame_index);
     vm->stack_top = prompt->stack_base;
 
@@ -454,6 +470,7 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         vm->stack_top++;
     }
 
+    popTempRoot(vm);
     return ZYM_CONTROL_TRANSFER;
 }
 
@@ -685,28 +702,20 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         return ZYM_ERROR;
     }
 
-    int needed_top = callee_slot + handler_fn->max_regs;
+    // Same spill_count omission as withPrompt, and worse here: stack_top was
+    // truncated to the prompt base above, so the spill area is guaranteed to
+    // land outside the region the GC scans.
+    int needed_top = callee_slot + handler_fn->max_regs + handler_fn->spill_count;
     if (needed_top > STACK_MAX) {
         popTempRoot(vm);
         popTempRoot(vm);
         zym_runtimeError(vm, "Cont.shift: stack overflow.");
         return ZYM_ERROR;
     }
-    if (needed_top > vm->stack_capacity) {
-        int new_capacity = vm->stack_capacity;
-        while (new_capacity < needed_top) {
-            new_capacity *= 2;
-            if (new_capacity > STACK_MAX) {
-                new_capacity = STACK_MAX;
-                break;
-            }
-        }
-        Value* old_stack = vm->stack;
-        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
-        vm->stack_capacity = new_capacity;
-        if (old_stack != vm->stack) {
-            updateStackReferences(vm, old_stack, vm->stack);
-        }
+    if (!growStackForCall(vm, needed_top, NULL)) {
+        popTempRoot(vm);
+        popTempRoot(vm);
+        return ZYM_ERROR;
     }
 
     vm->stack[callee_slot] = handler;
@@ -721,8 +730,13 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     frame->stack_base = callee_slot;
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
+    frame->arg_count = 1;    // shift requires arity 1 (the continuation)
+    frame->preempt_id = 0;
 
     vm->current_frame = frame;
+    // withPrompt sets this on its own frame push; shift did not, so LOAD_STATE
+    // came back with the unwound caller's base instead of the handler's.
+    vm->cur_base = callee_slot;
     vm->chunk = &handler_fn->chunk;
     vm->ip = handler_fn->chunk.code;
 
