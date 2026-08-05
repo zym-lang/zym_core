@@ -1060,6 +1060,8 @@ ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
     if (vm == NULL || chunk == NULL) return ZYM_STATUS_RUNTIME_ERROR;
 
     InterpretResult result = runChunk(vm, chunk);
+    vm->execution_suspended =
+        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
@@ -1074,7 +1076,17 @@ ZymStatus zym_resume(ZymVM* vm)
 {
     if (vm == NULL) return ZYM_STATUS_RUNTIME_ERROR;
 
+    // Nothing is suspended: the previous run finished (or never started), so
+    // there is no saved position to continue from. Re-entering the dispatch
+    // loop would execute from a stale ip. Report the misuse rather than
+    // crashing -- an easy mistake when driving a resume loop.
+    if (!vm->execution_suspended) {
+        return ZYM_STATUS_RUNTIME_ERROR;
+    }
+
     InterpretResult result = runVM(vm);
+    vm->execution_suspended =
+        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
@@ -2200,6 +2212,8 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     vm->api_stack_top += argc;
 
     InterpretResult result = zym_call_execute(vm, argc);
+    vm->execution_suspended =
+        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;

@@ -171,6 +171,10 @@ typedef struct VM {
     int32_t preempt_counter;
     int32_t preempt_armed;          // value the counter was armed with
     volatile sig_atomic_t stop_requested;
+    // True only while execution is suspended and resumable (the last
+    // run returned YIELD or ABORTED). `chunk`/`ip` remain set after a
+    // completed run, so they cannot answer this on their own.
+    bool execution_suspended;
     PreemptEntry preempt_table[ZYM_PREEMPT_MAX_ENTRIES];
     uint32_t preempt_next_id;
     int preempt_live_count;

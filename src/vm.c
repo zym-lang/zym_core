@@ -86,6 +86,7 @@ void initVM(VM* vm) {
     vm->preempt_armed = INT32_MAX;
     vm->default_timeslice = DEFAULT_TIMESLICE;
     vm->stop_requested = 0;
+    vm->execution_suspended = false;
     memset(vm->preempt_table, 0, sizeof(vm->preempt_table));
     for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
         vm->preempt_table[i].callback = NULL_VAL;
@@ -650,6 +651,22 @@ static InterpretResult handlePreemption(VM* vm) {
     //    script. Registration order decides precedence among equals.
     for (int i = 0; i < fired_count; i++) {
         if (!IS_CLOSURE(fired[i]->callback)) {
+            // Settle the entry BEFORE unwinding. Without this its
+            // `remaining` stays <= 0, so the host cannot resume: every
+            // resume would re-fire the same exhausted deadline. A rearming
+            // entry gets a fresh slice (the host decides whether to resume);
+            // a ONESHOT entry retires, so a resume runs unimpeded.
+            for (int j = 0; j < fired_count; j++) {
+                PreemptEntry* e = fired[j];
+                if (e->flags & ZYM_PREEMPT_F_ONESHOT) {
+                    e->slice = 0;
+                    e->callback = NULL_VAL;
+                    vm->preempt_live_count--;
+                } else {
+                    e->remaining = e->slice;
+                }
+            }
+            preemptArm(vm);
             return INTERPRET_ABORTED;
         }
     }

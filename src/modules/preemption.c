@@ -38,6 +38,14 @@ static bool entry_masked(const VM* vm, const PreemptEntry* e) {
 }
 
 void preemptArm(VM* vm) {
+    // A pending hard stop outranks every deadline. Without this, clearing the
+    // last table entry re-arms the counter to INT32_MAX and the stop is never
+    // observed again -- the VM would run free with a stop still set.
+    if (vm->stop_requested) {
+        vm->preempt_counter = 0;
+        vm->preempt_armed   = 0;
+        return;
+    }
     int32_t best = INT32_MAX;
     for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
         PreemptEntry* e = &vm->preempt_table[i];
@@ -92,8 +100,11 @@ bool preemptSetSlice(VM* vm, uint32_t id, int slice, bool owner_script) {
     PreemptEntry* e = find_entry(vm, id);
     if (!e || !may_touch(e, owner_script)) return false;
     if (slice < 1) slice = 1;
+    // Restart the countdown: "fire `slice` instructions from now". The old
+    // clamp could only lower `remaining`, which made it impossible to give
+    // an exhausted entry more budget after an abort.
     e->slice = slice;
-    if (e->remaining > slice) e->remaining = slice;
+    e->remaining = slice;
     preemptArm(vm);
     return true;
 }
