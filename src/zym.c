@@ -5,6 +5,7 @@
 #include <inttypes.h>
 
 #include "./vm.h"
+#include "./modules/preemption.h"
 #include "./chunk.h"
 #ifndef ZYM_RUNTIME_ONLY
 #include "./preprocessor.h"
@@ -1064,6 +1065,7 @@ ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
         case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
         case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }
@@ -1078,9 +1080,42 @@ ZymStatus zym_resume(ZymVM* vm)
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
         case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
         case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }
+
+ZymPreemptId zym_preemptRegister(ZymVM* vm, int slice,
+                                 ZymValue callback, uint32_t flags) {
+    if (vm == NULL) return 0;
+    uint8_t f = 0;
+    if (flags & ZYM_PREEMPT_MASKABLE) f |= ZYM_PREEMPT_F_MASKABLE;
+    if (flags & ZYM_PREEMPT_ONESHOT)  f |= ZYM_PREEMPT_F_ONESHOT;
+    return preemptRegister(vm, slice, callback, f, /*owner_script=*/false);
+}
+
+bool zym_preemptUnregister(ZymVM* vm, ZymPreemptId id) {
+    return vm ? preemptUnregister(vm, id, /*owner_script=*/false) : false;
+}
+
+bool zym_preemptSetSlice(ZymVM* vm, ZymPreemptId id, int slice) {
+    return vm ? preemptSetSlice(vm, id, slice, /*owner_script=*/false) : false;
+}
+
+int zym_preemptRemaining(ZymVM* vm, ZymPreemptId id) {
+    return vm ? preemptEntryRemaining(vm, id) : -1;
+}
+
+bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id) {
+    return vm ? preemptTrigger(vm, id, /*owner_script=*/false) : false;
+}
+
+int zym_preemptCapacity(void) { return ZYM_PREEMPT_MAX_ENTRIES; }
+
+void zym_requestStop(ZymVM* vm) { if (vm) preemptRequestStop(vm); }
+void zym_clearStop(ZymVM* vm)   { if (vm) preemptClearStop(vm); }
+bool zym_stopRequested(const ZymVM* vm) { return vm ? preemptStopRequested(vm) : false; }
+bool zym_isAborting(const ZymVM* vm)    { return vm ? preemptStopRequested(vm) : false; }
 
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback)
 {
@@ -2169,6 +2204,7 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
         case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }
@@ -2316,6 +2352,7 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
         case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
+        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }

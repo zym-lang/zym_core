@@ -21,5 +21,7 @@ typedef enum {
     ZYM_STATUS_OK,
     ZYM_STATUS_COMPILE_ERROR,
     ZYM_STATUS_RUNTIME_ERROR,
-    ZYM_STATUS_YIELD
+    ZYM_STATUS_YIELD,
+    // Host-initiated stop. Appended so existing numeric values are stable.
+    ZYM_STATUS_ABORTED
 } ZymStatus;

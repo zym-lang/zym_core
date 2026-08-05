@@ -9,44 +9,142 @@
 #include "../memory.h"
 
 // ============================================================================
-// Preemption Control Functions
+// Preemption entry table
+// ============================================================================
+//
+// A single countdown (`vm->preempt_counter`) is armed to the nearest
+// deadline in the table. The dispatch loop only decrements it. Everything
+// below runs on the cold path, either when the countdown expires or when a
+// caller mutates the table.
+
+static PreemptEntry* find_entry(VM* vm, uint32_t id) {
+    if (id == 0) return NULL;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice != 0 && e->id == id) return e;
+    }
+    return NULL;
+}
+
+// True when an entry is currently excluded from the countdown: either its
+// own callback is running (structural, prevents self-recursion) or a script
+// shield is masking script-owned maskable entries (advisory).
+static bool entry_masked(const VM* vm, const PreemptEntry* e) {
+    if (e->in_flight) return true;
+    if ((e->flags & ZYM_PREEMPT_F_MASKABLE) && vm->preempt_shield_depth > 0) {
+        return true;
+    }
+    return false;
+}
+
+void preemptArm(VM* vm) {
+    int32_t best = INT32_MAX;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice == 0 || entry_masked(vm, e)) continue;
+        if (e->remaining < best) best = e->remaining;
+    }
+    if (best < 1) best = 1;   // always make forward progress
+    vm->preempt_counter = best;
+    vm->preempt_armed   = best;
+}
+
+uint32_t preemptRegister(VM* vm, int slice, Value callback,
+                         uint8_t flags, bool owner_script) {
+    if (slice < 1) slice = 1;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice != 0) continue;
+        uint32_t id = ++vm->preempt_next_id;
+        if (id == 0) id = ++vm->preempt_next_id;   // never hand out 0
+        e->slice        = slice;
+        e->remaining    = slice;
+        e->callback     = callback;
+        e->id           = id;
+        e->flags        = flags;
+        e->owner_script = owner_script;
+        e->in_flight    = false;
+        vm->preempt_live_count++;
+        preemptArm(vm);
+        return id;
+    }
+    return 0;   // table full
+}
+
+// `owner_script` gates authority: script may only touch entries it owns, so
+// it can never cancel or retune a host watchdog.
+static bool may_touch(const PreemptEntry* e, bool owner_script) {
+    return !owner_script || e->owner_script;
+}
+
+bool preemptUnregister(VM* vm, uint32_t id, bool owner_script) {
+    PreemptEntry* e = find_entry(vm, id);
+    if (!e || !may_touch(e, owner_script)) return false;
+    e->slice = 0;
+    e->callback = NULL_VAL;
+    e->in_flight = false;
+    vm->preempt_live_count--;
+    preemptArm(vm);
+    return true;
+}
+
+bool preemptSetSlice(VM* vm, uint32_t id, int slice, bool owner_script) {
+    PreemptEntry* e = find_entry(vm, id);
+    if (!e || !may_touch(e, owner_script)) return false;
+    if (slice < 1) slice = 1;
+    e->slice = slice;
+    if (e->remaining > slice) e->remaining = slice;
+    preemptArm(vm);
+    return true;
+}
+
+int preemptEntryRemaining(VM* vm, uint32_t id) {
+    PreemptEntry* e = find_entry(vm, id);
+    return e ? e->remaining : -1;
+}
+
+bool preemptTrigger(VM* vm, uint32_t id, bool owner_script) {
+    PreemptEntry* e = find_entry(vm, id);
+    if (!e || !may_touch(e, owner_script)) return false;
+    e->remaining = 0;
+    vm->preempt_counter = 0;   // enter the cold handler on the next dispatch
+    return true;
+}
+
+void preemptShieldPush(VM* vm) {
+    vm->preempt_shield_depth++;
+    preemptArm(vm);
+}
+
+void preemptShieldPop(VM* vm) {
+    if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
+    preemptArm(vm);
+}
+
+// ============================================================================
+// Unmaskable hard stop
 // ============================================================================
 
-void preemptionEnable(VM* vm) {
-    vm->preemption_enabled = true;
-    vm->preempt_counter = vm->default_timeslice;
+void preemptRequestStop(VM* vm) {
+    vm->stop_requested = 1;
+    vm->preempt_counter = 0;   // notice it on the very next dispatch
 }
 
-void preemptionDisable(VM* vm) {
-    vm->preemption_enabled = false;
-    vm->preempt_counter = INT32_MAX;
+void preemptClearStop(VM* vm) {
+    vm->stop_requested = 0;
+    preemptArm(vm);
 }
 
-void preemptionPushDisable(VM* vm) {
-    if (vm->preemption_disable_depth == 0 && vm->preemption_enabled) {
-        vm->saved_budget = vm->preempt_counter;
-    }
-    vm->preemption_disable_depth++;
-    vm->preempt_counter = INT32_MAX;
+bool preemptStopRequested(const VM* vm) {
+    return vm->stop_requested != 0;
 }
 
-void preemptionPopDisable(VM* vm) {
-    if (vm->preemption_disable_depth > 0) {
-        vm->preemption_disable_depth--;
-        if (vm->preemption_disable_depth == 0 && vm->preemption_enabled) {
-            vm->preempt_counter = vm->saved_budget;
-        }
-    }
-}
-
-bool preemptionIsEnabled(VM* vm) {
-    return vm->preemption_enabled && vm->preemption_disable_depth == 0;
-}
+// ============================================================================
+// Legacy single-target shims
+// ============================================================================
 
 void preemptionSetTimeslice(VM* vm, int instructions) {
-    if (instructions < 1) {
-        instructions = 1;
-    }
+    if (instructions < 1) instructions = 1;
     vm->default_timeslice = instructions;
 }
 
@@ -55,13 +153,11 @@ int preemptionGetTimeslice(VM* vm) {
 }
 
 void preemptionRequest(VM* vm) {
-    vm->preempt_requested = true;
     vm->preempt_counter = 0;
 }
 
 void preemptionReset(VM* vm) {
-    vm->preempt_counter = vm->preemption_enabled ? vm->default_timeslice : INT32_MAX;
-    vm->preempt_requested = false;
+    preemptArm(vm);
 }
 
 int preemptionRemaining(VM* vm) {
@@ -69,66 +165,95 @@ int preemptionRemaining(VM* vm) {
 }
 
 // ============================================================================
-// PREEMPT MODULE - NATIVE CLOSURE IMPLEMENTATION
+// PREEMPT MODULE -- script-facing surface
 // ============================================================================
+//
+// Script may only create, retune, and cancel entries it owns, and every
+// entry it creates is MASKABLE. It cannot reach host entries, cannot clear
+// the hard stop, and cannot disable the machinery globally -- there is no
+// longer a global switch to reach.
 
-typedef struct {
-    int dummy;
-} PreemptData;
+typedef struct { int dummy; } PreemptData;
 
 static void preempt_cleanup(ZymVM* vm, void* ptr) {
-    PreemptData* data = (PreemptData*)ptr;
     const ZymAllocator* alloc = zym_getAllocator(vm);
-    ZYM_FREE((ZymAllocator*)alloc, data, sizeof(PreemptData));
+    ZYM_FREE((ZymAllocator*)alloc, (PreemptData*)ptr, sizeof(PreemptData));
 }
 
-static ZymValue preempt_enable(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionEnable(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_disable(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionDisable(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_pushDisable(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionPushDisable(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_popDisable(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionPopDisable(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_getDisableDepth(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    return zym_newNumber((double)vm->preemption_disable_depth);
-}
-
-static ZymValue preempt_setCallback(ZymVM* vm, ZymValue context, ZymValue callback) {
-    (void)zym_getNativeData(context);
-    zym_setPreemptCallback(vm, callback);
-    return zym_newNull();
-}
-
-static ZymValue preempt_withDisabled(ZymVM* vm, ZymValue context, ZymValue fn) {
-    (void)zym_getNativeData(context);
-    if (!zym_isClosure(fn)) {
-        zym_runtimeError(vm, "Preempt.withDisabled: argument must be a function.");
+static ZymValue preempt_every(ZymVM* vm, ZymValue ctx, ZymValue slice, ZymValue cb) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(slice)) {
+        zym_runtimeError(vm, "Preempt.every(slice, fn): slice must be a number.");
         return ZYM_ERROR;
     }
+    if (!zym_isClosure(cb)) {
+        zym_runtimeError(vm, "Preempt.every(slice, fn): fn must be a function.");
+        return ZYM_ERROR;
+    }
+    uint32_t id = preemptRegister(vm, (int)zym_asNumber(slice), cb,
+                                  ZYM_PREEMPT_F_MASKABLE, true);
+    if (id == 0) {
+        zym_runtimeError(vm, "Preempt.every: no free preemption slots (max %d).",
+                         ZYM_PREEMPT_MAX_ENTRIES);
+        return ZYM_ERROR;
+    }
+    return zym_newNumber((double)id);
+}
 
+static ZymValue preempt_once(ZymVM* vm, ZymValue ctx, ZymValue slice, ZymValue cb) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(slice) || !zym_isClosure(cb)) {
+        zym_runtimeError(vm, "Preempt.once(slice, fn): expected (number, function).");
+        return ZYM_ERROR;
+    }
+    uint32_t id = preemptRegister(vm, (int)zym_asNumber(slice), cb,
+                                  ZYM_PREEMPT_F_MASKABLE | ZYM_PREEMPT_F_ONESHOT, true);
+    if (id == 0) {
+        zym_runtimeError(vm, "Preempt.once: no free preemption slots (max %d).",
+                         ZYM_PREEMPT_MAX_ENTRIES);
+        return ZYM_ERROR;
+    }
+    return zym_newNumber((double)id);
+}
+
+static ZymValue preempt_cancel(ZymVM* vm, ZymValue ctx, ZymValue idv) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(idv)) return zym_newBool(false);
+    return zym_newBool(preemptUnregister(vm, (uint32_t)zym_asNumber(idv), true));
+}
+
+static ZymValue preempt_setSlice(ZymVM* vm, ZymValue ctx, ZymValue idv, ZymValue slice) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(idv) || !zym_isNumber(slice)) return zym_newBool(false);
+    return zym_newBool(preemptSetSlice(vm, (uint32_t)zym_asNumber(idv),
+                                       (int)zym_asNumber(slice), true));
+}
+
+static ZymValue preempt_remaining(ZymVM* vm, ZymValue ctx, ZymValue idv) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(idv)) return zym_newNumber(-1);
+    return zym_newNumber((double)preemptEntryRemaining(vm, (uint32_t)zym_asNumber(idv)));
+}
+
+static ZymValue preempt_request(ZymVM* vm, ZymValue ctx, ZymValue idv) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isNumber(idv)) return zym_newBool(false);
+    return zym_newBool(preemptTrigger(vm, (uint32_t)zym_asNumber(idv), true));
+}
+
+// Run fn with this script's maskable entries suppressed. A non-maskable
+// host entry (a watchdog) fires straight through, which is the point.
+static ZymValue preempt_shield(ZymVM* vm, ZymValue ctx, ZymValue fn) {
+    (void)zym_getNativeData(ctx);
+    if (!zym_isClosure(fn)) {
+        zym_runtimeError(vm, "Preempt.shield(fn): argument must be a function.");
+        return ZYM_ERROR;
+    }
     ObjClosure* closure = AS_CLOSURE(fn);
     ObjFunction* function = closure->function;
-
     if (function->arity != 0) {
-        zym_runtimeError(vm, "Preempt.withDisabled: function must take 0 arguments, got %d.", function->arity);
+        zym_runtimeError(vm, "Preempt.shield(fn): function must take 0 arguments, got %d.",
+                         function->arity);
         return ZYM_ERROR;
     }
 
@@ -136,116 +261,53 @@ static ZymValue preempt_withDisabled(ZymVM* vm, ZymValue context, ZymValue fn) {
     if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
         uint32_t prev_instr = *(vm->ip - 1);
         int opcode = prev_instr & 0xFF;
-
-        if (opcode == CALL || opcode == CALL_SELF || opcode == TAIL_CALL ||
-            opcode == TAIL_CALL_SELF) {
+        if (opcode == CALL || opcode == CALL_SELF ||
+            opcode == TAIL_CALL || opcode == TAIL_CALL_SELF) {
             int result_reg = (prev_instr >> 8) & 0xFF;
-            int frame_base = (vm->frame_count > 0) ? vm->frames[vm->frame_count - 1].stack_base : 0;
+            int frame_base = (vm->frame_count > 0)
+                           ? vm->frames[vm->frame_count - 1].stack_base : 0;
             callee_slot = frame_base + result_reg;
         }
     }
-
     if (callee_slot < 0) {
-        zym_runtimeError(vm, "Preempt.withDisabled: could not determine call context.");
+        zym_runtimeError(vm, "Preempt.shield: could not determine call context.");
         return ZYM_ERROR;
     }
-
     if (vm->frame_count >= FRAMES_MAX) {
-        zym_runtimeError(vm, "Preempt.withDisabled: stack overflow (max call depth reached).");
+        zym_runtimeError(vm, "Preempt.shield: stack overflow (max call depth reached).");
         return ZYM_ERROR;
     }
 
-    int needed_top = callee_slot + function->max_regs;
-    if (needed_top > STACK_MAX) {
-        zym_runtimeError(vm, "Preempt.withDisabled: stack overflow.");
+    int needed_top = callee_slot + function->max_regs + function->spill_count;
+    if (!growStackForCall(vm, needed_top, NULL)) {
+        zym_runtimeError(vm, "Preempt.shield: stack overflow.");
         return ZYM_ERROR;
-    }
-    
-    if (needed_top > vm->stack_capacity) {
-        int new_capacity = vm->stack_capacity;
-        while (new_capacity < needed_top) {
-            new_capacity *= 2;
-            if (new_capacity > STACK_MAX) {
-                new_capacity = STACK_MAX;
-                break;
-            }
-        }
-        Value* old_stack = vm->stack;
-        vm->stack = GROW_ARRAY(vm, Value, vm->stack, vm->stack_capacity, new_capacity);
-        vm->stack_capacity = new_capacity;
-        if (old_stack != vm->stack) {
-            updateStackReferences(vm, old_stack, vm->stack);
-        }
     }
 
     vm->stack[callee_slot] = fn;
 
     CallFrame* frame = &vm->frames[vm->frame_count++];
-    frame->closure = closure;
-    frame->ip = vm->ip;
-    frame->stack_base = callee_slot;
+    frame->closure      = closure;
+    frame->ip           = vm->ip;
+    frame->stack_base   = callee_slot;
     frame->caller_chunk = vm->chunk;
-    frame->flags = FRAME_FLAG_DISABLE_PREEMPT;
+    frame->flags        = FRAME_FLAG_DISABLE_PREEMPT;
+    frame->arg_count    = 0;
+    frame->preempt_id   = 0;
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
     vm->chunk = &function->chunk;
     vm->ip = function->chunk.code;
+    if (needed_top > vm->stack_top) vm->stack_top = needed_top;
 
-    if (needed_top > vm->stack_top) {
-        vm->stack_top = needed_top;
-    }
-
-    vm->preemption_disable_depth++;
-
+    preemptShieldPush(vm);
     return ZYM_CONTROL_TRANSFER;
 }
 
-static ZymValue preempt_isEnabled(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    return zym_newBool(preemptionIsEnabled(vm));
-}
-
-static ZymValue preempt_setTimeslice(ZymVM* vm, ZymValue context, ZymValue instructions) {
-    (void)zym_getNativeData(context);
-
-    if (!zym_isNumber(instructions)) {
-        zym_runtimeError(vm, "Preempt.setTimeslice: argument must be a number.");
-        return ZYM_ERROR;
-    }
-
-    int value = (int)zym_asNumber(instructions);
-    preemptionSetTimeslice(vm, value);
-    return zym_newNull();
-}
-
-static ZymValue preempt_getTimeslice(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    return zym_newNumber((double)preemptionGetTimeslice(vm));
-}
-
-static ZymValue preempt_request(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionRequest(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_reset(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    preemptionReset(vm);
-    return zym_newNull();
-}
-
-static ZymValue preempt_remaining(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    return zym_newNumber((double)preemptionRemaining(vm));
-}
-
-static ZymValue preempt_yield(ZymVM* vm, ZymValue context) {
-    (void)zym_getNativeData(context);
-    vm->preempt_requested = true;
-    vm->preempt_counter = 0;
-    return zym_newNull();
+static ZymValue preempt_shieldDepth(ZymVM* vm, ZymValue ctx) {
+    (void)zym_getNativeData(ctx);
+    return zym_newNumber((double)vm->preempt_shield_depth);
 }
 
 // ============================================================================
@@ -263,70 +325,30 @@ ZymValue nativePreempt_create(ZymVM* vm) {
     ZymValue context = zym_createNativeContext(vm, data, preempt_cleanup);
     zym_pushRoot(vm, context);
 
-    ZymValue enable = zym_createNativeClosure(vm, "enable()", (void*)preempt_enable, context);
-    zym_pushRoot(vm, enable);
-
-    ZymValue disable = zym_createNativeClosure(vm, "disable()", (void*)preempt_disable, context);
-    zym_pushRoot(vm, disable);
-
-    ZymValue pushDisable = zym_createNativeClosure(vm, "pushDisable()", (void*)preempt_pushDisable, context);
-    zym_pushRoot(vm, pushDisable);
-
-    ZymValue popDisable = zym_createNativeClosure(vm, "popDisable()", (void*)preempt_popDisable, context);
-    zym_pushRoot(vm, popDisable);
-
-    ZymValue getDisableDepth = zym_createNativeClosure(vm, "getDisableDepth()", (void*)preempt_getDisableDepth, context);
-    zym_pushRoot(vm, getDisableDepth);
-
-    ZymValue setCallback = zym_createNativeClosure(vm, "setCallback(fn)", (void*)preempt_setCallback, context);
-    zym_pushRoot(vm, setCallback);
-
-    ZymValue withDisabled = zym_createNativeClosure(vm, "withDisabled(fn)", (void*)preempt_withDisabled, context);
-    zym_pushRoot(vm, withDisabled);
-
-    ZymValue isEnabled = zym_createNativeClosure(vm, "isEnabled()", (void*)preempt_isEnabled, context);
-    zym_pushRoot(vm, isEnabled);
-
-    ZymValue setTimeslice = zym_createNativeClosure(vm, "setTimeslice(n)", (void*)preempt_setTimeslice, context);
-    zym_pushRoot(vm, setTimeslice);
-
-    ZymValue getTimeslice = zym_createNativeClosure(vm, "getTimeslice()", (void*)preempt_getTimeslice, context);
-    zym_pushRoot(vm, getTimeslice);
-
-    ZymValue request = zym_createNativeClosure(vm, "request()", (void*)preempt_request, context);
-    zym_pushRoot(vm, request);
-
-    ZymValue reset = zym_createNativeClosure(vm, "reset()", (void*)preempt_reset, context);
-    zym_pushRoot(vm, reset);
-
-    ZymValue remaining = zym_createNativeClosure(vm, "remaining()", (void*)preempt_remaining, context);
-    zym_pushRoot(vm, remaining);
-
-    ZymValue yield_closure = zym_createNativeClosure(vm, "yield()", (void*)preempt_yield, context);
-    zym_pushRoot(vm, yield_closure);
+#define MK(sig, fn) zym_createNativeClosure(vm, sig, (void*)fn, context)
+    ZymValue every       = MK("every(slice, fn)", preempt_every);        zym_pushRoot(vm, every);
+    ZymValue once        = MK("once(slice, fn)", preempt_once);          zym_pushRoot(vm, once);
+    ZymValue cancel      = MK("cancel(id)", preempt_cancel);             zym_pushRoot(vm, cancel);
+    ZymValue setSlice    = MK("setSlice(id, n)", preempt_setSlice);      zym_pushRoot(vm, setSlice);
+    ZymValue remaining   = MK("remaining(id)", preempt_remaining);       zym_pushRoot(vm, remaining);
+    ZymValue request     = MK("request(id)", preempt_request);           zym_pushRoot(vm, request);
+    ZymValue shield      = MK("shield(fn)", preempt_shield);             zym_pushRoot(vm, shield);
+    ZymValue shieldDepth = MK("shieldDepth()", preempt_shieldDepth);     zym_pushRoot(vm, shieldDepth);
+#undef MK
 
     ZymValue obj = zym_newMap(vm);
     zym_pushRoot(vm, obj);
 
-    zym_mapSet(vm, obj, "enable", enable);
-    zym_mapSet(vm, obj, "disable", disable);
-    zym_mapSet(vm, obj, "pushDisable", pushDisable);
-    zym_mapSet(vm, obj, "popDisable", popDisable);
-    zym_mapSet(vm, obj, "getDisableDepth", getDisableDepth);
-    zym_mapSet(vm, obj, "setCallback", setCallback);
-    zym_mapSet(vm, obj, "withDisabled", withDisabled);
-    zym_mapSet(vm, obj, "isEnabled", isEnabled);
-    zym_mapSet(vm, obj, "setTimeslice", setTimeslice);
-    zym_mapSet(vm, obj, "getTimeslice", getTimeslice);
-    zym_mapSet(vm, obj, "request", request);
-    zym_mapSet(vm, obj, "reset", reset);
+    zym_mapSet(vm, obj, "every", every);
+    zym_mapSet(vm, obj, "once", once);
+    zym_mapSet(vm, obj, "cancel", cancel);
+    zym_mapSet(vm, obj, "setSlice", setSlice);
     zym_mapSet(vm, obj, "remaining", remaining);
-    zym_mapSet(vm, obj, "yield", yield_closure);
+    zym_mapSet(vm, obj, "request", request);
+    zym_mapSet(vm, obj, "shield", shield);
+    zym_mapSet(vm, obj, "shieldDepth", shieldDepth);
 
-    for (int i = 0; i < 16; i++) {
-        zym_popRoot(vm);
-    }
-
+    for (int i = 0; i < 10; i++) zym_popRoot(vm);
     return obj;
 }
 

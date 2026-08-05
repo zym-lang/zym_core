@@ -187,6 +187,56 @@ ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
 
+// -----------------------------------------------------------------------------
+// PREEMPTION (host side)
+// -----------------------------------------------------------------------------
+// A single countdown drives a small table of independent entries, so a host
+// watchdog, a host UI pump, and a script scheduler coexist without fighting
+// over one global timer. The dispatch loop cost is unchanged: one decrement
+// and one predicted branch. All table work happens on expiry.
+//
+// Authority is the point of the design. Entries registered here are
+// host-owned: script cannot cancel them, retune them, or mask them unless
+// you pass ZYM_PREEMPT_MASKABLE. A host entry with a NULL callback aborts
+// execution on expiry, which is the watchdog shape -- there is no script
+// callback to intercept, mishandle, or loop inside.
+
+typedef uint32_t ZymPreemptId;          // 0 is never a valid id
+
+#define ZYM_PREEMPT_MASKABLE  (1u << 0) // may be suppressed by a script shield
+#define ZYM_PREEMPT_ONESHOT   (1u << 1) // retire after firing instead of rearming
+
+// Register a host-owned entry firing every `slice` instructions. Pass
+// zym_newNull() as `callback` for an abort-on-expiry watchdog. Returns 0
+// when the table is full.
+ZymPreemptId zym_preemptRegister(ZymVM* vm, int slice,
+                                 ZymValue callback, uint32_t flags);
+bool zym_preemptUnregister(ZymVM* vm, ZymPreemptId id);
+bool zym_preemptSetSlice(ZymVM* vm, ZymPreemptId id, int slice);
+int  zym_preemptRemaining(ZymVM* vm, ZymPreemptId id);   // -1 if unknown
+bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id);     // fire at next dispatch
+int  zym_preemptCapacity(void);
+
+// -----------------------------------------------------------------------------
+// HARD STOP
+// -----------------------------------------------------------------------------
+// Unmaskable and sticky. Checked before any masking logic, so a script
+// shield, an in-flight preempt callback, or an empty entry table cannot
+// suppress it. Never cleared by the VM: call zym_clearStop() before reusing
+// the VM. Declared for cross-context writes, so it is safe to call from an
+// ISR, a signal handler, or another thread.
+//
+// Execution unwinds to ZYM_STATUS_ABORTED, which is deliberately NOT a
+// runtime error: no diagnostic is pushed and no script-visible handler runs,
+// so a sandboxed script cannot observe or intercept its own termination.
+//
+// A native that re-enters the VM must PROPAGATE ZYM_STATUS_ABORTED rather
+// than treating it as an ordinary failure; swallowing it defeats the stop.
+void zym_requestStop(ZymVM* vm);
+void zym_clearStop(ZymVM* vm);
+bool zym_stopRequested(const ZymVM* vm);
+bool zym_isAborting(const ZymVM* vm);
+
 ZymStatus zym_serializeChunk(ZymVM* vm, ZymCompilerConfig config, ZymChunk* chunk, char** out_buffer, size_t* out_size);
 ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, size_t size);
 

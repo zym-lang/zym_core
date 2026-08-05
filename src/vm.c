@@ -14,6 +14,7 @@
 #include "./gc.h"
 #include "./native.h"
 #include "zym/zym.h"
+#include "./modules/preemption.h"
 #include "./modules/continuation.h"
 #include "./modules/core_modules.h"
 
@@ -82,11 +83,16 @@ void initVM(VM* vm) {
     vm->next_prompt_tag_id = 1;
 
     vm->preempt_counter = INT32_MAX;
-    vm->saved_budget = DEFAULT_TIMESLICE;
+    vm->preempt_armed = INT32_MAX;
     vm->default_timeslice = DEFAULT_TIMESLICE;
-    vm->preempt_requested = false;
-    vm->preemption_enabled = false;
-    vm->preemption_disable_depth = 0;
+    vm->stop_requested = 0;
+    memset(vm->preempt_table, 0, sizeof(vm->preempt_table));
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        vm->preempt_table[i].callback = NULL_VAL;
+    }
+    vm->preempt_next_id = 0;
+    vm->preempt_live_count = 0;
+    vm->preempt_shield_depth = 0;
     vm->on_preempt_callback = NULL_VAL;
 
     vm->resume_depth = 0;
@@ -425,8 +431,18 @@ void closeUpvalues(VM* vm, Value* last) {
 void unwindFrames(VM* vm, int new_frame_count) {
     while (vm->frame_count > new_frame_count) {
         CallFrame* frame = &vm->frames[--vm->frame_count];
-        if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
-            vm->preemption_disable_depth--;
+        if (frame->flags & FRAME_FLAG_PREEMPT) {
+            // Release this entry's structural guard so it can fire again.
+            for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+                PreemptEntry* e = &vm->preempt_table[i];
+                if (e->slice != 0 && e->id == frame->preempt_id) {
+                    e->in_flight = false;
+                    break;
+                }
+            }
+        }
+        if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
+            if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
         }
     }
     vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
@@ -498,7 +514,7 @@ static Value resolveOverload(VM* vm, ObjDispatcher* dispatcher, uint16_t arg_cou
     return NULL_VAL;
 }
 
-static bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
+bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     if (needed_top <= vm->stack_capacity) {
         return true;
     }
@@ -544,12 +560,12 @@ static bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     return true;
 }
 
-static bool pushPreemptFrame(VM* vm) {
-    if (IS_NULL(vm->on_preempt_callback) || !IS_CLOSURE(vm->on_preempt_callback)) {
+static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
+    if (entry == NULL || !IS_CLOSURE(entry->callback)) {
         return false;
     }
 
-    ObjClosure* closure = AS_CLOSURE(vm->on_preempt_callback);
+    ObjClosure* closure = AS_CLOSURE(entry->callback);
     ObjFunction* function = closure->function;
 
     if (vm->frame_count == FRAMES_MAX) {
@@ -567,7 +583,7 @@ static bool pushPreemptFrame(VM* vm) {
         return false;
     }
 
-    vm->stack[callee_slot] = vm->on_preempt_callback;
+    vm->stack[callee_slot] = entry->callback;
     vm->stack_top = needed_top;
 
     CallFrame* frame = &vm->frames[vm->frame_count++];
@@ -577,13 +593,17 @@ static bool pushPreemptFrame(VM* vm) {
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_PREEMPT;
     frame->arg_count    = 0;
+    frame->preempt_id   = entry->id;
 
     vm->current_frame = frame;
     vm->cur_base = callee_slot;
     vm->chunk = &function->chunk;
     vm->ip = function->chunk.code;
 
-    vm->preemption_disable_depth++;
+    // Structural re-entry guard: only THIS entry is masked while its
+    // callback runs. Other entries, in particular a non-maskable host
+    // watchdog, remain live so a runaway callback is still stoppable.
+    entry->in_flight = true;
 
     return true;
 }
@@ -591,20 +611,74 @@ static bool pushPreemptFrame(VM* vm) {
 // --- Cold preemption handler: outlined from DISPATCH to reduce I-cache pressure ---
 __attribute__((noinline, cold))
 static InterpretResult handlePreemption(VM* vm) {
-    if (!vm->preemption_enabled || vm->preemption_disable_depth > 0) {
-        // Spurious trigger: counter wrapped from INT32_MAX or preempt_requested while disabled
-        vm->preempt_counter = INT32_MAX;
-        vm->preempt_requested = false;
+    // 1. HARD STOP -- checked before any masking, and never cleared here.
+    //    A shield, an in-flight callback, or an empty table cannot suppress
+    //    it, which is what makes it a guarantee rather than a request. The
+    //    host clears it via preemptClearStop().
+    if (vm->stop_requested) {
+        return INTERPRET_ABORTED;
+    }
+
+    // 2. How much time actually passed. NOT the nominal slice: a trigger()
+    //    or a stop request can drive the counter to 0 early.
+    int32_t elapsed = vm->preempt_armed - vm->preempt_counter;
+    if (elapsed < 0) elapsed = 0;
+
+    // 3. Charge every unmasked entry and collect the expired ones. Masking
+    //    is per-entry: an in-flight callback masks only itself, so a
+    //    non-maskable host watchdog still fires while script code runs
+    //    inside a preempt callback.
+    PreemptEntry* fired[ZYM_PREEMPT_MAX_ENTRIES];
+    int fired_count = 0;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice == 0) continue;
+        if (e->in_flight) continue;
+        if ((e->flags & ZYM_PREEMPT_F_MASKABLE) && vm->preempt_shield_depth > 0) {
+            continue;
+        }
+        e->remaining -= elapsed;
+        if (e->remaining <= 0) fired[fired_count++] = e;
+    }
+
+    if (fired_count == 0) {
+        preemptArm(vm);
         return INTERPRET_OK;
     }
-    // Real preemption
-    vm->preempt_counter = vm->default_timeslice;
-    vm->preempt_requested = false;
-    if (IS_CLOSURE(vm->on_preempt_callback)) {
-        if (pushPreemptFrame(vm)) {
-            return INTERPRET_OK;  // callback pushed, continue execution
+
+    // 4. A callback-less entry means "stop", so honour it before running any
+    //    script. Registration order decides precedence among equals.
+    for (int i = 0; i < fired_count; i++) {
+        if (!IS_CLOSURE(fired[i]->callback)) {
+            return INTERPRET_ABORTED;
         }
     }
+
+    // 5. Rearm (or retire) each fired entry, then hand control to the first
+    //    callback. Only one frame can be pushed per expiry; the others keep
+    //    their refreshed deadlines and fire on a later pass.
+    PreemptEntry* target = fired[0];
+    for (int i = 0; i < fired_count; i++) {
+        PreemptEntry* e = fired[i];
+        if (e->flags & ZYM_PREEMPT_F_ONESHOT) {
+            if (e != target) {
+                e->slice = 0;
+                e->callback = NULL_VAL;
+                vm->preempt_live_count--;
+            }
+        } else {
+            e->remaining = e->slice;
+        }
+    }
+
+    if (pushPreemptFrame(vm, target)) {
+        preemptArm(vm);
+        return INTERPRET_OK;   // callback frame pushed; execution continues
+    }
+
+    // Could not push a frame (stack/frame exhaustion): yield to the host
+    // rather than silently dropping the callback.
+    preemptArm(vm);
     return INTERPRET_YIELD;
 }
 
@@ -788,7 +862,9 @@ static InterpretResult run(VM* vm) {
     if (__builtin_expect(--vm->preempt_counter <= 0, 0)) { \
         STORE_STATE(); \
         InterpretResult _pr = handlePreemption(vm); \
-        if (_pr == INTERPRET_YIELD) return INTERPRET_YIELD; \
+        /* ABORTED must propagate exactly like YIELD, otherwise a stop
+           falls through and execution continues. */ \
+        if (_pr == INTERPRET_YIELD || _pr == INTERPRET_ABORTED) return _pr; \
         LOAD_STATE(); \
     } \
     instr = *ip++; \
@@ -2875,8 +2951,17 @@ static InterpretResult run(VM* vm) {
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-            if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
-                vm->preemption_disable_depth--;
+            if (frame->flags & FRAME_FLAG_PREEMPT) {
+                for (int pi = 0; pi < ZYM_PREEMPT_MAX_ENTRIES; pi++) {
+                    PreemptEntry* pe = &vm->preempt_table[pi];
+                    if (pe->slice != 0 && pe->id == frame->preempt_id) {
+                        pe->in_flight = false;
+                        break;
+                    }
+                }
+            }
+            if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
+                if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
             }
             STORE_STATE();
             return INTERPRET_OK;
@@ -2889,8 +2974,17 @@ static InterpretResult run(VM* vm) {
         vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
         RELOAD_SP();  // returning to caller frame: recompute spill base
 
-        if (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
-            vm->preemption_disable_depth--;
+        if (frame->flags & FRAME_FLAG_PREEMPT) {
+            for (int pi = 0; pi < ZYM_PREEMPT_MAX_ENTRIES; pi++) {
+                PreemptEntry* pe = &vm->preempt_table[pi];
+                if (pe->slice != 0 && pe->id == frame->preempt_id) {
+                    pe->in_flight = false;
+                    break;
+                }
+            }
+        }
+        if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
+            if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
         }
 
         // Single check for any active boundary (withPrompt or resume)

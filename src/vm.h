@@ -45,6 +45,24 @@
 #define DEFAULT_TIMESLICE 10000
 #define MAX_RESUME_DEPTH 64
 #define MAX_WITH_PROMPT_DEPTH 64
+// ---- Preemption entry table ---------------------------------------------
+// Fixed size, no allocation: registration fails when full. Keeps the MCU
+// profile honest.
+#define ZYM_PREEMPT_MAX_ENTRIES 8
+
+#define ZYM_PREEMPT_F_MASKABLE  (1u << 0)  // suppressed by a script shield
+#define ZYM_PREEMPT_F_ONESHOT   (1u << 1)  // do not rearm after firing
+
+typedef struct {
+    int32_t  slice;        // rearm value; 0 means the slot is free
+    int32_t  remaining;    // counts down toward 0
+    Value    callback;     // NULL_VAL => abort execution instead of calling
+    uint32_t id;           // 0 is never a valid id
+    uint8_t  flags;
+    bool     owner_script; // false => host-owned
+    bool     in_flight;    // this entry's callback is executing
+} PreemptEntry;
+
 #define FRAME_FLAG_PREEMPT 0x01
 #define FRAME_FLAG_DISABLE_PREEMPT 0x02
 // Re-entrant API boundary: this frame was pushed by a public API call
@@ -65,6 +83,7 @@ struct CallFrame {
     Chunk* caller_chunk;
     int flags;
     uint16_t arg_count;  // actual number of args passed to this call (for variadic PACK_REST)
+    uint32_t preempt_id; // preemption entry whose callback this frame runs (0 = none)
 };
 typedef struct CallFrame CallFrame;
 
@@ -139,12 +158,25 @@ typedef struct VM {
     int prompt_count;
     uint32_t next_prompt_tag_id;
 
+    // ---- Preemption -------------------------------------------------
+    // One countdown drives an entry table. The dispatch loop only ever
+    // decrements `preempt_counter`; all table work happens on expiry in
+    // the cold handler, so the hot path stays at 1 decrement + 1 branch.
+    //
+    // `stop_requested` is the unmaskable hard stop. It is checked BEFORE
+    // any masking so a shield, a running callback, or a table with no
+    // entries can never suppress it, and it is never cleared by the VM.
+    // Declared like `compile_cancelled` so an ISR or another thread can
+    // set it safely.
     int32_t preempt_counter;
-    int32_t saved_budget;
-    bool preempt_requested;
-    bool preemption_enabled;
-    int preemption_disable_depth;
-    Value on_preempt_callback;
+    int32_t preempt_armed;          // value the counter was armed with
+    volatile sig_atomic_t stop_requested;
+    PreemptEntry preempt_table[ZYM_PREEMPT_MAX_ENTRIES];
+    uint32_t preempt_next_id;
+    int preempt_live_count;
+    int preempt_shield_depth;       // script critical sections; masks
+                                    // script-owned MASKABLE entries only
+    Value on_preempt_callback;      // legacy single-callback shim
     int default_timeslice;
 
     ResumeContext resume_stack[MAX_RESUME_DEPTH];
@@ -202,7 +234,12 @@ typedef enum {
     INTERPRET_OK,
     INTERPRET_COMPILE_ERROR,
     INTERPRET_RUNTIME_ERROR,
-    INTERPRET_YIELD
+    INTERPRET_YIELD,
+    // Execution was stopped by the host (watchdog expiry or an explicit
+    // stop request). Deliberately NOT a runtime error: no diagnostic is
+    // pushed and no script-visible handler runs, so a sandboxed script
+    // cannot observe, intercept, or loop inside its own termination.
+    INTERPRET_ABORTED
 } InterpretResult;
 
 static inline Chunk* currentChunk(VM* vm) {
@@ -215,6 +252,9 @@ void runtimeError(VM* vm, const char* format, ...);
 
 void updateStackReferences(VM* vm, Value* old_stack, Value* new_stack);
 void closeUpvalues(VM* vm, Value* last);
+// Grow the value stack so `needed_top` slots are addressable. Exposed so
+// native modules that push their own call frames can use it.
+bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out);
 void unwindFrames(VM* vm, int new_frame_count);
 void protectLocalRefsInValue(VM* vm, Value value, Value* frame_start);
 

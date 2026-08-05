@@ -109,13 +109,13 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
     cont->prompt_tag = tag;
     cont->state = CONT_VALID;
     
-    int saved_depth = vm->preemption_disable_depth;
+    int saved_depth = vm->preempt_shield_depth;
     for (int i = capture_frame_count + prompt_frame; i < vm->frame_count; i++) {
         if (vm->frames[i].flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
             saved_depth--;
         }
     }
-    cont->preemption_disable_depth = saved_depth;
+    cont->preempt_shield_depth = saved_depth;
 
     cont->return_slot = return_slot + (prompt->stack_base - capture_stack_base);
 
@@ -185,7 +185,7 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
 
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
-    vm->preemption_disable_depth = cont->preemption_disable_depth;
+    vm->preempt_shield_depth = cont->preempt_shield_depth;
 
     int result_slot = restore_base + cont->return_slot;
     vm->stack[result_slot] = resume_value;
