@@ -233,6 +233,7 @@ ObjContinuation* newContinuation(VM* vm) {
     cont->stack_base_offset = 0;
     cont->saved_ip = NULL;
     cont->saved_chunk = NULL;
+    cont->saved_owner = NULL;
     cont->prompt_tag = NULL;
     cont->state = CONT_VALID;
     cont->return_slot = 0;

@@ -180,6 +180,35 @@ void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
         }
     }
 
+    // Continuations hold a resume target of their own (saved_ip/saved_chunk) that
+    // no frame covers. The rule is simply that a freed chunk is gone: nothing
+    // aiming into it is resumable, so retire every such continuation here. This
+    // is what CONT_INVALID is for.
+    //
+    // For a host-owned target that is also a hard memory requirement -- the
+    // bytecode is released on the next line and no marking can protect it. For a
+    // target inside an ObjFunction the storage would in fact survive, because
+    // saved_owner keeps it marked; retiring those is a deliberate choice to keep
+    // one rule rather than two, since the host has declared that chunk dead.
+    for (Obj* o = vm->objects; o != NULL; o = o->next) {
+        if (o->type != OBJ_CONTINUATION) continue;
+        ObjContinuation* k = (ObjContinuation*)o;
+
+        if (k->saved_chunk == chunk || chunkOwnsFunction(chunk, k->saved_owner)) {
+            k->state       = CONT_INVALID;
+            k->saved_chunk = NULL;
+            k->saved_ip    = NULL;
+            k->saved_owner = NULL;
+        }
+
+        // Captured frames carry caller_chunk pointers the GC dereferences too.
+        for (int i = 0; i < k->frame_count; i++) {
+            if (k->frames[i].caller_chunk == chunk) {
+                k->frames[i].caller_chunk = NULL;
+            }
+        }
+    }
+
     freeChunk(vm, chunk);
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }

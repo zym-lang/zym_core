@@ -539,14 +539,16 @@ static void blackenObject(VM* vm, Obj* object) {
                 markObject(vm, (Obj*)cont->prompt_tag);
             }
 
-            // NOTE: cont->saved_chunk is deliberately NOT marked here. A Chunk is
-            // embedded by value in its ObjFunction (object.h) and freed with it, and
-            // markChunk only walks constants -- it cannot keep the owner alive, so
-            // marking it would buy nothing while adding a dereference of a pointer
-            // nothing roots. A zero-frame capture (prompt pushed at the current
-            // depth, or the preempt-truncation branch) therefore still holds an
-            // unowned saved_chunk; closing that needs an owner reference stored on
-            // the continuation, not a mark here.
+            // Keep the resume target's bytecode alive. Marking saved_chunk itself
+            // would be useless -- a Chunk is embedded by value in its ObjFunction
+            // and markChunk only walks constants, so it cannot reach the owner.
+            // Marking the owner is what actually pins the memory. It is NULL for a
+            // host-owned chunk, which no marking can protect; zym_freeChunk
+            // invalidates continuations pointing into those instead.
+            if (cont->saved_owner != NULL) {
+                markObject(vm, (Obj*)cont->saved_owner);
+            }
+
             for (int i = 0; i < cont->frame_count; i++) {
                 if (cont->frames[i].closure != NULL) {
                     markObject(vm, (Obj*)cont->frames[i].closure);

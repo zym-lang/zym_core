@@ -37,6 +37,24 @@ PromptEntry* findPrompt(VM* vm, ObjPromptTag* tag) {
     return NULL;
 }
 
+// Which ObjFunction embeds this chunk, or NULL if it is host-owned.
+//
+// A Chunk has no back-pointer to its owner, so we recover it by scanning the
+// live frames: whatever chunk a capture saves is either the currently executing
+// function's or its caller's, and both are on the frame stack at capture time.
+// The result is what the GC marks -- without it, nothing keeps the resume
+// target's bytecode alive once the capturing function goes out of scope.
+static ObjFunction* ownerOfChunk(VM* vm, Chunk* chunk) {
+    if (chunk == NULL) return NULL;
+    for (int i = 0; i < vm->frame_count; i++) {
+        ObjClosure* cl = vm->frames[i].closure;
+        if (cl != NULL && cl->function != NULL && &cl->function->chunk == chunk) {
+            return cl->function;
+        }
+    }
+    return NULL;   // top-level/host chunk: nothing to mark
+}
+
 ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot) {
     PromptEntry* prompt = findPrompt(vm, tag);
     if (prompt == NULL) {
@@ -104,6 +122,9 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
         cont->saved_ip = vm->ip;
         cont->saved_chunk = vm->chunk;
     }
+    // Resolve while the owning frame is still live -- after the unwind the
+    // caller performs, the frame stack no longer names it.
+    cont->saved_owner = ownerOfChunk(vm, cont->saved_chunk);
     cont->stack_base_offset = capture_stack_base;
 
     cont->prompt_tag = tag;

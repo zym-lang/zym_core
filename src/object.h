@@ -233,6 +233,12 @@ typedef struct ObjContinuation {
     int stack_base_offset;
     uint32_t* saved_ip;
     Chunk* saved_chunk;
+    // The ObjFunction whose embedded chunk `saved_chunk` is, or NULL when the
+    // resume target lives in a host-owned chunk. A Chunk is not a GC object and
+    // carries no back-pointer, so marking `saved_chunk` cannot keep its storage
+    // alive -- only marking this owner can. NULL means no owner can be marked,
+    // and the chunk is invalidated by zym_freeChunk instead.
+    ObjFunction* saved_owner;
     ObjPromptTag* prompt_tag;
     ContinuationState state;
     int return_slot;
