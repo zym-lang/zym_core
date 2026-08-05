@@ -120,12 +120,66 @@ ZymChunk* zym_newChunk(ZymVM* vm)
     return chunk;
 }
 
+// Is `fn` one of this chunk's constants? A chunk's constant pool is what keeps
+// the functions compiled inside it reachable, so once the chunk is gone the next
+// collection sweeps them and their embedded bytecode with them.
+static bool chunkOwnsFunction(Chunk* chunk, ObjFunction* fn)
+{
+    if (fn == NULL) return false;
+    for (int i = 0; i < chunk->constants.count; i++) {
+        Value v = chunk->constants.values[i];
+        if (IS_FUNCTION(v) && AS_FUNCTION(v) == fn) return true;
+    }
+    return false;
+}
+
 void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
 {
     if (chunk == NULL) return;
-    if (vm->chunk == chunk) {
-        vm->chunk = NULL;
+
+    // An abort suspends rather than unwinds, so a suspended VM still holds an
+    // `ip` into live bytecode. Freeing that bytecode used to leave
+    // execution_suspended set, and the next zym_resume walked past its guard
+    // and dispatched from released memory -- reachable from ordinary script
+    // through the CLI's child VMs, and fatal to the host. Decide here whether
+    // this chunk is implicated in the suspension and, if so, drop it: resume
+    // then reports RUNTIME_ERROR instead of running freed code.
+    //
+    // "Implicated" is wider than vm->chunk == chunk, because the VM is usually
+    // parked inside a *function* whose own chunk is embedded in an ObjFunction
+    // held only by this chunk's constant pool.
+    bool implicated = (vm->chunk == chunk);
+
+    if (!implicated && vm->ip != NULL && chunk->code != NULL &&
+        vm->ip >= chunk->code && vm->ip < chunk->code + chunk->count) {
+        implicated = true;
     }
+
+    for (int i = 0; i < vm->frame_count && !implicated; i++) {
+        if (vm->frames[i].caller_chunk == chunk) {
+            implicated = true;
+        } else if (vm->frames[i].closure != NULL &&
+                   chunkOwnsFunction(chunk, vm->frames[i].closure->function)) {
+            implicated = true;
+        }
+    }
+
+    if (implicated) {
+        vm->chunk = NULL;
+        vm->ip = NULL;
+        vm->execution_suspended = false;
+    }
+
+    // Live frames snapshot the caller's chunk, and both markRoots and
+    // blackenObject dereference caller_chunk during a collection. Any still
+    // pointing into this chunk would be read after free; markChunk NULL-guards,
+    // so clearing them is enough.
+    for (int i = 0; i < vm->frame_count; i++) {
+        if (vm->frames[i].caller_chunk == chunk) {
+            vm->frames[i].caller_chunk = NULL;
+        }
+    }
+
     freeChunk(vm, chunk);
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
