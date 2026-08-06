@@ -284,12 +284,13 @@ typedef enum {
     INTERPRET_OK,
     INTERPRET_COMPILE_ERROR,
     INTERPRET_RUNTIME_ERROR,
-    INTERPRET_YIELD,
-    // Execution was stopped by the host (watchdog expiry or an explicit
-    // stop request). Deliberately NOT a runtime error: no diagnostic is
-    // pushed and no script-visible handler runs, so a sandboxed script
-    // cannot observe, intercept, or loop inside its own termination.
-    INTERPRET_ABORTED
+    // Execution paused at an instruction boundary and can be resumed. Why is
+    // recorded in vm->vm_cause, never in this value: a watchdog, a stop, the
+    // memory ceiling, and an unservable preempt callback are one state with
+    // four causes. Deliberately NOT a runtime error -- no diagnostic is pushed
+    // and no script-visible handler runs, so a sandboxed script cannot observe,
+    // intercept, or loop inside its own termination.
+    INTERPRET_SUSPENDED
 } InterpretResult;
 
 static inline Chunk* currentChunk(VM* vm) {

@@ -628,7 +628,7 @@ static InterpretResult handlePreemption(VM* vm) {
     //    host clears it via preemptClearStop().
     if (vm->stop_requested) {
         vm->vm_cause = ZYM_CAUSE_HOST_STOP;
-        return INTERPRET_ABORTED;
+        return INTERPRET_SUSPENDED;
     }
 
     // 1b. MEMORY CEILING -- also unmaskable, and also never cleared here.
@@ -638,7 +638,7 @@ static InterpretResult handlePreemption(VM* vm) {
     //     because a stop is the host demanding termination outright.
     if (vm->oom_pending) {
         vm->vm_cause = ZYM_CAUSE_MEMORY_LIMIT;
-        return INTERPRET_ABORTED;
+        return INTERPRET_SUSPENDED;
     }
 
     // 2. How much time actually passed. NOT the nominal slice: a trigger()
@@ -690,7 +690,7 @@ static InterpretResult handlePreemption(VM* vm) {
             vm->vm_cause         = ZYM_CAUSE_PREEMPT;
             vm->cause_preempt_id = fired[i]->id;
             preemptArm(vm);
-            return INTERPRET_ABORTED;
+            return INTERPRET_SUSPENDED;
         }
     }
 
@@ -733,7 +733,7 @@ static InterpretResult handlePreemption(VM* vm) {
     vm->vm_cause         = ZYM_CAUSE_PREEMPT_BLOCKED;
     vm->cause_preempt_id = target->id;
     preemptArm(vm);
-    return INTERPRET_YIELD;
+    return INTERPRET_SUSPENDED;
 }
 
 // --- Cold error helper: outlined from run() to reduce I-cache pressure ---
@@ -916,9 +916,9 @@ static InterpretResult run(VM* vm) {
     if (__builtin_expect(--vm->preempt_counter <= 0, 0)) { \
         STORE_STATE(); \
         InterpretResult _pr = handlePreemption(vm); \
-        /* ABORTED must propagate exactly like YIELD, otherwise a stop
-           falls through and execution continues. */ \
-        if (_pr == INTERPRET_YIELD || _pr == INTERPRET_ABORTED) return _pr; \
+        /* A suspension must propagate out of the loop; falling through would
+           let a stop, a watchdog, or the memory ceiling be ignored. */ \
+        if (_pr == INTERPRET_SUSPENDED) return _pr; \
         LOAD_STATE(); \
     } \
     instr = *ip++; \

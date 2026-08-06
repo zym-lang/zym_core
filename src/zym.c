@@ -1156,20 +1156,16 @@ static void begin_run(ZymVM* vm)
 // ceiling in reallocate); this only records the resulting state.
 static ZymStatus settle_result(ZymVM* vm, InterpretResult result)
 {
-    vm->execution_suspended =
-        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
+    vm->execution_suspended = (result == INTERPRET_SUSPENDED);
 
     switch (result) {
         case INTERPRET_OK:
             vm->vm_state = ZYM_STATE_IDLE;
             vm->vm_cause = ZYM_CAUSE_NONE;
             return ZYM_STATUS_OK;
-        case INTERPRET_YIELD:
+        case INTERPRET_SUSPENDED:
             vm->vm_state = ZYM_STATE_SUSPENDED;
-            return ZYM_STATUS_YIELD;
-        case INTERPRET_ABORTED:
-            vm->vm_state = ZYM_STATE_SUSPENDED;
-            return ZYM_STATUS_ABORTED;
+            return ZYM_STATUS_SUSPENDED;
         case INTERPRET_COMPILE_ERROR:
             vm->vm_state = ZYM_STATE_FAILED;
             vm->vm_cause = ZYM_CAUSE_COMPILE_ERROR;
@@ -1180,6 +1176,38 @@ static ZymStatus settle_result(ZymVM* vm, InterpretResult result)
             vm->vm_cause = ZYM_CAUSE_RUNTIME_ERROR;
             return ZYM_STATUS_RUNTIME_ERROR;
     }
+}
+
+// A suspension the caller may transparently continue past. Only an unservable
+// preempt callback qualifies: the entry was rearmed before we gave up on it, so
+// resuming makes progress and the condition usually clears itself once the
+// stack unwinds. Everything else -- a watchdog, a host stop, the memory ceiling
+// -- is a decision the host has to make, and auto-resuming it would defeat the
+// mechanism entirely.
+static bool auto_resumable(const ZymVM* vm)
+{
+    return vm->vm_cause == ZYM_CAUSE_PREEMPT_BLOCKED;
+}
+
+ZymStatus zym_runToCompletion(ZymVM* vm, ZymChunk* chunk)
+{
+    if (vm == NULL || chunk == NULL) return ZYM_STATUS_RUNTIME_ERROR;
+    ZymStatus s = zym_runChunk(vm, chunk);
+    while (s == ZYM_STATUS_SUSPENDED && auto_resumable(vm)) {
+        s = zym_resume(vm);
+    }
+    return s;
+}
+
+ZymStatus zym_callToCompletion(ZymVM* vm, const char* funcName,
+                               int argc, ZymValue* argv)
+{
+    if (vm == NULL || funcName == NULL) return ZYM_STATUS_RUNTIME_ERROR;
+    ZymStatus s = zym_callv(vm, funcName, argc, argv);
+    while (s == ZYM_STATUS_SUSPENDED && auto_resumable(vm)) {
+        s = zym_resume(vm);
+    }
+    return s;
 }
 
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
@@ -1285,7 +1313,7 @@ bool zym_stopRequested(const ZymVM* vm) { return vm ? preemptStopRequested(vm) :
 bool zym_isAborting(const ZymVM* vm)    { return vm ? preemptStopRequested(vm) : false; }
 
 // ---- Memory ceiling ------------------------------------------------------
-// Crossing the limit suspends the VM (ZYM_STATUS_ABORTED) rather than failing
+// Crossing the limit suspends the VM (ZYM_STATUS_SUSPENDED) rather than failing
 // the allocation, so the host chooses what happens next. Sticky like the hard
 // stop: clear it, or raise the limit, before resuming.
 
@@ -2584,8 +2612,7 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     switch (result) {
         case INTERPRET_OK: return ZYM_STATUS_OK;
         case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
-        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
-        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
+        case INTERPRET_SUSPENDED: return ZYM_STATUS_SUSPENDED;
         default: return ZYM_STATUS_RUNTIME_ERROR;
     }
 }

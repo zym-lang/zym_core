@@ -23,9 +23,16 @@ typedef enum {
     ZYM_STATUS_OK,
     ZYM_STATUS_COMPILE_ERROR,
     ZYM_STATUS_RUNTIME_ERROR,
-    ZYM_STATUS_YIELD,
-    // Host-initiated stop. Appended so existing numeric values are stable.
-    ZYM_STATUS_ABORTED
+    // Paused at an instruction boundary with frames, stack, and ip intact, and
+    // resumable. Deliberately NOT an error: nothing unwinds, no diagnostic is
+    // pushed, and no script-visible handler runs.
+    //
+    // This is one status because it is one VM state. A watchdog, a host stop,
+    // the memory ceiling, and a preempt callback that could not be pushed all
+    // arrive here and all call for different responses -- ask zym_vmCause().
+    // Branching on the status alone tells you the VM paused, never why, and
+    // auto-resuming without checking the cause defeats a watchdog.
+    ZYM_STATUS_SUSPENDED,
 } ZymStatus;
 
 // -----------------------------------------------------------------------------

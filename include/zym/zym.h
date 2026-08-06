@@ -185,6 +185,19 @@ bool zym_wasCancelled(const ZymVM* vm);
 
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_resume(ZymVM* vm);
+
+// Run, transparently continuing past suspensions the host has no decision to
+// make about -- today only ZYM_CAUSE_PREEMPT_BLOCKED, where a preempt callback
+// could not be pushed because the call stack was exhausted. A watchdog, a host
+// stop, and the memory ceiling all return ZYM_STATUS_SUSPENDED to the caller,
+// because auto-resuming those would defeat them.
+//
+// Prefer these over hand-rolling a resume loop: a loop written as
+// `while (s == ZYM_STATUS_SUSPENDED) s = zym_resume(vm);` silently disarms
+// every watchdog on the VM.
+ZymStatus zym_runToCompletion(ZymVM* vm, ZymChunk* chunk);
+ZymStatus zym_callToCompletion(ZymVM* vm, const char* funcName,
+                               int argc, ZymValue* argv);
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
 
 // -----------------------------------------------------------------------------
@@ -254,11 +267,12 @@ int  zym_preemptIds(const ZymVM* vm, ZymPreemptId* out, int max);
 // the VM. Declared for cross-context writes, so it is safe to call from an
 // ISR, a signal handler, or another thread.
 //
-// Execution unwinds to ZYM_STATUS_ABORTED, which is deliberately NOT a
-// runtime error: no diagnostic is pushed and no script-visible handler runs,
-// so a sandboxed script cannot observe or intercept its own termination.
+// Execution suspends with ZYM_STATUS_SUSPENDED and cause ZYM_CAUSE_HOST_STOP.
+// Deliberately NOT a runtime error: no diagnostic is pushed and no
+// script-visible handler runs, so a sandboxed script cannot observe or
+// intercept its own termination.
 //
-// A native that re-enters the VM must PROPAGATE ZYM_STATUS_ABORTED rather
+// A native that re-enters the VM must PROPAGATE ZYM_STATUS_SUSPENDED rather
 // than treating it as an ordinary failure; swallowing it defeats the stop.
 void zym_requestStop(ZymVM* vm);
 void zym_clearStop(ZymVM* vm);
@@ -272,7 +286,8 @@ bool zym_isAborting(const ZymVM* vm);
 //
 // Crossing the ceiling does NOT fail the allocation. The request is satisfied
 // -- the host allocator still has memory -- and the VM is then suspended at the
-// next instruction boundary with ZYM_STATUS_ABORTED, exactly like a watchdog.
+// next instruction boundary with ZYM_STATUS_SUSPENDED and cause
+// ZYM_CAUSE_MEMORY_LIMIT, exactly like a watchdog.
 // Failing the allocation instead would strand every caller in the VM that
 // assumes allocation succeeds, and would leave the host nothing to recover
 // from. The overshoot is therefore bounded by one allocation rather than zero.
