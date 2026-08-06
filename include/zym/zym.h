@@ -201,7 +201,7 @@ void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
 // execution on expiry, which is the watchdog shape -- there is no script
 // callback to intercept, mishandle, or loop inside.
 
-typedef uint32_t ZymPreemptId;          // 0 is never a valid id
+// ZymPreemptId is declared in config.h alongside ZymVmInfo, which uses it.
 
 #define ZYM_PREEMPT_MASKABLE  (1u << 0) // may be suppressed by a script shield
 #define ZYM_PREEMPT_ONESHOT   (1u << 1) // retire after firing instead of rearming
@@ -265,6 +265,31 @@ size_t zym_getMemoryLimit(const ZymVM* vm);
 size_t zym_memoryUsed(const ZymVM* vm);
 bool   zym_oomPending(const ZymVM* vm);
 void   zym_clearOom(ZymVM* vm);
+
+// -----------------------------------------------------------------------------
+// VM STATE AND CAUSE
+// -----------------------------------------------------------------------------
+// A ZymStatus tells you what one call returned. These tell you what the VM
+// *is*, and why -- readable at any time, including from inside a native while
+// the VM is running, or from another context.
+//
+// The two are separate axes on purpose. `state` answers whether execution can
+// continue; `cause` answers what put it there. New reasons to stop become new
+// causes, so neither the state enum nor any existing branch on it has to grow.
+//
+// `cause` latches the reason for the last transition out of RUNNING and stays
+// readable until the next run begins, so it can be inspected after the fact.
+// The detail fields in ZymVmInfo are only meaningful for their own cause:
+// `preempt_id` for the preemption causes, `bytes_wanted` for ZYM_CAUSE_MEMORY_LIMIT.
+//
+// `resumable` is the field to branch on when driving a resume loop: it folds
+// together "is anything suspended" with "has every sticky condition been
+// cleared", which is otherwise three flags the host has to check itself.
+//
+// See config.h for ZymVmState, ZymVmCause, and ZymVmInfo.
+ZymVmState zym_vmState(const ZymVM* vm);
+ZymVmCause zym_vmCause(const ZymVM* vm);
+void       zym_vmInfo(const ZymVM* vm, ZymVmInfo* out);
 
 ZymStatus zym_serializeChunk(ZymVM* vm, ZymCompilerConfig config, ZymChunk* chunk, char** out_buffer, size_t* out_size);
 ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, size_t size);

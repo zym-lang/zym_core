@@ -86,6 +86,7 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
                 // one allocation, plus whatever the current opcode still does
                 // before DISPATCH runs again.
                 vm->oom_pending = true;
+                vm->cause_bytes_wanted = newSize - oldSize;   // what crossed it
                 vm->preempt_counter = 0;   // observed by DISPATCH -> handlePreemption
             }
         }

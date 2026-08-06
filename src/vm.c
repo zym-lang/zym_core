@@ -48,6 +48,11 @@ void initVM(VM* vm) {
     vm->active_boundaries = 0;
     vm->current_frame = NULL;
 
+    vm->vm_state = ZYM_STATE_IDLE;
+    vm->vm_cause = ZYM_CAUSE_NONE;
+    vm->cause_preempt_id = 0;
+    vm->cause_bytes_wanted = 0;
+
     vm->objects = NULL;
     vm->bytes_allocated = 0;
     vm->memory_limit = 0;   // unlimited until the host sets one
@@ -619,6 +624,7 @@ static InterpretResult handlePreemption(VM* vm) {
     //    it, which is what makes it a guarantee rather than a request. The
     //    host clears it via preemptClearStop().
     if (vm->stop_requested) {
+        vm->vm_cause = ZYM_CAUSE_HOST_STOP;
         return INTERPRET_ABORTED;
     }
 
@@ -628,6 +634,7 @@ static InterpretResult handlePreemption(VM* vm) {
     //     until the host decides what to do. Ranked below the hard stop
     //     because a stop is the host demanding termination outright.
     if (vm->oom_pending) {
+        vm->vm_cause = ZYM_CAUSE_MEMORY_LIMIT;
         return INTERPRET_ABORTED;
     }
 
@@ -677,6 +684,8 @@ static InterpretResult handlePreemption(VM* vm) {
                     e->remaining = e->slice;
                 }
             }
+            vm->vm_cause         = ZYM_CAUSE_PREEMPT;
+            vm->cause_preempt_id = fired[i]->id;
             preemptArm(vm);
             return INTERPRET_ABORTED;
         }
@@ -718,6 +727,8 @@ static InterpretResult handlePreemption(VM* vm) {
 
     // Could not push a frame (stack/frame exhaustion): yield to the host
     // rather than silently dropping the callback.
+    vm->vm_cause         = ZYM_CAUSE_PREEMPT_BLOCKED;
+    vm->cause_preempt_id = target->id;
     preemptArm(vm);
     return INTERPRET_YIELD;
 }

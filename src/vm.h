@@ -16,16 +16,18 @@
  *
  * These arrays are pre-allocated in the VM struct. Memory usage on 64-bit:
  *
- *   CallFrame:   32 bytes each (closure, ip, stack_base, caller_chunk + padding)
- *   PromptEntry: 16 bytes each (tag, frame_index, stack_base)
+ *   CallFrame:    32 bytes each (closure, ip, stack_base, caller_chunk + padding)
+ *   PromptEntry:  16 bytes each (tag, frame_index, stack_base)
  *   ResumeContext: 8 bytes each (frame_boundary, result_slot)
+ *   PreemptEntry: 24 bytes each (slice, remaining, callback, id, flags + padding)
  *
  * ┌─────────────┬─────────────────────────────────────────────────┐
- * │   Count     │  32      64      128     256     512            │
+ * │   Count     │  8       16      32      64      256            │
  * ├─────────────┼─────────────────────────────────────────────────┤
- * │ FRAMES_MAX  │  1 KB    2 KB    4 KB    8 KB    16 KB          │
- * │ MAX_PROMPTS │  0.5 KB  1 KB    2 KB    4 KB    8 KB           │
- * │ RESUME_DEPTH│  0.25 KB 0.5 KB  1 KB    2 KB    4 KB           │
+ * │ FRAMES_MAX  │  0.25 KB 0.5 KB  1 KB    2 KB    8 KB           │
+ * │ MAX_PROMPTS │  128 B   256 B   0.5 KB  1 KB    4 KB           │
+ * │ RESUME_DEPTH│  64 B    128 B   256 B   0.5 KB  2 KB           │
+ * │ PREEMPT_MAX │  192 B   384 B   768 B   1.5 KB  6 KB           │
  * └─────────────┴─────────────────────────────────────────────────┘
  *
  * Notes:
@@ -33,6 +35,11 @@
  *   - MAX_PROMPTS limits concurrent prompt boundaries (bookmarks for continuations)
  *   - Captured continuations are heap-allocated, not limited by these values
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
+ *   - ZYM_PREEMPT_MAX_ENTRIES is one table shared by host and script entries.
+ *     handlePreemption also builds a scratch array of one pointer per slot on
+ *     the C stack, so a slot costs 24 bytes of VM plus 8 bytes of stack during
+ *     an expiry. Scanning is O(slots) on the cold path only; the dispatch loop
+ *     stays one decrement and one branch whatever the size.
  */
 #ifndef FRAMES_MAX
 #define FRAMES_MAX 256
@@ -48,7 +55,15 @@
 // ---- Preemption entry table ---------------------------------------------
 // Fixed size, no allocation: registration fails when full. Keeps the MCU
 // profile honest.
+//
+// Overridable at build time like FRAMES_MAX and STACK_MAX. The table lives
+// inline in the VM struct, so each slot costs sizeof(PreemptEntry) (24 bytes)
+// per VM plus one pointer of stack in handlePreemption's scratch array. The
+// capacity is shared between host and script entries; hosts should read
+// zym_preemptCapacity() rather than assume a number.
+#ifndef ZYM_PREEMPT_MAX_ENTRIES
 #define ZYM_PREEMPT_MAX_ENTRIES 8
+#endif
 
 #define ZYM_PREEMPT_F_MASKABLE  (1u << 0)  // suppressed by a script shield
 #define ZYM_PREEMPT_F_ONESHOT   (1u << 1)  // do not rearm after firing
@@ -186,6 +201,16 @@ typedef struct VM {
     // run returned YIELD or ABORTED). `chunk`/`ip` remain set after a
     // completed run, so they cannot answer this on their own.
     bool execution_suspended;
+
+    // ---- Reported state ---------------------------------------------
+    // What the VM is, and why. `vm_state` tracks execution; `vm_cause`
+    // latches the reason for the last transition out of RUNNING and
+    // survives until the next run starts, so it stays readable after the
+    // fact. The detail fields are only meaningful for their own cause.
+    ZymVmState vm_state;
+    ZymVmCause vm_cause;
+    ZymPreemptId cause_preempt_id;   // entry that fired, for the preempt causes
+    size_t cause_bytes_wanted;       // request that crossed the ceiling
     PreemptEntry preempt_table[ZYM_PREEMPT_MAX_ENTRIES];
     uint32_t preempt_next_id;
     int preempt_live_count;

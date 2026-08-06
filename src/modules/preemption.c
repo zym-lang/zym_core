@@ -60,6 +60,17 @@ void preemptArm(VM* vm) {
 uint32_t preemptRegister(VM* vm, int slice, Value callback,
                          uint8_t flags, bool owner_script) {
     if (slice < 1) slice = 1;
+
+    // A callback the VM could never invoke must not be registrable. pushPreemptFrame
+    // requires arity 0, so a callback taking arguments would occupy a slot, fire on
+    // every slice, and never run -- silently. Reject it here, where both the script
+    // natives and zym_preemptRegister funnel through, so neither path can hand back
+    // an id for an entry that cannot do its job. A NULL callback is the watchdog
+    // shape and is deliberately allowed.
+    if (IS_CLOSURE(callback) && AS_CLOSURE(callback)->function->arity != 0) {
+        return 0;
+    }
+
     for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
         PreemptEntry* e = &vm->preempt_table[i];
         if (e->slice != 0) continue;
@@ -201,6 +212,13 @@ static ZymValue preempt_every(ZymVM* vm, ZymValue ctx, ZymValue slice, ZymValue 
         zym_runtimeError(vm, "Preempt.every(slice, fn): fn must be a function.");
         return ZYM_ERROR;
     }
+    // Checked here as well as in preemptRegister so the script gets the real
+    // reason rather than the table-full message.
+    if (AS_CLOSURE(cb)->function->arity != 0) {
+        zym_runtimeError(vm, "Preempt.every(slice, fn): fn must take 0 arguments, got %d.",
+                         AS_CLOSURE(cb)->function->arity);
+        return ZYM_ERROR;
+    }
     uint32_t id = preemptRegister(vm, (int)zym_asNumber(slice), cb,
                                   ZYM_PREEMPT_F_MASKABLE, true);
     if (id == 0) {
@@ -215,6 +233,11 @@ static ZymValue preempt_once(ZymVM* vm, ZymValue ctx, ZymValue slice, ZymValue c
     (void)zym_getNativeData(ctx);
     if (!zym_isNumber(slice) || !zym_isClosure(cb)) {
         zym_runtimeError(vm, "Preempt.once(slice, fn): expected (number, function).");
+        return ZYM_ERROR;
+    }
+    if (AS_CLOSURE(cb)->function->arity != 0) {
+        zym_runtimeError(vm, "Preempt.once(slice, fn): fn must take 0 arguments, got %d.",
+                         AS_CLOSURE(cb)->function->arity);
         return ZYM_ERROR;
     }
     uint32_t id = preemptRegister(vm, (int)zym_asNumber(slice), cb,

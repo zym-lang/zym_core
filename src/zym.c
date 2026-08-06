@@ -1138,21 +1138,56 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src) { (void)
 
 #endif
 
+// ---- Reported state -----------------------------------------------------
+// Every entry point that hands control back to the host funnels through these,
+// so state and cause stay accurate regardless of which one ran.
+
+static void begin_run(ZymVM* vm)
+{
+    vm->vm_state           = ZYM_STATE_RUNNING;
+    vm->vm_cause           = ZYM_CAUSE_NONE;
+    vm->cause_preempt_id   = 0;
+    vm->cause_bytes_wanted = 0;
+}
+
+// Fold an interpreter result into the reported state and the public status.
+// The suspend causes are set where they happen (handlePreemption, the memory
+// ceiling in reallocate); this only records the resulting state.
+static ZymStatus settle_result(ZymVM* vm, InterpretResult result)
+{
+    vm->execution_suspended =
+        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
+
+    switch (result) {
+        case INTERPRET_OK:
+            vm->vm_state = ZYM_STATE_IDLE;
+            vm->vm_cause = ZYM_CAUSE_NONE;
+            return ZYM_STATUS_OK;
+        case INTERPRET_YIELD:
+            vm->vm_state = ZYM_STATE_SUSPENDED;
+            return ZYM_STATUS_YIELD;
+        case INTERPRET_ABORTED:
+            vm->vm_state = ZYM_STATE_SUSPENDED;
+            return ZYM_STATUS_ABORTED;
+        case INTERPRET_COMPILE_ERROR:
+            vm->vm_state = ZYM_STATE_FAILED;
+            vm->vm_cause = ZYM_CAUSE_COMPILE_ERROR;
+            return ZYM_STATUS_COMPILE_ERROR;
+        case INTERPRET_RUNTIME_ERROR:
+        default:
+            vm->vm_state = ZYM_STATE_FAILED;
+            vm->vm_cause = ZYM_CAUSE_RUNTIME_ERROR;
+            return ZYM_STATUS_RUNTIME_ERROR;
+    }
+}
+
 ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
 {
     if (vm == NULL || chunk == NULL) return ZYM_STATUS_RUNTIME_ERROR;
 
+    begin_run(vm);
     InterpretResult result = runChunk(vm, chunk);
-    vm->execution_suspended =
-        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
-    switch (result) {
-        case INTERPRET_OK: return ZYM_STATUS_OK;
-        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
-        case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
-        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
-        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
-        default: return ZYM_STATUS_RUNTIME_ERROR;
-    }
+    return settle_result(vm, result);
 }
 
 ZymStatus zym_resume(ZymVM* vm)
@@ -1167,17 +1202,9 @@ ZymStatus zym_resume(ZymVM* vm)
         return ZYM_STATUS_RUNTIME_ERROR;
     }
 
+    begin_run(vm);
     InterpretResult result = runVM(vm);
-    vm->execution_suspended =
-        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
-    switch (result) {
-        case INTERPRET_OK: return ZYM_STATUS_OK;
-        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
-        case INTERPRET_COMPILE_ERROR: return ZYM_STATUS_COMPILE_ERROR;
-        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
-        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
-        default: return ZYM_STATUS_RUNTIME_ERROR;
-    }
+    return settle_result(vm, result);
 }
 
 ZymPreemptId zym_preemptRegister(ZymVM* vm, int slice,
@@ -1236,6 +1263,45 @@ bool   zym_oomPending(const ZymVM* vm)     { return vm ? vm->oom_pending : false
 void zym_clearOom(ZymVM* vm)
 {
     if (vm) vm->oom_pending = false;
+}
+
+// ---- State and cause reporting -------------------------------------------
+
+ZymVmState zym_vmState(const ZymVM* vm)
+{
+    return vm ? vm->vm_state : ZYM_STATE_IDLE;
+}
+
+ZymVmCause zym_vmCause(const ZymVM* vm)
+{
+    return vm ? vm->vm_cause : ZYM_CAUSE_NONE;
+}
+
+void zym_vmInfo(const ZymVM* vm, ZymVmInfo* out)
+{
+    if (out == NULL) return;
+    if (vm == NULL) {
+        ZymVmInfo empty = {0};
+        empty.state = ZYM_STATE_IDLE;
+        empty.cause = ZYM_CAUSE_NONE;
+        *out = empty;
+        return;
+    }
+
+    out->state          = vm->vm_state;
+    out->cause          = vm->vm_cause;
+    out->preempt_id     = vm->cause_preempt_id;
+    out->bytes_wanted   = vm->cause_bytes_wanted;
+    out->memory_limit   = vm->memory_limit;
+    out->memory_used    = vm->bytes_allocated;
+
+    // Whether zym_resume would actually make progress right now. The host
+    // would otherwise have to re-derive this from three separate flags, and
+    // missing one of them is the easy mistake -- a resume loop that spins
+    // because a sticky condition was never cleared.
+    out->resumable = vm->execution_suspended &&
+                     !vm->stop_requested &&
+                     !vm->oom_pending;
 }
 
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback)
@@ -2320,16 +2386,15 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     }
     vm->api_stack_top += argc;
 
+    ZymVmState prior = vm->vm_state;
     InterpretResult result = zym_call_execute(vm, argc);
-    vm->execution_suspended =
-        (result == INTERPRET_YIELD || result == INTERPRET_ABORTED);
-    switch (result) {
-        case INTERPRET_OK: return ZYM_STATUS_OK;
-        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
-        case INTERPRET_YIELD: return ZYM_STATUS_YIELD;
-        case INTERPRET_ABORTED: return ZYM_STATUS_ABORTED;
-        default: return ZYM_STATUS_RUNTIME_ERROR;
+    ZymStatus st = settle_result(vm, result);
+    // Re-entrant call from a native: the outer dispatch loop is still running,
+    // so an inner completion must not report the VM as idle.
+    if (st == ZYM_STATUS_OK && prior == ZYM_STATE_RUNNING) {
+        vm->vm_state = ZYM_STATE_RUNNING;
     }
+    return st;
 }
 
 ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
