@@ -25,8 +25,8 @@ void pushTempRoot(VM* vm, Obj* object) {
         vm->temp_roots = (Obj**)ZYM_REALLOC(&vm->allocator, vm->temp_roots,
             sizeof(Obj*) * old_capacity, sizeof(Obj*) * vm->temp_root_capacity);
         if (vm->temp_roots == NULL) {
-            fprintf(stderr, "Fatal: Out of memory for temp roots\n");
-            exit(1);
+            vm->temp_root_capacity = old_capacity;   // keep the struct coherent
+            zymOutOfMemory(vm);
         }
     }
 
@@ -103,8 +103,8 @@ void markObject(VM* vm, Obj* object) {
         #endif
 
         if (vm->gray_stack == NULL) {
-            fprintf(stderr, "Fatal: Out of memory during GC marking\n");
-            exit(1);
+            vm->gray_capacity = old_capacity;
+            zymOutOfMemory(vm);
         }
     }
 

@@ -67,6 +67,11 @@ typedef enum {
     ZYM_CAUSE_PREEMPT_BLOCKED,
     ZYM_CAUSE_HOST_STOP,        // zym_requestStop
     ZYM_CAUSE_MEMORY_LIMIT,     // ceiling crossed
+    // The allocator itself failed and a collection did not free enough. Unlike
+    // MEMORY_LIMIT this is not resumable: the VM is unwound from wherever it
+    // was, so its frames are not in a state execution could continue from. The
+    // VM must be discarded.
+    ZYM_CAUSE_OUT_OF_MEMORY,
     ZYM_CAUSE_RUNTIME_ERROR,
     ZYM_CAUSE_COMPILE_ERROR,
 } ZymVmCause;

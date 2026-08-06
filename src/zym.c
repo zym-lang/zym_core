@@ -294,6 +294,31 @@ void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
     ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
 }
 
+// Arm a recovery boundary for unrecoverable allocation failure, saving whatever
+// was armed before. Nesting matters: a native that re-enters the VM installs its
+// own, so a failure unwinds only as far as that native's call and it returns a
+// status normally, instead of the jump skipping over its C++ frame.
+#define ZYM_OOM_GUARD_BEGIN(vm, on_oom)                                        \
+    jmp_buf _zym_saved_jmp;                                                    \
+    bool _zym_saved_armed = (vm)->oom_jmp_armed;                               \
+    if (_zym_saved_armed) memcpy(&_zym_saved_jmp, &(vm)->oom_jmp, sizeof(jmp_buf)); \
+    if (setjmp((vm)->oom_jmp) != 0) {                                          \
+        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
+        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
+        (vm)->vm_state = ZYM_STATE_FAILED;                                     \
+        (vm)->vm_cause = ZYM_CAUSE_OUT_OF_MEMORY;                              \
+        (vm)->execution_suspended = false;   /* frames are not continuable */   \
+        on_oom;                                                                \
+        return ZYM_STATUS_RUNTIME_ERROR;                                       \
+    }                                                                          \
+    (vm)->oom_jmp_armed = true;
+
+#define ZYM_OOM_GUARD_END(vm)                                                  \
+    do {                                                                       \
+        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
+        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
+    } while (0)
+
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
                       const ZymSourceMap* source_map,
                       const char* entry_file, ZymCompilerConfig config,
@@ -301,7 +326,13 @@ ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
 {
     if (out_tree) *out_tree = NULL;
     if (source == NULL || chunk == NULL) return ZYM_STATUS_COMPILE_ERROR;
+
+    // A compile allocates heavily and has no instruction boundary to fall back
+    // to, so an allocation failure here unwinds to this boundary and is
+    // reported as a compile error rather than killing the process.
+    ZYM_OOM_GUARD_BEGIN(vm, { vm->compiler = NULL; return ZYM_STATUS_COMPILE_ERROR; });
     bool success = compile(vm, source, chunk, source_map, entry_file, config, out_tree);
+    ZYM_OOM_GUARD_END(vm);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
@@ -1142,6 +1173,7 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src) { (void)
 // Every entry point that hands control back to the host funnels through these,
 // so state and cause stay accurate regardless of which one ran.
 
+
 static void begin_run(ZymVM* vm)
 {
     vm->has_executed       = true;   // locks the preemption reserve
@@ -1214,8 +1246,10 @@ ZymStatus zym_runChunk(ZymVM* vm, ZymChunk* chunk)
 {
     if (vm == NULL || chunk == NULL) return ZYM_STATUS_RUNTIME_ERROR;
 
+    ZYM_OOM_GUARD_BEGIN(vm, {});
     begin_run(vm);
     InterpretResult result = runChunk(vm, chunk);
+    ZYM_OOM_GUARD_END(vm);
     return settle_result(vm, result);
 }
 
@@ -1231,8 +1265,10 @@ ZymStatus zym_resume(ZymVM* vm)
         return ZYM_STATUS_RUNTIME_ERROR;
     }
 
+    ZYM_OOM_GUARD_BEGIN(vm, {});
     begin_run(vm);
     InterpretResult result = runVM(vm);
+    ZYM_OOM_GUARD_END(vm);
     return settle_result(vm, result);
 }
 
@@ -2459,8 +2495,10 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     }
     vm->api_stack_top += argc;
 
+    ZYM_OOM_GUARD_BEGIN(vm, {});
     ZymVmState prior = vm->vm_state;
     InterpretResult result = zym_call_execute(vm, argc);
+    ZYM_OOM_GUARD_END(vm);
     ZymStatus st = settle_result(vm, result);
     // Re-entrant call from a native: the outer dispatch loop is still running,
     // so an inner completion must not report the VM as idle.

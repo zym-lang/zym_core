@@ -32,10 +32,6 @@ void appendSourceMapSegment(VM* vm, SourceMap* map,
             vm, map->segments,
             sizeof(SourceMapSegment) * old_capacity,
             sizeof(SourceMapSegment) * map->capacity);
-        if (map->segments == NULL) {
-            fprintf(stderr, "Failed to allocate memory for source map.\n");
-            exit(1);
-        }
     }
 
     // Note: segments are appended one-per-expanded-line and never coalesced.

@@ -7,6 +7,20 @@
 typedef struct VM VM;
 
 // Raw allocator convenience macros (take ZymAllocator*)
+// reallocate NEVER returns NULL for a non-zero size. On failure it collects,
+// retries, and then calls zymOutOfMemory, which unwinds to the nearest armed
+// API boundary or, with none armed, terminates. Callers must not NULL-check it:
+// such a check is dead code and implies a contract that does not exist.
+//
+// Unrecoverable allocation failure. When a public entry point has armed a
+// recovery boundary this does not return: it unwinds there and the call reports
+// ZYM_STATUS_RUNTIME_ERROR with cause ZYM_CAUSE_OUT_OF_MEMORY. With nothing
+// armed -- an allocation outside any VM operation, such as during zym_newVM --
+// there is nowhere to go and the process still dies, which is the honest
+// outcome for a host that cannot even construct a VM.
+struct VM;
+void zymOutOfMemory(struct VM* vm);
+
 #define ZYM_ALLOC(a, size)              (a)->alloc((a)->ctx, (size))
 #define ZYM_CALLOC(a, count, size)      (a)->calloc((a)->ctx, (count), (size))
 #define ZYM_REALLOC(a, ptr, old, new_)  (a)->realloc((a)->ctx, (ptr), (old), (new_))

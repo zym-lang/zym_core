@@ -27,9 +27,6 @@ void writeInstruction(VM* vm, Chunk* chunk, uint32_t instruction, int line) {
         chunk->capacity = GROW_CAPACITY(oldCapacity);
         chunk->code = GROW_ARRAY(vm, uint32_t, chunk->code, oldCapacity, chunk->capacity);
         chunk->lines = GROW_ARRAY(vm, int, chunk->lines, oldCapacity, chunk->capacity);
-        if (chunk->code == NULL || chunk->lines == NULL) {
-            exit(1);
-        }
     }
     chunk->code[chunk->count] = instruction;
     chunk->lines[chunk->count] = line;
@@ -42,9 +39,6 @@ void write64BitLiteral(VM* vm, Chunk* chunk, double value, int line) {
         chunk->capacity = GROW_CAPACITY(oldCapacity);
         chunk->code = GROW_ARRAY(vm, uint32_t, chunk->code, oldCapacity, chunk->capacity);
         chunk->lines = GROW_ARRAY(vm, int, chunk->lines, oldCapacity, chunk->capacity);
-        if (chunk->code == NULL || chunk->lines == NULL) {
-            exit(1);
-        }
     }
 
     uint64_t bits;

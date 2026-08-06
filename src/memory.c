@@ -46,6 +46,19 @@ ZymAllocator zym_defaultAllocator(void) {
 // REALLOCATE (GC-aware, uses VM's allocator)
 // =============================================================================
 
+void zymOutOfMemory(VM* vm)
+{
+    if (vm != NULL && vm->oom_jmp_armed) {
+        // Record the reason before leaving; the landing pad only knows that it
+        // was jumped to, not why.
+        vm->vm_cause = ZYM_CAUSE_OUT_OF_MEMORY;
+        vm->oom_jmp_armed = false;   // one shot: a failure while unwinding is fatal
+        longjmp(vm->oom_jmp, 1);
+    }
+    fprintf(stderr, "Fatal: Out of memory\n");
+    exit(1);
+}
+
 void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
     vm->bytes_allocated += newSize - oldSize;
 
@@ -88,6 +101,15 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
                 vm->oom_pending = true;
                 vm->cause_bytes_wanted = newSize - oldSize;   // what crossed it
                 vm->preempt_counter = 0;   // observed by DISPATCH -> handlePreemption
+
+                // A compile has no instruction boundary to suspend at, so the
+                // dispatch-loop route above never runs and the ceiling would be
+                // ignored for the whole compilation. The frontend already polls
+                // a cancellation flag at every statement and declaration
+                // boundary; reuse it so the compile stops there instead.
+                if (vm->compiler != NULL) {
+                    vm->compile_cancelled = 1;
+                }
             }
         }
     }
@@ -104,8 +126,7 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
             result = ZYM_REALLOC(&vm->allocator, pointer, oldSize, newSize);
         }
         if (result == NULL) {
-            fprintf(stderr, "Fatal: Out of memory\n");
-            exit(1);
+            zymOutOfMemory(vm);   // does not return when a boundary is armed
         }
     }
     return result;

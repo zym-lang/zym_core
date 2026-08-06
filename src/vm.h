@@ -10,6 +10,7 @@
 #include "./source_file.h"
 #include "./diagnostics.h"
 #include <signal.h> /* sig_atomic_t for compile cancellation flag */
+#include <setjmp.h> /* non-local exit on unrecoverable allocation failure */
 
 /*
  * VM Configuration Limits
@@ -207,6 +208,16 @@ typedef struct VM {
     // latches the reason for the last transition out of RUNNING and
     // survives until the next run starts, so it stays readable after the
     // fact. The detail fields are only meaningful for their own cause.
+    // Where to land when the allocator fails and a collection cannot free
+    // enough. reallocate must return usable memory to callers that assume it
+    // succeeds, so the only honest alternative to killing the process is to
+    // leave the operation entirely. Armed by each public entry point and
+    // restored on the way out, so a failure unwinds to the NEAREST boundary --
+    // a native that re-entered the VM gets a status back and returns normally,
+    // rather than having its own frame jumped over.
+    jmp_buf oom_jmp;
+    bool    oom_jmp_armed;
+
     ZymVmState vm_state;
     ZymVmCause vm_cause;
     ZymPreemptId cause_preempt_id;   // entry that fired, for the preempt causes

@@ -26,11 +26,6 @@ void writeValueArray(VM* vm, ValueArray* array, Value value) {
         int oldCapacity = array->capacity;
         array->capacity = GROW_CAPACITY(oldCapacity);
         array->values = GROW_ARRAY(vm, Value, array->values, oldCapacity, array->capacity);
-        if (array->values == NULL) {
-            if (IS_OBJ(value)) popTempRoot(vm);
-            printf("Out of memory!\n");
-            exit(1);
-        }
     }
 
     array->values[array->count] = value;
