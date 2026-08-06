@@ -237,6 +237,35 @@ void zym_clearStop(ZymVM* vm);
 bool zym_stopRequested(const ZymVM* vm);
 bool zym_isAborting(const ZymVM* vm);
 
+// -----------------------------------------------------------------------------
+// MEMORY CEILING
+// -----------------------------------------------------------------------------
+// A per-VM byte budget. 0 (the default) means unlimited.
+//
+// Crossing the ceiling does NOT fail the allocation. The request is satisfied
+// -- the host allocator still has memory -- and the VM is then suspended at the
+// next instruction boundary with ZYM_STATUS_ABORTED, exactly like a watchdog.
+// Failing the allocation instead would strand every caller in the VM that
+// assumes allocation succeeds, and would leave the host nothing to recover
+// from. The overshoot is therefore bounded by one allocation rather than zero.
+//
+// The condition is sticky, like the hard stop: resuming without clearing it
+// suspends again immediately. The host's options are to raise the limit (which
+// clears it automatically once usage is back under budget), free what it can
+// and call zym_clearOom(), or discard the VM.
+//
+// A collection is attempted before the ceiling is declared crossed, so a
+// program that merely produces garbage is never charged for it.
+//
+// This bounds script-driven allocation only. It does NOT make a genuine
+// allocator failure recoverable -- that still terminates the process, as do
+// the collector's own internal allocations.
+void   zym_setMemoryLimit(ZymVM* vm, size_t bytes);
+size_t zym_getMemoryLimit(const ZymVM* vm);
+size_t zym_memoryUsed(const ZymVM* vm);
+bool   zym_oomPending(const ZymVM* vm);
+void   zym_clearOom(ZymVM* vm);
+
 ZymStatus zym_serializeChunk(ZymVM* vm, ZymCompilerConfig config, ZymChunk* chunk, char** out_buffer, size_t* out_size);
 ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, size_t size);
 

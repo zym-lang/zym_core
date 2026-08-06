@@ -1212,6 +1212,32 @@ void zym_clearStop(ZymVM* vm)   { if (vm) preemptClearStop(vm); }
 bool zym_stopRequested(const ZymVM* vm) { return vm ? preemptStopRequested(vm) : false; }
 bool zym_isAborting(const ZymVM* vm)    { return vm ? preemptStopRequested(vm) : false; }
 
+// ---- Memory ceiling ------------------------------------------------------
+// Crossing the limit suspends the VM (ZYM_STATUS_ABORTED) rather than failing
+// the allocation, so the host chooses what happens next. Sticky like the hard
+// stop: clear it, or raise the limit, before resuming.
+
+void zym_setMemoryLimit(ZymVM* vm, size_t bytes)
+{
+    if (vm == NULL) return;
+    vm->memory_limit = bytes;
+    // Raising the limit above current usage retires a pending condition on its
+    // own; without this the host would have to call clearOom as well, and
+    // forgetting would look like the new limit was ignored.
+    if (vm->oom_pending && (bytes == 0 || vm->bytes_allocated <= bytes)) {
+        vm->oom_pending = false;
+    }
+}
+
+size_t zym_getMemoryLimit(const ZymVM* vm) { return vm ? vm->memory_limit : 0; }
+size_t zym_memoryUsed(const ZymVM* vm)     { return vm ? vm->bytes_allocated : 0; }
+bool   zym_oomPending(const ZymVM* vm)     { return vm ? vm->oom_pending : false; }
+
+void zym_clearOom(ZymVM* vm)
+{
+    if (vm) vm->oom_pending = false;
+}
+
 void zym_setPreemptCallback(ZymVM* vm, ZymValue callback)
 {
     if (vm == NULL) return;

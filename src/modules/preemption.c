@@ -41,7 +41,7 @@ void preemptArm(VM* vm) {
     // A pending hard stop outranks every deadline. Without this, clearing the
     // last table entry re-arms the counter to INT32_MAX and the stop is never
     // observed again -- the VM would run free with a stop still set.
-    if (vm->stop_requested) {
+    if (vm->stop_requested || vm->oom_pending) {
         vm->preempt_counter = 0;
         vm->preempt_armed   = 0;
         return;

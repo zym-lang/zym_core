@@ -50,6 +50,8 @@ void initVM(VM* vm) {
 
     vm->objects = NULL;
     vm->bytes_allocated = 0;
+    vm->memory_limit = 0;   // unlimited until the host sets one
+    vm->oom_pending = false;
     vm->next_gc = 1024 * 1024;
     vm->gc_debt = INT32_MAX;  // GC starts disabled during init
     vm->gray_count = 0;
@@ -620,6 +622,15 @@ static InterpretResult handlePreemption(VM* vm) {
         return INTERPRET_ABORTED;
     }
 
+    // 1b. MEMORY CEILING -- also unmaskable, and also never cleared here.
+    //     The allocation that crossed the limit already succeeded, so the VM
+    //     is in a consistent state; we are just declining to run any further
+    //     until the host decides what to do. Ranked below the hard stop
+    //     because a stop is the host demanding termination outright.
+    if (vm->oom_pending) {
+        return INTERPRET_ABORTED;
+    }
+
     // 2. How much time actually passed. NOT the nominal slice: a trigger()
     //    or a stop request can drive the counter to 0 early.
     int32_t elapsed = vm->preempt_armed - vm->preempt_counter;
@@ -689,6 +700,18 @@ static InterpretResult handlePreemption(VM* vm) {
     }
 
     if (pushPreemptFrame(vm, target)) {
+        // Retire a one-shot target now that its callback is on the stack (and
+        // rooted there, so clearing the entry cannot collect it). The loop
+        // above deliberately skips the target, because retiring it before the
+        // push would blank the very callback we are about to run. Leaving it
+        // live is not an option either: it fired, so its `remaining` is <= 0,
+        // and preemptArm clamps that to 1 -- the callback would re-fire on the
+        // next instruction, forever.
+        if (target->flags & ZYM_PREEMPT_F_ONESHOT) {
+            target->slice    = 0;
+            target->callback = NULL_VAL;
+            vm->preempt_live_count--;
+        }
         preemptArm(vm);
         return INTERPRET_OK;   // callback frame pushed; execution continues
     }
@@ -2980,6 +3003,9 @@ static InterpretResult run(VM* vm) {
             if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
                 if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
             }
+            if ((frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) != 0) {
+                preemptArm(vm);   // see the matching note on the normal RET path
+            }
             STORE_STATE();
             return INTERPRET_OK;
         }
@@ -3002,6 +3028,16 @@ static InterpretResult run(VM* vm) {
         }
         if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
             if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
+        }
+        if (__builtin_expect(
+                (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) != 0, 0)) {
+            // Re-arm now that something is unmasked again. preemptArm skips
+            // masked entries, so while the callback ran (or the shield was up)
+            // the counter was armed from whatever remained -- INT32_MAX when
+            // nothing else was live. Without this the counter keeps that value
+            // forever: a rearming entry fires exactly once, and a shield
+            // permanently retires every maskable entry it suppressed.
+            preemptArm(vm);
         }
 
         // Single check for any active boundary (withPrompt or resume)

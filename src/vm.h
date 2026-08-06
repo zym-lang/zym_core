@@ -142,6 +142,17 @@ typedef struct VM {
 
     // Garbage Collector
     size_t bytes_allocated;
+    // Byte ceiling for this VM; 0 means unlimited. Checked in reallocate on
+    // the growth path. Crossing it does NOT fail the allocation -- real memory
+    // is still there, so the request is satisfied and the VM is suspended at
+    // the next instruction boundary instead. That is what makes it
+    // recoverable: the host can raise the limit, drop references, or tear the
+    // VM down, where a failed allocation would leave nothing to decide.
+    size_t memory_limit;
+    // Sticky, like stop_requested: set when the ceiling is crossed, cleared
+    // only by the host. Without stickiness a resume would run straight back
+    // over the limit and the host would never regain control.
+    bool oom_pending;
     size_t next_gc;
     int32_t gc_debt;  // Allocation debt counter: triggers GC when <= 0; INT32_MAX when GC disabled
     Obj** gray_stack;
