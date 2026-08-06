@@ -272,28 +272,6 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src)
     return dst;
 }
 
-ZymStatus zym_preprocess(ZymVM* vm, const char* source,
-                         ZymSourceMap* source_map, ZymFileId origin_file_id,
-                         const char** processedSource)
-{
-    if (source == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
-
-    char* processed = preprocess(vm, source, source_map, origin_file_id);
-    if (processed == NULL) {
-        *processedSource = NULL;
-        return ZYM_STATUS_COMPILE_ERROR;
-    }
-
-    *processedSource = processed;
-    return ZYM_STATUS_OK;
-}
-
-void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
-{
-    if (processedSource == NULL) return;
-    ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
-}
-
 // Arm a recovery boundary for unrecoverable allocation failure, saving whatever
 // was armed before. Nesting matters: a native that re-enters the VM installs its
 // own, so a failure unwinds only as far as that native's call and it returns a
@@ -318,6 +296,33 @@ void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
         if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
         (vm)->oom_jmp_armed = _zym_saved_armed;                                \
     } while (0)
+
+ZymStatus zym_preprocess(ZymVM* vm, const char* source,
+                         ZymSourceMap* source_map, ZymFileId origin_file_id,
+                         const char** processedSource)
+{
+    if (source == NULL || processedSource == NULL) return ZYM_STATUS_COMPILE_ERROR;
+
+    // Hosts call this immediately before zym_compile, which is guarded; leaving
+    // it unguarded made the pair inconsistent for no reason.
+    ZYM_OOM_GUARD_BEGIN(vm, { *processedSource = NULL; return ZYM_STATUS_COMPILE_ERROR; });
+    char* processed = preprocess(vm, source, source_map, origin_file_id);
+    ZYM_OOM_GUARD_END(vm);
+    if (processed == NULL) {
+        *processedSource = NULL;
+        return ZYM_STATUS_COMPILE_ERROR;
+    }
+
+    *processedSource = processed;
+    return ZYM_STATUS_OK;
+}
+
+void zym_freeProcessedSource(ZymVM* vm, const char* processedSource)
+{
+    if (processedSource == NULL) return;
+    ZYM_FREE_STR(&vm->allocator, (char*)processedSource);
+}
+
 
 ZymStatus zym_compile(ZymVM* vm, const char* source, ZymChunk* chunk,
                       const ZymSourceMap* source_map,
@@ -345,7 +350,19 @@ ZymStatus zym_parseOnly(ZymVM* vm, const char* source,
     if (out_tree == NULL) return ZYM_STATUS_COMPILE_ERROR;
     *out_tree = NULL;
     if (vm == NULL || source == NULL) return ZYM_STATUS_COMPILE_ERROR;
+
+    // The tooling entries retain what zym_compile discards -- the parse tree
+    // outlives the call -- so they are the peak-memory paths in the library,
+    // running in a long-lived server on whatever file a user opens. Clearing
+    // vm->compiler matters as much as the status: markRoots walks that chain,
+    // and after a jump it points into a dead stack frame.
+    ZYM_OOM_GUARD_BEGIN(vm, {
+        vm->compiler = NULL;
+        *out_tree = NULL;     // never hand back a half-built tree
+        return ZYM_STATUS_COMPILE_ERROR;
+    });
     bool success = parseOnly(vm, source, source_map, entry_file, out_tree);
+    ZYM_OOM_GUARD_END(vm);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
@@ -665,7 +682,17 @@ ZymStatus zym_check(ZymVM* vm, const char* source,
     *out_tree = NULL;
     *out_table = NULL;
     if (vm == NULL || source == NULL) return ZYM_STATUS_COMPILE_ERROR;
+
+    // See zym_parseOnly: same reasoning, and this one also builds the symbol
+    // table, making it the largest single allocation the library performs.
+    ZYM_OOM_GUARD_BEGIN(vm, {
+        vm->compiler = NULL;
+        *out_tree  = NULL;
+        *out_table = NULL;
+        return ZYM_STATUS_COMPILE_ERROR;
+    });
     bool success = checkCompile(vm, source, source_map, entry_file, out_tree, out_table);
+    ZYM_OOM_GUARD_END(vm);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
@@ -1461,7 +1488,12 @@ ZymStatus zym_deserializeChunk(ZymVM* vm, ZymChunk* chunk, const char* buffer, s
 
     vm->chunk = chunk;
 
+    // Reads untrusted bytes and allocates as it goes. The loader already
+    // rejects malformed sizes; this covers the allocator simply failing on a
+    // well-formed one, which would otherwise take the process down.
+    ZYM_OOM_GUARD_BEGIN(vm, { return ZYM_STATUS_COMPILE_ERROR; });
     bool success = deserializeChunk(vm, chunk, (const uint8_t*)buffer, size);
+    ZYM_OOM_GUARD_END(vm);
     return success ? ZYM_STATUS_OK : ZYM_STATUS_COMPILE_ERROR;
 }
 
@@ -2590,7 +2622,21 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
         vm->stack_top = frame_base + 1 + argc;
     }
 
+    // An allocation failure inside the callee must not skip the caller-stack
+    // cleanup below: on the re-entrant path the CALLER keeps running, and
+    // leaving stack_top above saved_stack_top makes markRoots rescan slots the
+    // next collection has already freed. The landing pad repeats it.
+    ZYM_OOM_GUARD_BEGIN(vm, {
+        if (saved_stack_top < vm->stack_top) {
+            for (int i = saved_stack_top; i < vm->stack_top; i++) {
+                if (i == vm->api_stack_top) continue;
+                vm->stack[i] = NULL_VAL;
+            }
+            vm->stack_top = saved_stack_top;
+        }
+    });
     InterpretResult result = zym_call_execute(vm, argc);
+    ZYM_OOM_GUARD_END(vm);
     // zym_call_execute leaves the result at stack[frame_base] and sets
     // api_stack_top=frame_base so zym_getCallResult can read it.
 
