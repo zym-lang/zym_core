@@ -212,6 +212,16 @@ typedef struct VM {
     ZymPreemptId cause_preempt_id;   // entry that fired, for the preempt causes
     size_t cause_bytes_wanted;       // request that crossed the ceiling
     PreemptEntry preempt_table[ZYM_PREEMPT_MAX_ENTRIES];
+    // Slots the host keeps for itself. Script's ceiling is
+    // ZYM_PREEMPT_MAX_ENTRIES - host_preempt_reserve; the host itself may still
+    // use any free slot. Settable only before the VM has ever executed, so a
+    // script's budget cannot shrink under it mid-run: whatever capacity it sees
+    // at the start is still bindable at the end.
+    int host_preempt_reserve;
+    // Latched on the first run/resume/call. Gates the reserve, which must be a
+    // bring-up decision -- a host that discovers mid-run that it needs slots has
+    // already lost the argument.
+    bool has_executed;
     uint32_t preempt_next_id;
     int preempt_live_count;
     int preempt_shield_depth;       // script critical sections; masks

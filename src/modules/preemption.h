@@ -8,11 +8,16 @@
 // Registration returns an opaque id (0 on failure). `callback` may be
 // NULL_VAL, which means "abort execution on expiry" -- the watchdog shape,
 // with nothing for script to intercept.
+int  preemptCount(const VM* vm, bool script_owned_only);
+int  preemptScriptCapacity(const VM* vm);
+int  preemptScriptAvailable(const VM* vm);
+int  preemptIds(const VM* vm, uint32_t* out, int max, bool script_owned_only);
+
 uint32_t preemptRegister(VM* vm, int slice, Value callback,
                          uint8_t flags, bool owner_script);
 bool     preemptUnregister(VM* vm, uint32_t id, bool owner_script);
 bool     preemptSetSlice(VM* vm, uint32_t id, int slice, bool owner_script);
-int      preemptEntryRemaining(VM* vm, uint32_t id);
+int      preemptEntryRemaining(VM* vm, uint32_t id, bool owner_script);
 bool     preemptTrigger(VM* vm, uint32_t id, bool owner_script);
 
 // Recompute the countdown from the table. Call after any mutation.

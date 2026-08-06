@@ -1144,6 +1144,7 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src) { (void)
 
 static void begin_run(ZymVM* vm)
 {
+    vm->has_executed       = true;   // locks the preemption reserve
     vm->vm_state           = ZYM_STATE_RUNNING;
     vm->vm_cause           = ZYM_CAUSE_NONE;
     vm->cause_preempt_id   = 0;
@@ -1225,7 +1226,7 @@ bool zym_preemptSetSlice(ZymVM* vm, ZymPreemptId id, int slice) {
 }
 
 int zym_preemptRemaining(ZymVM* vm, ZymPreemptId id) {
-    return vm ? preemptEntryRemaining(vm, id) : -1;
+    return vm ? preemptEntryRemaining(vm, id, /*owner_script=*/false) : -1;
 }
 
 bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id) {
@@ -1233,6 +1234,50 @@ bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id) {
 }
 
 int zym_preemptCapacity(void) { return ZYM_PREEMPT_MAX_ENTRIES; }
+
+// ---- Host reserve --------------------------------------------------------
+// Slots held back from script so the host can still arm a watchdog or a
+// deadline after script has been running. Expressed as a reserve rather than a
+// script quota so it stays correct when ZYM_PREEMPT_MAX_ENTRIES changes with
+// the build target.
+
+bool zym_setHostPreemptReserve(ZymVM* vm, int slots)
+{
+    if (vm == NULL) return false;
+    // Bring-up only. Allowing this mid-run would let script's budget shrink
+    // underneath it for reasons it cannot see, so a capacity read at the start
+    // of a run would stop meaning anything. A host that needs slots knows so
+    // before it runs anything.
+    if (vm->has_executed) return false;
+    if (slots < 0 || slots > ZYM_PREEMPT_MAX_ENTRIES) return false;
+    vm->host_preempt_reserve = slots;
+    return true;
+}
+
+int zym_getHostPreemptReserve(const ZymVM* vm)
+{
+    return vm ? vm->host_preempt_reserve : 0;
+}
+
+int zym_preemptCount(const ZymVM* vm, bool script_owned_only)
+{
+    return vm ? preemptCount(vm, script_owned_only) : 0;
+}
+
+int zym_preemptScriptCapacity(const ZymVM* vm)
+{
+    return vm ? preemptScriptCapacity(vm) : 0;
+}
+
+int zym_preemptScriptAvailable(const ZymVM* vm)
+{
+    return vm ? preemptScriptAvailable(vm) : 0;
+}
+
+int zym_preemptIds(const ZymVM* vm, ZymPreemptId* out, int max)
+{
+    return vm ? preemptIds(vm, out, max, /*script_owned_only=*/false) : 0;
+}
 
 void zym_requestStop(ZymVM* vm) { if (vm) preemptRequestStop(vm); }
 void zym_clearStop(ZymVM* vm)   { if (vm) preemptClearStop(vm); }

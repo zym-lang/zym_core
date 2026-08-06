@@ -57,6 +57,48 @@ void preemptArm(VM* vm) {
     vm->preempt_armed   = best;
 }
 
+int preemptCount(const VM* vm, bool script_owned_only) {
+    int n = 0;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        const PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice == 0) continue;
+        if (script_owned_only && !e->owner_script) continue;
+        n++;
+    }
+    return n;
+}
+
+// How many entries script may hold in total. Fixed for the life of the run:
+// the reserve is locked once the VM executes, so whatever script sees at the
+// start is still bindable at the end.
+int preemptScriptCapacity(const VM* vm) {
+    int cap = ZYM_PREEMPT_MAX_ENTRIES - vm->host_preempt_reserve;
+    return cap < 0 ? 0 : cap;
+}
+
+// Free slots script could actually take right now. Bounded by BOTH its own
+// remaining budget and the real free slots -- the host may be using more than
+// its reserve, and promising script room that does not exist would turn the
+// next register into a surprise.
+int preemptScriptAvailable(const VM* vm) {
+    int budget = preemptScriptCapacity(vm) - preemptCount(vm, true);
+    int free_slots = ZYM_PREEMPT_MAX_ENTRIES - preemptCount(vm, false);
+    int n = budget < free_slots ? budget : free_slots;
+    return n < 0 ? 0 : n;
+}
+
+int preemptIds(const VM* vm, uint32_t* out, int max, bool script_owned_only) {
+    int n = 0;
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        const PreemptEntry* e = &vm->preempt_table[i];
+        if (e->slice == 0) continue;
+        if (script_owned_only && !e->owner_script) continue;
+        if (out != NULL && n < max) out[n] = e->id;
+        n++;
+    }
+    return n;
+}
+
 uint32_t preemptRegister(VM* vm, int slice, Value callback,
                          uint8_t flags, bool owner_script) {
     if (slice < 1) slice = 1;
@@ -68,6 +110,12 @@ uint32_t preemptRegister(VM* vm, int slice, Value callback,
     // an id for an entry that cannot do its job. A NULL callback is the watchdog
     // shape and is deliberately allowed.
     if (IS_CLOSURE(callback) && AS_CLOSURE(callback)->function->arity != 0) {
+        return 0;
+    }
+
+    // Script may not spend the host's reserve. The host itself is unrestricted:
+    // the reserve is a floor for the host, a ceiling for script.
+    if (owner_script && preemptCount(vm, true) >= preemptScriptCapacity(vm)) {
         return 0;
     }
 
@@ -120,9 +168,14 @@ bool preemptSetSlice(VM* vm, uint32_t id, int slice, bool owner_script) {
     return true;
 }
 
-int preemptEntryRemaining(VM* vm, uint32_t id) {
+int preemptEntryRemaining(VM* vm, uint32_t id, bool owner_script) {
     PreemptEntry* e = find_entry(vm, id);
-    return e ? e->remaining : -1;
+    // Ownership-gated like the mutators. Ids are handed out sequentially, so an
+    // ungated read would let script probe 1, 2, 3... and map every host entry --
+    // which would make gating Preempt.ids() pointless. A host that wants script
+    // to see one of its deadlines can expose it through its own native.
+    if (!e || !may_touch(e, owner_script)) return -1;
+    return e->remaining;
 }
 
 bool preemptTrigger(VM* vm, uint32_t id, bool owner_script) {
@@ -266,7 +319,7 @@ static ZymValue preempt_setSlice(ZymVM* vm, ZymValue ctx, ZymValue idv, ZymValue
 static ZymValue preempt_remaining(ZymVM* vm, ZymValue ctx, ZymValue idv) {
     (void)zym_getNativeData(ctx);
     if (!zym_isNumber(idv)) return zym_newNumber(-1);
-    return zym_newNumber((double)preemptEntryRemaining(vm, (uint32_t)zym_asNumber(idv)));
+    return zym_newNumber((double)preemptEntryRemaining(vm, (uint32_t)zym_asNumber(idv), true));
 }
 
 static ZymValue preempt_request(ZymVM* vm, ZymValue ctx, ZymValue idv) {
@@ -339,6 +392,33 @@ static ZymValue preempt_shield(ZymVM* vm, ZymValue ctx, ZymValue fn) {
     return ZYM_CONTROL_TRANSFER;
 }
 
+// Script sees its own budget, not the machine's: `capacity` is what the host
+// left it, and `ids` lists only entries it owns. Enumerating host entries would
+// hand script a map of its own supervision that it could not act on anyway.
+static ZymValue preempt_capacity(ZymVM* vm, ZymValue ctx) {
+    (void)zym_getNativeData(ctx);
+    return zym_newNumber((double)preemptScriptCapacity(vm));
+}
+
+static ZymValue preempt_available(ZymVM* vm, ZymValue ctx) {
+    (void)zym_getNativeData(ctx);
+    return zym_newNumber((double)preemptScriptAvailable(vm));
+}
+
+static ZymValue preempt_ids(ZymVM* vm, ZymValue ctx) {
+    (void)zym_getNativeData(ctx);
+    uint32_t ids[ZYM_PREEMPT_MAX_ENTRIES];
+    int n = preemptIds(vm, ids, ZYM_PREEMPT_MAX_ENTRIES, /*script_owned_only=*/true);
+
+    ZymValue list = zym_newList(vm);
+    zym_pushRoot(vm, list);
+    for (int i = 0; i < n; i++) {
+        zym_listAppend(vm, list, zym_newNumber((double)ids[i]));
+    }
+    zym_popRoot(vm);
+    return list;
+}
+
 static ZymValue preempt_shieldDepth(ZymVM* vm, ZymValue ctx) {
     (void)zym_getNativeData(ctx);
     return zym_newNumber((double)vm->preempt_shield_depth);
@@ -368,6 +448,9 @@ ZymValue nativePreempt_create(ZymVM* vm) {
     ZymValue request     = MK("request(id)", preempt_request);           zym_pushRoot(vm, request);
     ZymValue shield      = MK("shield(fn)", preempt_shield);             zym_pushRoot(vm, shield);
     ZymValue shieldDepth = MK("shieldDepth()", preempt_shieldDepth);     zym_pushRoot(vm, shieldDepth);
+    ZymValue capacity    = MK("capacity()", preempt_capacity);           zym_pushRoot(vm, capacity);
+    ZymValue available   = MK("available()", preempt_available);         zym_pushRoot(vm, available);
+    ZymValue ids         = MK("ids()", preempt_ids);                     zym_pushRoot(vm, ids);
 #undef MK
 
     ZymValue obj = zym_newMap(vm);
@@ -381,8 +464,11 @@ ZymValue nativePreempt_create(ZymVM* vm) {
     zym_mapSet(vm, obj, "request", request);
     zym_mapSet(vm, obj, "shield", shield);
     zym_mapSet(vm, obj, "shieldDepth", shieldDepth);
+    zym_mapSet(vm, obj, "capacity", capacity);
+    zym_mapSet(vm, obj, "available", available);
+    zym_mapSet(vm, obj, "ids", ids);
 
-    for (int i = 0; i < 10; i++) zym_popRoot(vm);
+    for (int i = 0; i < 13; i++) zym_popRoot(vm);   // context + 11 methods + obj
     return obj;
 }
 

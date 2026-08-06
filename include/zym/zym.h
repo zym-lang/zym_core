@@ -215,7 +215,35 @@ bool zym_preemptUnregister(ZymVM* vm, ZymPreemptId id);
 bool zym_preemptSetSlice(ZymVM* vm, ZymPreemptId id, int slice);
 int  zym_preemptRemaining(ZymVM* vm, ZymPreemptId id);   // -1 if unknown
 bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id);     // fire at next dispatch
-int  zym_preemptCapacity(void);
+int  zym_preemptCapacity(void);                          // build-time table size
+
+// ---- Reserving slots from script ----------------------------------------
+// The table is shared, so a script that registers greedily can leave the host
+// unable to arm a watchdog or a deadline later. A reserve holds slots back:
+// script's ceiling becomes capacity - reserve, while the host stays free to use
+// any slot. Expressed as a reserve rather than a script quota so it remains
+// correct when ZYM_PREEMPT_MAX_ENTRIES changes with the build target.
+//
+// Settable ONLY before the VM has executed anything; returns false afterwards,
+// and false for a value outside [0, capacity]. That restriction is the point:
+// script must be able to treat its capacity as fixed for the whole run, so that
+// a budget read at the start is still bindable at the end. It also means the
+// reserve can never fail to be satisfied -- at bring-up script holds nothing.
+//
+// A host that discovers mid-run that it needs slots has already lost; decide at
+// bring-up. The reserve lets it bind late without holding a slot speculatively,
+// which otherwise costs an entry that joins every rearm and expiry scan.
+bool zym_setHostPreemptReserve(ZymVM* vm, int slots);
+int  zym_getHostPreemptReserve(const ZymVM* vm);
+
+// Occupancy. `script_owned_only` counts just the entries script registered.
+int  zym_preemptCount(const ZymVM* vm, bool script_owned_only);
+int  zym_preemptScriptCapacity(const ZymVM* vm);   // capacity - reserve
+int  zym_preemptScriptAvailable(const ZymVM* vm);  // what script could still take
+
+// Writes up to `max` live ids into `out` (host and script alike) and returns
+// the total number live, which may exceed `max`. Pass NULL to count only.
+int  zym_preemptIds(const ZymVM* vm, ZymPreemptId* out, int max);
 
 // -----------------------------------------------------------------------------
 // HARD STOP

@@ -48,6 +48,9 @@ void initVM(VM* vm) {
     vm->active_boundaries = 0;
     vm->current_frame = NULL;
 
+    vm->host_preempt_reserve = 0;
+    vm->has_executed = false;
+
     vm->vm_state = ZYM_STATE_IDLE;
     vm->vm_cause = ZYM_CAUSE_NONE;
     vm->cause_preempt_id = 0;
