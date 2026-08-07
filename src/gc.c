@@ -218,6 +218,19 @@ static void markRoots(VM* vm) {
         markObject(vm, (Obj*)vm->entry_file);
     }
     markValue(vm, vm->on_preempt_callback);
+
+    // Every live preemption entry's callback. The table is the only thing
+    // referring to a handler registered as an anonymous closure -- nothing on
+    // the stack, in globals, or in a frame holds it once the registering
+    // function returns. Without this a collection frees the closure and the
+    // entry keeps a dangling Value that pushPreemptFrame dereferences when the
+    // slice expires. Free slots carry slice == 0 and a stale callback, so mark
+    // only live ones.
+    for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+        if (vm->preempt_table[i].slice != 0) {
+            markValue(vm, vm->preempt_table[i].callback);
+        }
+    }
     #ifdef GC_DEBUG_FULL
     printf("Marking compiler roots (compiler=%p)\n", (void*)vm->compiler);
     fflush(stdout);
