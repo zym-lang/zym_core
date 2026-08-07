@@ -25,6 +25,19 @@ typedef struct ObjEnumSchema ObjEnumSchema;
 // (binary op with two spilled operands = 2; three-operand call = 3).
 #define SPILL_SCRATCH_COUNT 4
 
+// Physical-register cap for LOCALS. Locals declared past this spill to the
+// per-frame spill stack; everything above the highest live local remains
+// available to temps and call windows. This is a floor for temp space, not a
+// partition: a function with 12 locals still has ~240 registers of temp room.
+// The band only binds in local-heavy functions, where it guarantees calls,
+// argument staging, and expression evaluation always have >= 
+// (MAX_PHYSICAL_REGS - ZYM_LOCAL_REG_CAP) registers to work with. Lua has
+// shipped for decades on a 200/~55 split; 192/64 sits above that. Overridable
+// by the consumer build (-DZYM_LOCAL_REG_CAP=N) like the other limits.
+#ifndef ZYM_LOCAL_REG_CAP
+#define ZYM_LOCAL_REG_CAP 192
+#endif
+
 typedef enum {
     TCO_OFF,        // No tail call optimization
     TCO_SAFE,       // Only optimize pure self-recursion (no captured upvalues)
@@ -156,8 +169,14 @@ typedef struct Compiler {
     // line. Updated at the top of compile_expression / compile_statement.
     int current_line;
 
-    Local locals[MAX_LOCALS];
+    // Dynamic: a function may declare far more locals than there are physical
+    // registers, since everything past local_alloc_cap spills. A fixed array
+    // here would cap the count at the register count, which is the ceiling
+    // spilling exists to remove -- and it is per-Compiler, so every nested
+    // function body would carry it.
+    Local* locals;
     int local_count;
+    int local_capacity;
     int scope_depth;
 
     int* break_jumps;

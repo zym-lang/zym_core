@@ -381,9 +381,9 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
         return ZYM_ERROR;
     }
 
-    // Every other frame-push site sizes the window as max_regs + spill_count
-    // (vm.c:581 and the CALL opcodes). Omitting the spill area let SPILL_STORE
-    // write above stack_top, which markRoots never scans.
+    // Every other frame-push site sizes the window as max_regs (vm.c and the
+    // CALL opcodes). Spill slots are reserved separately on vm->spill_stack
+    // just below, so they are deliberately absent from this arithmetic.
     int needed_top = callee_slot + function->max_regs;
     if (needed_top > STACK_MAX) {
         zym_runtimeError(vm, "Cont.withPrompt: stack overflow.");
@@ -407,7 +407,7 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
     frame->closure = closure;
     frame->ip = vm->ip;
     frame->stack_base = callee_slot;
-    frame->spill_base = reserveSpillSlots(vm, function->spill_count);
+    frame->spill_base = frameReserveSpills(vm, function->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
     frame->arg_count = 0;    // withPrompt requires arity 0
@@ -772,7 +772,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     frame->closure = handler_closure;
     frame->ip = vm->ip;
     frame->stack_base = callee_slot;
-    frame->spill_base = reserveSpillSlots(vm, handler_fn->spill_count);
+    frame->spill_base = frameReserveSpills(vm, handler_fn->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags = 0;
     frame->arg_count = 1;    // shift requires arity 1 (the continuation)

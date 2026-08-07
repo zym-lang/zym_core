@@ -480,8 +480,18 @@ static int reserve_register(Compiler* c) {
     // which falls back to the spill area when the window is exhausted.
     // The local-alloc cap leaves SPILL_SCRATCH_COUNT regs reserved at
     // the top of the window for spill loads.
-    if (c->next_register >= c->local_alloc_cap) {
-        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.", c->next_register + 1, c->local_alloc_cap);
+    // Capped at the full window minus the spill-load scratch, NOT at the
+    // local cap: this allocator serves params, self-slots, and call/argument
+    // staging, which may legitimately sit above the local band. Under
+    // ZYM_FORCE_SPILL_AT, temp_alloc_cap is lowered too, so this shrinks with
+    // it. The message must not say "local variables" -- exhaustion here means
+    // the expression or call needed more registers than remain, which is a
+    // different situation with a different remedy.
+    int phys_cap = c->temp_alloc_cap - SPILL_SCRATCH_COUNT;
+    if (c->next_register >= phys_cap) {
+        compiler_error(c, -1,
+            "Out of registers (%d needed, %d available): expression or call too complex.",
+            c->next_register + 1, phys_cap);
         return 0;
     }
 
@@ -923,11 +933,24 @@ static int resolve_upvalue(Compiler* compiler, Token* name) {
     return r;
 }
 
-static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
-    if (compiler->local_count >= MAX_LOCALS) {
-        compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
-        return;
+// Grow the dynamic locals array. Locals past local_alloc_cap spill rather than
+// occupying a register, so the count is bounded by the spill-slot space (65535)
+// rather than by the 256-register window. Mirrors the upvalue array's growth.
+static bool ensure_local_capacity(Compiler* c) {
+    if (c->local_count < c->local_capacity) return true;
+    if (c->local_count >= 0xFFFF) {
+        compiler_error(c, -1, "Too many local variables (%d). Maximum is %d per function.",
+                       c->local_count + 1, 0xFFFF);
+        return false;
     }
+    int old_capacity = c->local_capacity;
+    c->local_capacity = old_capacity < 8 ? 8 : old_capacity * 2;
+    c->locals = GROW_ARRAY(c->vm, Local, c->locals, old_capacity, c->local_capacity);
+    return true;
+}
+
+static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
+    if (!ensure_local_capacity(compiler)) return;
     Local* local = &compiler->locals[compiler->local_count++];
     local->name = name;
     local->depth = compiler->scope_depth;
@@ -943,10 +966,7 @@ static void add_local_at_reg(Compiler* compiler, Token name, int reg) {
 // rather than a physical register. Used by the STMT_VAR_DECLARATION
 // branch when reserve_local_register reports the new local was spilled.
 static void add_local_spilled(Compiler* compiler, Token name, uint16_t slot) {
-    if (compiler->local_count >= MAX_LOCALS) {
-        compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
-        return;
-    }
+    if (!ensure_local_capacity(compiler)) return;
     Local* local = &compiler->locals[compiler->local_count++];
     local->name = name;
     local->depth = compiler->scope_depth;
@@ -964,10 +984,7 @@ static void add_local_spilled(Compiler* compiler, Token name, uint16_t slot) {
 // Spillable locals go through reserve_local_register + add_local_spilled
 // in STMT_VAR_DECLARATION instead.
 static int add_local(Compiler* compiler, Token name) {
-    if (compiler->local_count >= MAX_LOCALS) {
-        compiler_error(compiler, -1, "Too many local variables (%d). Maximum is %d per function.", compiler->local_count + 1, MAX_LOCALS);
-        return -1;
-    }
+    if (!ensure_local_capacity(compiler)) return -1;
     Local* local = &compiler->locals[compiler->local_count++];
     local->name = name;
     local->depth = compiler->scope_depth;
@@ -2798,7 +2815,7 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             // callee plus arguments -- not the call's footprint. The callee's whole
             // activation record is based at call_base: OP(CALL) sets
             // `frame->stack_base = callee_slot` and reserves
-            // `callee_slot + max_regs + spill_count`. That width belongs to the callee and
+            // `callee_slot + max_regs`. That width belongs to the callee and
             // is not knowable here, so basing a call at a register that has anything live
             // above it lets the callee's own locals overwrite the caller's.
             //
@@ -2861,6 +2878,14 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 // Can't optimize - allocate fresh registers above the local region
                 call_base = compiler->next_register;
                 compiler->next_register += call_slots_needed;
+                // Without this a wide-arity call walks past R255 and the 8-bit
+                // register operand silently wraps -- corruption, not an error.
+                if (compiler->next_register > compiler->temp_alloc_cap) {
+                    compiler_error(compiler, expr->line,
+                        "Out of registers (%d needed, %d available): call too complex.",
+                        compiler->next_register, compiler->temp_alloc_cap);
+                    break;
+                }
                 if (compiler->next_register > compiler->max_register_seen) {
                     compiler->max_register_seen = compiler->next_register;
                 }
@@ -4826,7 +4851,9 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->max_register_seen = 0;
     compiler->temp_free_top = 0;
 
-    compiler->local_alloc_cap = MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT;
+    compiler->local_alloc_cap = ZYM_LOCAL_REG_CAP < (MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT)
+                              ? ZYM_LOCAL_REG_CAP
+                              : (MAX_PHYSICAL_REGS - SPILL_SCRATCH_COUNT);
     compiler->temp_alloc_cap = MAX_PHYSICAL_REGS;
     compiler->spill_count = 0;
     compiler->peak_concurrent_spills = 0;
@@ -4845,6 +4872,10 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->upvalues = NULL;
     compiler->upvalue_count = 0;
     compiler->upvalue_capacity = 0;
+
+    compiler->locals = NULL;
+    compiler->local_count = 0;
+    compiler->local_capacity = 0;
 
     memset(compiler->hoisted, 0, sizeof(compiler->hoisted));
     compiler->hoisted_count = 0;
@@ -5309,11 +5340,20 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
 
     // Reserve register R0 for the function itself, using the function's actual name
     // so that it can reference itself for recursion.
-    Local* local = &fn_compiler.locals[fn_compiler.local_count++];
-    local->name = stmt->name; // Use the actual function name, not empty string
-    local->name.length = stmt->name.length;
-    local->depth = fn_compiler.scope_depth;
-    local->is_initialized = true;
+    // Must go through the growth path: the locals array is dynamic and starts
+    // NULL, so writing it directly here dereferences NULL on the first local.
+    if (ensure_local_capacity(&fn_compiler)) {
+        Local* local = &fn_compiler.locals[fn_compiler.local_count++];
+        local->name = stmt->name; // Use the actual function name, not empty string
+        local->name.length = stmt->name.length;
+        local->depth = fn_compiler.scope_depth;
+        local->reg = 0;
+        local->is_initialized = true;
+        local->is_captured = false;
+        local->is_spilled = false;
+        local->spill_slot = 0;
+        local->struct_type = NULL;
+    }
     reserve_register(&fn_compiler); // Consumes R0
 
     // Compile parameters, which will now start at R1.
@@ -5524,6 +5564,9 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
     // Clean up dynamic upvalue array
     if (fn_compiler.upvalues) {
         FREE_ARRAY(fn_compiler.vm, Upvalue, fn_compiler.upvalues, fn_compiler.upvalue_capacity);
+    }
+    if (fn_compiler.locals) {
+        FREE_ARRAY(fn_compiler.vm, Local, fn_compiler.locals, fn_compiler.local_capacity);
     }
 
     // Clean up break jumps array
@@ -5960,6 +6003,9 @@ cleanup_on_error:
     // Clean up dynamic upvalue array
     if (compiler.upvalues) {
         FREE_ARRAY(vm, Upvalue, compiler.upvalues, compiler.upvalue_capacity);
+    }
+    if (compiler.locals) {
+        FREE_ARRAY(vm, Local, compiler.locals, compiler.local_capacity);
     }
 
     // Clean up global types array

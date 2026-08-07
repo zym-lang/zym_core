@@ -644,7 +644,7 @@ static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
     frame->closure      = closure;
     frame->ip           = vm->ip;
     frame->stack_base   = callee_slot;
-    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
+    frame->spill_base   = frameReserveSpills(vm, function->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_PREEMPT;
     frame->arg_count    = 0;
@@ -2485,7 +2485,8 @@ static InterpretResult run(VM* vm) {
             }
 
             // Calculate required stack size and grow if needed
-            // Frame layout: [regs 0..max_regs) | [spill 0..spill_count) | [variadic extras transiently above]
+            // Frame layout: [regs 0..max_regs) | [variadic extras transiently above]
+            // Spills are not here -- see CallFrame.spill_base.
             // PACK_REST runs at function entry before any SPILL op, so the
             // spill area and the variadic-extras region never alias in time.
             // For variadic functions, extra args beyond arity occupy stack slots too
@@ -2511,7 +2512,7 @@ static InterpretResult run(VM* vm) {
             frame->closure      = closure;
             frame->ip           = ip;
             frame->stack_base   = callee_slot;
-            frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
+            frame->spill_base   = frameReserveSpills(vm, function->spill_count);
             frame->caller_chunk = vm->chunk;
             frame->flags        = 0;
             frame->arg_count    = arg_count;
@@ -2681,7 +2682,7 @@ static InterpretResult run(VM* vm) {
         frame->closure      = closure;
         frame->ip           = ip;
         frame->stack_base   = callee_slot;
-        frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
+        frame->spill_base   = frameReserveSpills(vm, function->spill_count);
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
         frame->arg_count    = REG_Bx(instr);
@@ -2843,7 +2844,7 @@ static InterpretResult run(VM* vm) {
             // This is the top frame, so releasing back to its own base and
             // re-reserving is exactly a pop-and-push of the spill region.
             vm->spill_top = current_frame->spill_base;
-            current_frame->spill_base = reserveSpillSlots(vm, function->spill_count);
+            current_frame->spill_base = frameReserveSpills(vm, function->spill_count);
 
             // Jump into the new function
             vm->chunk = &function->chunk;
@@ -4187,7 +4188,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure      = closure;
     frame->stack_base   = frame_base;
-    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
+    frame->spill_base   = frameReserveSpills(vm, function->spill_count);
     // Mark as the public-API boundary so OP(RET) knows to stop here
     // when this frame returns, instead of cascading through any
     // already-suspended caller frames (re-entrant case).

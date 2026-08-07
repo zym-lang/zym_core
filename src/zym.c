@@ -2627,12 +2627,10 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // caller's still-live register window, silently corrupting locals
     // (the symptom: a script local that was a map becomes null between
     // two adjacent statements). Conservatively reserve up through the
-    // current frame's `stack_base + max_regs` instead.
-    // max_regs + spill_count, matching zym_call_prepare and every other
-    // frame-push site. Omitting the spill area lets this frame land inside a
-    // caller's spilled locals -- the same defect fixed in withPrompt/shift,
-    // and it bites hardest right here, since this is the function reentrant
-    // natives call back through.
+    // current frame's `stack_base + max_regs` instead, matching
+    // zym_call_prepare and every other frame-push site. Spilled locals are not
+    // in this window -- they live on the parallel spill stack -- which is what
+    // stops a re-entrant call from landing in the caller's spilled values.
     int frame_base = vm->stack_top;
     if (vm->current_frame && vm->current_frame->closure &&
         vm->current_frame->closure->function) {

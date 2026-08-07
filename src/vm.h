@@ -333,7 +333,16 @@ void closeUpvalues(VM* vm, Value* last);
 bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out);
 void unwindFrames(VM* vm, int new_frame_count);
 // Reserve a frame's spill slots on the parallel spill stack; see CallFrame.spill_base.
+// Slow path only -- go through frameReserveSpills(), which keeps the zero case
+// (nearly every call) out of line-free.
 int reserveSpillSlots(VM* vm, int count);
+
+// Frame push is hot and almost nothing spills, so the common case must not pay
+// for a call. spill_top is the base a zero-slot frame would have been given.
+static inline int frameReserveSpills(VM* vm, int count) {
+    if (__builtin_expect(count == 0, 1)) return vm->spill_top;
+    return reserveSpillSlots(vm, count);
+}
 void protectLocalRefsInValue(VM* vm, Value value, Value* frame_start);
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value);

@@ -197,9 +197,13 @@ typedef enum {
 
     // Register spill opcodes (A:8 + Bx:16)
     //
-    // The per-frame stack window is laid out as
-    //     [bp+0 .. bp+max_regs)                — physical 8-bit registers
-    //     [bp+max_regs .. bp+max_regs+spill_count) — spill area (uint16 indexed)
+    // The frame's value-stack window is just its registers:
+    //     [bp+0 .. bp+max_regs)   — physical 8-bit registers
+    //
+    // Spill slots are NOT in that window. They live on vm->spill_stack, a
+    // parallel array, at [frame->spill_base .. +spill_count), because a
+    // callee's frame is based just above the caller's registers and grows
+    // upward -- an in-window spill area was exactly what a call landed on.
     //
     // Only emitted by the compiler when register pressure exceeds the
     // 8-bit register window. Bx is the spill slot index (0..65535).

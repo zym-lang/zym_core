@@ -377,7 +377,7 @@ static ZymValue preempt_shield(ZymVM* vm, ZymValue ctx, ZymValue fn) {
     frame->closure      = closure;
     frame->ip           = vm->ip;
     frame->stack_base   = callee_slot;
-    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
+    frame->spill_base   = frameReserveSpills(vm, function->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_DISABLE_PREEMPT;
     frame->arg_count    = 0;
