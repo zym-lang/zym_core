@@ -12,6 +12,9 @@ void initChunk(Chunk* chunk) {
     chunk->code = NULL;
     chunk->lines = NULL;
     initValueArray(&chunk->constants);
+    // Conservative until the compiler fills it in: better to over-scan
+    // during GC than to leave live registers unmarked.
+    chunk->max_regs = MAX_PHYSICAL_REGS;
 }
 
 void freeChunk(VM* vm, Chunk* chunk) {

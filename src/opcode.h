@@ -1,5 +1,11 @@
 #pragma once
 
+// 8-bit register addressing supports 256 registers. This is a property of the
+// instruction encoding, so it lives here: both the compiler (allocating them)
+// and chunk.c (bounding a chunk's live window for the GC) need the same number,
+// and a second copy of it is how the two drift apart.
+#define MAX_PHYSICAL_REGS 256
+
 typedef enum {
     // Memory and Constants
     MOVE,

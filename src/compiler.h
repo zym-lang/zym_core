@@ -16,7 +16,6 @@ typedef struct ObjEnumSchema ObjEnumSchema;
 #define MAX_LOOP_DEPTH 16
 #define MAX_HOISTED 1024
 #define MAX_LABELS 256
-#define MAX_PHYSICAL_REGS 256     // 8-bit register addressing supports 256 registers
 
 // Number of physical registers reserved at the top of the register
 // window as scratch for SPILL_LOAD targets. These regs are not

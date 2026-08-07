@@ -315,6 +315,90 @@ static int is_local_reg(Compiler* c, int r) {
     return get_local_by_reg(c, r) != NULL;
 }
 
+
+// Does `e` read the identifier `name` anywhere in its subtree?
+//
+// This decides whether `x = <e>` may compile `e` straight into x's register.
+// That elision saves a MOVE and is what makes assignment cheap, but it is only
+// valid when `e` never READS x -- several expression kinds write their
+// destination before they are finished with their operands:
+//
+//   x = cond and x        `and` writes the left operand to the destination,
+//                         then the right operand reads a destroyed x
+//   xs = [...xs, 3]       NEW_LIST lands in the destination first, so the
+//                         spread copies from the fresh empty list
+//   x = ++x[0]            the destination is clobbered before x[0] is read
+//
+// A syntactic occurrence check is conservative -- it can route through a temp
+// when the read was harmless -- but it is cheap and it only costs the cases
+// where the name genuinely appears, so `x = f()` and `xs = [1,2,3]` stay on
+// the fast path.
+static bool expr_reads_name(const Expr* e, const Token* name) {
+    if (e == NULL) return false;
+    switch (e->type) {
+        case EXPR_VARIABLE:
+            return e->as.variable.name.length == name->length &&
+                   memcmp(e->as.variable.name.start, name->start, (size_t)name->length) == 0;
+        case EXPR_ASSIGN:
+            return expr_reads_name(e->as.assign.target, name) ||
+                   expr_reads_name(e->as.assign.value, name);
+        case EXPR_BINARY:
+            return expr_reads_name(e->as.binary.left, name) ||
+                   expr_reads_name(e->as.binary.right, name);
+        case EXPR_CALL: {
+            if (expr_reads_name(e->as.call.callee, name)) return true;
+            for (int i = 0; i < e->as.call.arg_count; i++) {
+                if (expr_reads_name(e->as.call.args[i], name)) return true;
+            }
+            return false;
+        }
+        case EXPR_GET:      return expr_reads_name(e->as.get.object, name);
+        case EXPR_SET:      return expr_reads_name(e->as.set.object, name) ||
+                                   expr_reads_name(e->as.set.value, name);
+        case EXPR_UNARY:    return expr_reads_name(e->as.unary.right, name);
+        case EXPR_GROUPING: return expr_reads_name(e->as.grouping.expression, name);
+        case EXPR_LIST: {
+            for (int i = 0; i < e->as.list.count; i++) {
+                if (expr_reads_name(e->as.list.elements[i], name)) return true;
+            }
+            return false;
+        }
+        case EXPR_SUBSCRIPT:
+            return expr_reads_name(e->as.subscript.object, name) ||
+                   expr_reads_name(e->as.subscript.index, name);
+        case EXPR_MAP: {
+            for (int i = 0; i < e->as.map.count; i++) {
+                if (expr_reads_name(e->as.map.keys[i], name)) return true;
+                if (expr_reads_name(e->as.map.values[i], name)) return true;
+            }
+            return false;
+        }
+        case EXPR_STRUCT_INST: {
+            for (int i = 0; i < e->as.struct_inst.field_count; i++) {
+                if (expr_reads_name(e->as.struct_inst.field_values[i], name)) return true;
+            }
+            return false;
+        }
+        case EXPR_TERNARY:
+            return expr_reads_name(e->as.ternary.condition, name) ||
+                   expr_reads_name(e->as.ternary.then_expr, name) ||
+                   expr_reads_name(e->as.ternary.else_expr, name);
+        case EXPR_PRE_INC:  return expr_reads_name(e->as.pre_inc.target, name);
+        case EXPR_POST_INC: return expr_reads_name(e->as.post_inc.target, name);
+        case EXPR_PRE_DEC:  return expr_reads_name(e->as.pre_dec.target, name);
+        case EXPR_POST_DEC: return expr_reads_name(e->as.post_dec.target, name);
+        case EXPR_SPREAD:   return expr_reads_name(e->as.spread.expression, name);
+        case EXPR_FUNCTION:
+            // A nested function body may capture and read the name as an
+            // upvalue. Be conservative rather than walking statements here.
+            return true;
+        case EXPR_LITERAL:
+        case EXPR_ERROR:
+        default:
+            return false;
+    }
+}
+
 static int alloc_temp(Compiler* c) {
     // Bump next_register past the highest reg occupied by a live local.
     // Spilled locals occupy no physical reg, so they don't contribute.
@@ -1585,14 +1669,22 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     }
 
     // For self-calls, we don't need to load the callee - the VM will get it from the frame
+    int callee_temp = -1;
     if (!is_self_call) {
-        // Compile the callee into R0
+        // Stage the callee in a temp instead of writing call_base now. call_base
+        // is R0, this function's own self-slot, and an argument may still need to
+        // READ it -- `func me() { return other(me) }` passes `me`, which resolves
+        // through R0. Loading the callee there first meant the argument saw the
+        // callee instead of the enclosing function. Moved into place below, once
+        // every argument has been evaluated, for the same reason the arguments
+        // themselves are staged.
+        callee_temp = reserve_register(compiler);
         if (callee->type == EXPR_VARIABLE) {
             Token* name = &callee->as.variable.name;
-            compile_tco_callee(compiler, name, arg_count, call_base, callee->line);
+            compile_tco_callee(compiler, name, arg_count, callee_temp, callee->line);
         } else {
             // TCO_AGGRESSIVE: Non-variable callee (e.g., arr[0], obj.method, lambda)
-            compile_expression(compiler, callee, call_base);
+            compile_expression(compiler, callee, callee_temp);
         }
     } else {
         /* Phase 4.5d scope-aware TAIL_CALL_SELF parity: same rationale as
@@ -1631,6 +1723,14 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     // CRITICAL: Close frame upvalues BEFORE moving arguments
     // This ensures closures capture the OLD parameter values before we overwrite them
     emit_instruction(compiler, PACK_ABx(CLOSE_FRAME_UPVALUES, 0, 0), line);
+
+    // Callee into call_base FIRST: the argument moves below write R1..Rn, and
+    // callee_temp is allocated in that range, so copying it afterwards would
+    // read a register an argument had already overwritten. Nothing reads
+    // call_base between here and the tail call.
+    if (callee_temp != -1) {
+        emit_move(compiler, call_base, callee_temp, line);
+    }
 
     // Now move them to R1, R2, R3, ... for the tail call
     for (int i = 0; i < arg_count; i++) {
@@ -2107,9 +2207,22 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 }
 
                 if (reg != -1) {
-                    // Normal variable: compile value directly into its register
-                    COMPILE_REQUIRED(compiler, expr->as.assign.value, reg);
-                    EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
+                    // Compile the value straight into the variable's register to
+                    // avoid a MOVE -- but only when the value never reads the
+                    // variable. Several expression kinds write their destination
+                    // before they finish reading their operands, so eliding the
+                    // temp there hands them a destination they have already
+                    // destroyed. The spilled path above always uses a scratch
+                    // register for exactly this reason.
+                    if (expr_reads_name(expr->as.assign.value, &name)) {
+                        int scratch = alloc_temp(compiler);
+                        COMPILE_REQUIRED(compiler, expr->as.assign.value, scratch);
+                        emit_move(compiler, reg, scratch, expr->line);
+                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
+                    } else {
+                        COMPILE_REQUIRED(compiler, expr->as.assign.value, reg);
+                        EMIT_MOVE_IF_NEEDED(compiler, target_reg, reg, expr->line);
+                    }
                 } else if ((reg = resolve_upvalue(compiler, &name)) != -1) {
                     // Assign to an upvalue.
                     int value_reg = alloc_temp(compiler);
@@ -4158,8 +4271,21 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
                             restore_temp_top(compiler, saved_top);
                             return false;
                         }
-                        // Non-spilled local: compile straight into its register.
-                        compile_expression(compiler, assign->value, local->reg);
+                        // Non-spilled local: compile straight into its register,
+                        // unless the value reads the variable. See expr_reads_name --
+                        // `x = cond and x`, `xs = [...xs, 3]` and `x = ++x[0]` all
+                        // write the destination before they finish reading it, so the
+                        // elision has to be skipped for them. Same reasoning as the
+                        // spilled branch just above, which always uses a scratch.
+                        if (expr_reads_name(assign->value, &name)) {
+                            int saved_top = save_temp_top(compiler);
+                            int scratch = alloc_temp(compiler);
+                            compile_expression(compiler, assign->value, scratch);
+                            emit_move(compiler, local->reg, scratch, stmt->line);
+                            restore_temp_top(compiler, saved_top);
+                        } else {
+                            compile_expression(compiler, assign->value, local->reg);
+                        }
                         COMPILER_TRACE_TOK(compiler, &name, ZYM_RES_LOCAL, local->reg, -1);
                         return false;
                     }
@@ -5868,6 +5994,10 @@ cleanup_on_error:
     if (success) {
         chunk->count = compiler.function->chunk.count;
         chunk->capacity = compiler.function->chunk.capacity;
+        // The width the GC needs. A top-level chunk runs with no CallFrame, so
+        // nothing else records how far up the stack its registers reach.
+        chunk->max_regs = compiler.max_register_seen + 1;
+        if (chunk->max_regs > MAX_PHYSICAL_REGS) chunk->max_regs = MAX_PHYSICAL_REGS;
         chunk->code = compiler.function->chunk.code;
         chunk->lines = compiler.function->chunk.lines;
         chunk->constants = compiler.function->chunk.constants;

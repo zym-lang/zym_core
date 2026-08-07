@@ -3938,12 +3938,17 @@ InterpretResult runChunk(VM* vm, Chunk* chunk) {
     vm->chunk = chunk;
     vm->ip = vm->chunk->code;
 
-    // For top-level chunk execution (no call frame), conservatively set stack_top
-    // to protect registers used by the chunk. Since we don't track max_regs for chunks,
-    // we use a reasonable upper bound (128 registers should be more than enough for
-    // most top-level scripts).
+    // A top-level chunk executes with no CallFrame, so stack_top is the only
+    // thing telling markRoots how far its live registers reach -- it scans
+    // [0, stack_top) and sweeps anything above. This used to be a hardcoded 128,
+    // which is not a bound: the compiler emits up to MAX_PHYSICAL_REGS, so a
+    // script with more than 128 live top-level registers had objects collected
+    // out from under it. Use the width the compiler actually measured.
     if (vm->frame_count == 0) {
-        vm->stack_top = 128;  // Conservative estimate for top-level chunk registers
+        int width = chunk->max_regs;
+        if (width < 0) width = 0;
+        if (width > MAX_PHYSICAL_REGS) width = MAX_PHYSICAL_REGS;
+        if (vm->stack_top < width) vm->stack_top = width;
     }
 
 #ifdef DEBUG_PRINT_CODE

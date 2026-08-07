@@ -192,6 +192,7 @@ static void serializeChunkBody(VM* vm, Chunk* chunk, CompilerConfig config,
         }
     }
 
+    writeBytes(vm, out, &chunk->max_regs, sizeof(int));
     writeBytes(vm, out, &chunk->count, sizeof(int));
     writeBytes(vm, out, chunk->code, sizeof(uint32_t) * chunk->count);
 
@@ -518,6 +519,15 @@ static bool deserializeChunkBody(VM* vm, Chunk* chunk, const uint8_t* buffer, si
                 return false;
         }
     }
+
+    // Untrusted input: a bad width here would under-mark (collecting live
+    // objects) or over-mark past the stack. Clamp rather than trust.
+    int stored_max_regs = 0;
+    READ_BYTES(&stored_max_regs, sizeof(int));
+    if (stored_max_regs < 0 || stored_max_regs > MAX_PHYSICAL_REGS) {
+        stored_max_regs = MAX_PHYSICAL_REGS;
+    }
+    chunk->max_regs = stored_max_regs;
 
     int instruction_count = 0;
     READ_BYTES(&instruction_count, sizeof(int));
