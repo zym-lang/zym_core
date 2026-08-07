@@ -1475,38 +1475,53 @@ static void compile_dynamic_call_argument(Compiler* compiler, Expr* arg, int arg
     COMPILE_REQUIRED(compiler, arg, arg_slot);
 }
 
+// Can SAFE mode prove this tail call resolves to the declaration it names?
+//
+// This asks about IDENTITY only -- self-call, or a hoisted declaration whose
+// name and arity match. It deliberately does NOT ask whether anything captured
+// the frame. It used to: each check also required upvalue_count == 0, from
+// before the TCO path emitted CLOSE_FRAME_UPVALUES. That opcode now runs
+// unconditionally before every tail call and closes every upvalue at or above
+// the frame base, so a closure holding a frame local gets its own copy before
+// the frame is reused. The static check was guarding a hazard the VM handles.
+//
+// Keeping it had a real cost: the hoisting pre-pass records name and arity for
+// every declaration up front but leaves upvalue_count at -1 until that
+// function's own body compiles. A forward reference therefore always failed
+// the conjunct, so mutual recursion was never optimized in SAFE mode -- one of
+// the two directions is a forward reference by definition. It also read
+// compiler->upvalue_count while the current function was still compiling, so a
+// closure created later in the body could invalidate a decision already taken.
 static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_count) {
     if (compiler->function && compiler->function->name &&
         compiler->function->name->length == name->length &&
         memcmp(compiler->function->name->chars, name->start, name->length) == 0) {
-        return compiler->upvalue_count == 0;
+        return true;
     }
     ScopedString mangled = scoped_mangle(compiler, name, arg_count);
     bool is_self = false;
     if (compiler->function && compiler->function->name &&
         compiler->function->name->length == (int)strlen(mangled.str) &&
         memcmp(compiler->function->name->chars, mangled.str, strlen(mangled.str)) == 0) {
-        is_self = (compiler->upvalue_count == 0);
+        is_self = true;
     }
     scoped_string_free(&mangled);
     if (is_self) return true;
 
-    // Check 3: Hoisted function with zero upvalues (global)
+    // Check 3: a hoisted declaration at global scope with matching arity.
     Compiler* root = root_compiler(compiler);
     for (int i = 0; i < root->hoisted_count; i++) {
         if (tokens_equal(&root->hoisted[i].name, name) &&
-            root->hoisted[i].arity == arg_count &&
-            root->hoisted[i].upvalue_count == 0) {
+            root->hoisted[i].arity == arg_count) {
             return true;
         }
     }
 
-    // Check 4: Hoisted function with zero upvalues (local in any scope)
+    // Check 4: a hoisted declaration local to any enclosing scope.
     for (Compiler* c = compiler; c != NULL; c = c->enclosing) {
         for (int i = 0; i < c->local_hoisted_count; i++) {
             if (tokens_equal(&c->local_hoisted[i].name, name) &&
-                c->local_hoisted[i].arity == arg_count &&
-                c->local_hoisted[i].upvalue_count == 0) {
+                c->local_hoisted[i].arity == arg_count) {
                 return true;
             }
         }
