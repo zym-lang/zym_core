@@ -79,6 +79,11 @@ void initVM(VM* vm) {
     vm->call_arg_top = 0;
     for (int i = 0; i < vm->stack_capacity; i++) vm->stack[i] = NULL_VAL;
 
+    // Allocated lazily on the first spilling call; most programs never spill.
+    vm->spill_stack = NULL;
+    vm->spill_capacity = 0;
+    vm->spill_top = 0;
+
     initTable(&vm->globals);
     initValueArray(&vm->globalSlots);
     initTable(&vm->strings);
@@ -162,6 +167,13 @@ void freeVM(VM* vm) {
     vm->stack = NULL;
     vm->stack_capacity = 0;
     vm->stack_top = 0;
+
+    if (vm->spill_stack != NULL) {
+        reallocate(vm, vm->spill_stack, sizeof(Value) * vm->spill_capacity, 0);
+    }
+    vm->spill_stack = NULL;
+    vm->spill_capacity = 0;
+    vm->spill_top = 0;
 
     diagsink_free(vm, &vm->diagnostics);
     sfr_free(vm, &vm->source_files);
@@ -444,6 +456,7 @@ void closeUpvalues(VM* vm, Value* last) {
 void unwindFrames(VM* vm, int new_frame_count) {
     while (vm->frame_count > new_frame_count) {
         CallFrame* frame = &vm->frames[--vm->frame_count];
+        vm->spill_top = frame->spill_base;   // release this frame's spills
         if (frame->flags & FRAME_FLAG_PREEMPT) {
             // Release this entry's structural guard so it can fire again.
             for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
@@ -527,6 +540,34 @@ static Value resolveOverload(VM* vm, ObjDispatcher* dispatcher, uint16_t arg_cou
     return NULL_VAL;
 }
 
+// Reserve `count` spill slots for a frame about to be pushed, returning the
+// base offset into vm->spill_stack. Cannot fail: reallocate() routes an
+// allocation failure through zymOutOfMemory rather than returning NULL.
+//
+// Offsets rather than pointers: this array moves on growth and a frame may
+// outlive several reallocations, so every reader goes through vm->spill_stack.
+int reserveSpillSlots(VM* vm, int count) {
+    int base = vm->spill_top;
+    if (count <= 0) return base;
+
+    int needed = vm->spill_top + count;
+    if (needed > vm->spill_capacity) {
+        int new_capacity = vm->spill_capacity < 64 ? 64 : vm->spill_capacity;
+        while (new_capacity < needed) new_capacity *= 2;
+        Value* grown = (Value*)reallocate(vm, vm->spill_stack,
+                                          sizeof(Value) * vm->spill_capacity,
+                                          sizeof(Value) * new_capacity);
+        for (int i = vm->spill_capacity; i < new_capacity; i++) grown[i] = NULL_VAL;
+        vm->spill_stack = grown;
+        vm->spill_capacity = new_capacity;
+    }
+    // Fresh slots must not carry a previous frame's values into this one --
+    // the collector scans the whole live region.
+    for (int i = vm->spill_top; i < needed; i++) vm->spill_stack[i] = NULL_VAL;
+    vm->spill_top = needed;
+    return base;
+}
+
 bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out) {
     if (needed_top <= vm->stack_capacity) {
         return true;
@@ -590,7 +631,7 @@ static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
     }
 
     int callee_slot = vm->stack_top;
-    int needed_top = callee_slot + function->max_regs + function->spill_count;
+    int needed_top = callee_slot + function->max_regs;
 
     if (!growStackForCall(vm, needed_top, NULL)) {
         return false;
@@ -603,6 +644,7 @@ static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
     frame->closure      = closure;
     frame->ip           = vm->ip;
     frame->stack_base   = callee_slot;
+    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_PREEMPT;
     frame->arg_count    = 0;
@@ -940,14 +982,16 @@ static InterpretResult run(VM* vm) {
     register Value* constants = vm->chunk ? vm->chunk->constants.values : NULL;
     register uint32_t instr = 0;
     register Value* bp = stack + base;  // base pointer for direct register access
-    // Spill-area base pointer. The spill region lives at bp[max_regs..],
-    // emitted only inside ObjFunction bodies (top-level chunks never spill),
-    // so we read it from the current frame's function when one exists. At
-    // the top level (frame_count == 0) we leave sp == bp; SPILL_LOAD/STORE
-    // never execute on the top-level chunk, so the value is unused.
-    register Value* sp = (vm->current_frame && vm->current_frame->closure)
-        ? bp + vm->current_frame->closure->function->max_regs
-        : bp;
+    // Spill-area base pointer. Spilled locals live on vm->spill_stack, NOT in
+    // the frame's register window: a callee's frame is based just above the
+    // caller's registers and grows upward, which is exactly where an in-frame
+    // spill area sat, so every call from a spilling function clobbered its own
+    // spilled locals. The parallel stack removes the overlap by construction.
+    // NULL when nothing has ever spilled; SPILL_LOAD/STORE only execute in a
+    // function that reserved slots, so the pointer is never dereferenced then.
+    register Value* sp = vm->spill_stack
+        ? vm->spill_stack + (vm->current_frame ? vm->current_frame->spill_base : 0)
+        : NULL;
 
     // Sync locals back to VM struct before calls that read vm->ip/cur_base
 #define STORE_IP()    (vm->ip = ip)
@@ -957,9 +1001,9 @@ static InterpretResult run(VM* vm) {
     // that know they kept the same frame (just GC stack relocation) should
     // use RELOAD_STACK() instead, which preserves sp's offset from bp.
 #define RELOAD_SP() do { \
-    sp = (vm->current_frame && vm->current_frame->closure) \
-        ? bp + vm->current_frame->closure->function->max_regs \
-        : bp; \
+    sp = vm->spill_stack \
+        ? vm->spill_stack + (vm->current_frame ? vm->current_frame->spill_base : 0) \
+        : NULL; \
 } while(0)
 #define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; RELOAD_SP(); } while(0)
 
@@ -988,7 +1032,7 @@ static InterpretResult run(VM* vm) {
     Value* _old_bp = bp; \
     stack = vm->stack; \
     bp = stack + base; \
-    sp = bp + (sp - _old_bp); \
+    RELOAD_SP(); \
 } while(0)
 #define BINARY_OP(op) \
     do { \
@@ -2445,7 +2489,7 @@ static InterpretResult run(VM* vm) {
             // PACK_REST runs at function entry before any SPILL op, so the
             // spill area and the variadic-extras region never alias in time.
             // For variadic functions, extra args beyond arity occupy stack slots too
-            int needed_top = callee_slot + function->max_regs + function->spill_count;
+            int needed_top = callee_slot + function->max_regs;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 int extra = arg_count - function->arity;
                 needed_top += extra;
@@ -2467,6 +2511,7 @@ static InterpretResult run(VM* vm) {
             frame->closure      = closure;
             frame->ip           = ip;
             frame->stack_base   = callee_slot;
+            frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
             frame->caller_chunk = vm->chunk;
             frame->flags        = 0;
             frame->arg_count    = arg_count;
@@ -2474,7 +2519,7 @@ static InterpretResult run(VM* vm) {
             vm->current_frame = frame;
             base = callee_slot;
             bp = stack + base;
-            sp = bp + function->max_regs;  // spill base for the callee frame
+            RELOAD_SP();  // spill base for the callee frame
             // Enter callee
             vm->chunk = &function->chunk;
             constants = vm->chunk->constants.values;
@@ -2620,7 +2665,7 @@ static InterpretResult run(VM* vm) {
             STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
         }
 
-        int needed_top = callee_slot + function->max_regs + function->spill_count;
+        int needed_top = callee_slot + function->max_regs;
         if (__builtin_expect(needed_top > vm->stack_capacity, 0)) {
             if (!growStackForCall(vm, needed_top, NULL)) {
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
@@ -2636,6 +2681,7 @@ static InterpretResult run(VM* vm) {
         frame->closure      = closure;
         frame->ip           = ip;
         frame->stack_base   = callee_slot;
+        frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
         frame->caller_chunk = vm->chunk;
         frame->flags        = 0;
         frame->arg_count    = REG_Bx(instr);
@@ -2643,7 +2689,7 @@ static InterpretResult run(VM* vm) {
         vm->current_frame = frame;
         base = callee_slot;
         bp = stack + base;
-        sp = bp + function->max_regs;  // spill base for the CALL_SELF callee
+        RELOAD_SP();  // spill base for the CALL_SELF callee
         ip = function->chunk.code;
         DISPATCH();
     }
@@ -2766,7 +2812,7 @@ static InterpretResult run(VM* vm) {
             // TAIL CALL OPTIMIZATION: Reuse current frame instead of pushing new one
             CallFrame* current_frame = vm->current_frame;
             int frame_base = current_frame->stack_base;
-            int needed_top = frame_base + function->max_regs + function->spill_count;
+            int needed_top = frame_base + function->max_regs;
             if (function->is_variadic && arg_count > (uint16_t)function->arity) {
                 needed_top += (arg_count - function->arity);
             }
@@ -2793,6 +2839,11 @@ static InterpretResult run(VM* vm) {
             // Update the frame to point at the new closure
             current_frame->closure = closure;
             current_frame->arg_count = arg_count;
+            // The frame is reused but the new function has its own spill needs.
+            // This is the top frame, so releasing back to its own base and
+            // re-reserving is exactly a pop-and-push of the spill region.
+            vm->spill_top = current_frame->spill_base;
+            current_frame->spill_base = reserveSpillSlots(vm, function->spill_count);
 
             // Jump into the new function
             vm->chunk = &function->chunk;
@@ -2800,7 +2851,7 @@ static InterpretResult run(VM* vm) {
             ip    = function->chunk.code;
             // base/bp unchanged (frame reused), but the new function may have
             // a different max_regs — recompute the spill base for the callee.
-            sp = bp + function->max_regs;
+            RELOAD_SP();
 
             DISPATCH();
         }
@@ -2849,6 +2900,7 @@ static InterpretResult run(VM* vm) {
                                 vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
                 closeUpvalues(vm, &stack[frame->stack_base + 1]);
             }
+            vm->spill_top = frame->spill_base;   // release this frame's spills
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
@@ -2939,6 +2991,7 @@ static InterpretResult run(VM* vm) {
                                 vm->open_upvalues->location > &stack[frame->stack_base], 0)) {
                 closeUpvalues(vm, &stack[frame->stack_base + 1]);
             }
+            vm->spill_top = frame->spill_base;   // release this frame's spills
             vm->frame_count--;
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
@@ -2990,7 +3043,7 @@ static InterpretResult run(VM* vm) {
         stack[callee_slot] = OBJ_VAL(closure);
 
         int frame_base = current_frame->stack_base;
-        int needed_top = frame_base + function->max_regs + function->spill_count;
+        int needed_top = frame_base + function->max_regs;
 
         if (__builtin_expect(needed_top > STACK_MAX, 0)) {
             STORE_IP(); runtimeError(vm, "Stack overflow.");
@@ -3054,6 +3107,7 @@ static InterpretResult run(VM* vm) {
         // mid-execution when this re-entrant call happened.
         if (__builtin_expect((frame->flags & FRAME_FLAG_API_BOUNDARY) != 0, 0)) {
             stack[frame->stack_base] = return_value;
+            vm->spill_top = frame->spill_base;   // release this frame's spills
             vm->frame_count--;
             // Restore base/current_frame to whatever was active before
             // zym_call_execute pushed this boundary; the C side will
@@ -3081,6 +3135,7 @@ static InterpretResult run(VM* vm) {
         }
 
         // Now pop the callee frame
+        vm->spill_top = frame->spill_base;   // release this frame's spills
         vm->frame_count--;
         base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
         bp = stack + base;
@@ -4028,8 +4083,7 @@ bool zym_call_prepare(VM* vm, const char* functionName, int arity) {
     for (int fi = 0; fi < vm->frame_count; fi++) {
         CallFrame* f = &vm->frames[fi];
         if (f->closure && f->closure->function) {
-            int ftop = f->stack_base + f->closure->function->max_regs
-                                     + f->closure->function->spill_count;
+            int ftop = f->stack_base + f->closure->function->max_regs;
             if (ftop > api_base) api_base = ftop;
         }
     }
@@ -4080,7 +4134,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
 
     // Calculate required stack size for this call
     // Mirror OP(CALL): variadic functions with extra args need additional slots.
-    int needed_top = frame_base + function->max_regs + function->spill_count;
+    int needed_top = frame_base + function->max_regs;
     if (function->is_variadic && argCount > function->arity) {
         needed_top += (argCount - function->arity);
     }
@@ -4133,6 +4187,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
     CallFrame* frame = &vm->frames[vm->frame_count++];
     frame->closure      = closure;
     frame->stack_base   = frame_base;
+    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
     // Mark as the public-API boundary so OP(RET) knows to stop here
     // when this frame returns, instead of cascading through any
     // already-suspended caller frames (re-entrant case).

@@ -2637,8 +2637,7 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     if (vm->current_frame && vm->current_frame->closure &&
         vm->current_frame->closure->function) {
         int caller_top = vm->current_frame->stack_base +
-                         vm->current_frame->closure->function->max_regs +
-                         vm->current_frame->closure->function->spill_count;
+                         vm->current_frame->closure->function->max_regs;
         if (caller_top > frame_base) frame_base = caller_top;
     }
     // Also walk all active frames to find the highest live slot, in case
@@ -2646,8 +2645,7 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     for (int fi = 0; fi < vm->frame_count; fi++) {
         CallFrame* f = &vm->frames[fi];
         if (f->closure && f->closure->function) {
-            int ftop = f->stack_base + f->closure->function->max_regs
-                                     + f->closure->function->spill_count;
+            int ftop = f->stack_base + f->closure->function->max_regs;
             if (ftop > frame_base) frame_base = ftop;
         }
     }

@@ -100,6 +100,13 @@ struct CallFrame {
     int flags;
     uint16_t arg_count;  // actual number of args passed to this call (for variadic PACK_REST)
     uint32_t preempt_id; // preemption entry whose callback this frame runs (0 = none)
+    // Offset of this frame's spill slots in vm->spill_stack. Spilled locals do
+    // NOT live on the value stack: a callee's frame is based just above the
+    // caller's registers and extends upward by its own width, which is exactly
+    // where an in-register spill area sat -- so every call from a spilling
+    // function overwrote its own spilled locals. Keeping them on a separate
+    // stack removes the overlap by construction rather than by arithmetic.
+    int spill_base;
 };
 typedef struct CallFrame CallFrame;
 
@@ -132,6 +139,13 @@ typedef struct VM {
     Value* stack;
     int stack_capacity;
     int stack_top;
+
+    // Parallel stack for spilled locals, bump-allocated per frame. Stays NULL
+    // and untouched for any program that never spills, so a normal call pays
+    // nothing for it. Marked wholesale by the collector: [0, spill_top).
+    Value* spill_stack;
+    int spill_capacity;
+    int spill_top;
     // Cursor used by the spread-call layout sequence
     // (CALL_ARG_PREP / CALL_ARG_SPREAD / CALL_VAR). Holds the absolute
     // stack index of the next free argument slot during a spread call.
@@ -318,6 +332,8 @@ void closeUpvalues(VM* vm, Value* last);
 // native modules that push their own call frames can use it.
 bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out);
 void unwindFrames(VM* vm, int new_frame_count);
+// Reserve a frame's spill slots on the parallel spill stack; see CallFrame.spill_base.
+int reserveSpillSlots(VM* vm, int count);
 void protectLocalRefsInValue(VM* vm, Value value, Value* frame_start);
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value);

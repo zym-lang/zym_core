@@ -219,6 +219,14 @@ static void markRoots(VM* vm) {
     }
     markValue(vm, vm->on_preempt_callback);
 
+    // Spilled locals. They live on a parallel stack rather than in the frames'
+    // register windows, so the value-stack walk above does not reach them --
+    // without this a spilled local is invisible to the collector and is freed
+    // while the function that owns it is still running.
+    for (int i = 0; i < vm->spill_top; i++) {
+        markValue(vm, vm->spill_stack[i]);
+    }
+
     // Every live preemption entry's callback. The table is the only thing
     // referring to a handler registered as an anonymous closure -- nothing on
     // the stack, in globals, or in a frame holds it once the registering

@@ -365,7 +365,7 @@ static ZymValue preempt_shield(ZymVM* vm, ZymValue ctx, ZymValue fn) {
         return ZYM_ERROR;
     }
 
-    int needed_top = callee_slot + function->max_regs + function->spill_count;
+    int needed_top = callee_slot + function->max_regs;
     if (!growStackForCall(vm, needed_top, NULL)) {
         zym_runtimeError(vm, "Preempt.shield: stack overflow.");
         return ZYM_ERROR;
@@ -377,6 +377,7 @@ static ZymValue preempt_shield(ZymVM* vm, ZymValue ctx, ZymValue fn) {
     frame->closure      = closure;
     frame->ip           = vm->ip;
     frame->stack_base   = callee_slot;
+    frame->spill_base   = reserveSpillSlots(vm, function->spill_count);
     frame->caller_chunk = vm->chunk;
     frame->flags        = FRAME_FLAG_DISABLE_PREEMPT;
     frame->arg_count    = 0;
