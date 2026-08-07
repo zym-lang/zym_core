@@ -623,12 +623,52 @@ static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
 
 // --- Cold preemption handler: outlined from DISPATCH to reduce I-cache pressure ---
 __attribute__((noinline, cold))
+// Index of the innermost host call boundary, or -1 if there is none.
+//
+// A boundary frame exists only when native C code re-entered the VM, so its
+// presence is exactly equivalent to "there is a live C frame between the host
+// and here". Walked only on the paths that are about to hand control back;
+// the common case -- nothing fired, or a callback pushed -- never calls this.
+static int preemptBoundaryFrame(const VM* vm) {
+    for (int i = 0; i < vm->frame_count; i++) {
+        if (vm->frames[i].flags & FRAME_FLAG_API_BOUNDARY) return i;
+    }
+    return -1;
+}
+
+// A suspension cannot cross a host call boundary. Handing the status back
+// means unwinding the native's C frame, and resuming means rebuilding it --
+// there is no protocol for either, and pretending otherwise leaves the VM
+// reporting `resumable` while a resume would run into a caller that no longer
+// exists. Terminate instead: an error already travels out through the status
+// returns natives are written to handle.
+//
+// Note this only bites on the paths that hand control back. Preemption itself
+// is fine underneath a native: a callback frame is pushed, it runs, and the
+// dispatch loop continues with the C frame untouched below it.
+__attribute__((noinline, cold))
+static InterpretResult preemptBoundaryError(VM* vm, int boundary, const char* what) {
+    ObjClosure*  cl = vm->frames[boundary].closure;
+    ObjFunction* fn = (cl != NULL) ? cl->function : NULL;
+    runtimeError(vm,
+        "%s cannot suspend across a host call: '%.*s' was called from native "
+        "code, and that native's frame can be neither suspended nor resumed. "
+        "The VM is terminated instead. Bound the script before entering the "
+        "native, or have it not call back into the VM.",
+        what,
+        fn && fn->name ? fn->name->length : 6,
+        fn && fn->name ? fn->name->chars  : "<anon>");
+    return INTERPRET_RUNTIME_ERROR;
+}
+
 static InterpretResult handlePreemption(VM* vm) {
     // 1. HARD STOP -- checked before any masking, and never cleared here.
     //    A shield, an in-flight callback, or an empty table cannot suppress
     //    it, which is what makes it a guarantee rather than a request. The
     //    host clears it via preemptClearStop().
     if (vm->stop_requested) {
+        int b = preemptBoundaryFrame(vm);
+        if (b >= 0) return preemptBoundaryError(vm, b, "a host stop");
         vm->vm_cause = ZYM_CAUSE_HOST_STOP;
         return INTERPRET_SUSPENDED;
     }
@@ -639,6 +679,8 @@ static InterpretResult handlePreemption(VM* vm) {
     //     until the host decides what to do. Ranked below the hard stop
     //     because a stop is the host demanding termination outright.
     if (vm->oom_pending) {
+        int b = preemptBoundaryFrame(vm);
+        if (b >= 0) return preemptBoundaryError(vm, b, "the memory ceiling");
         vm->vm_cause = ZYM_CAUSE_MEMORY_LIMIT;
         return INTERPRET_SUSPENDED;
     }
@@ -692,6 +734,10 @@ static InterpretResult handlePreemption(VM* vm) {
             vm->vm_cause         = ZYM_CAUSE_PREEMPT;
             vm->cause_preempt_id = fired[i]->id;
             preemptArm(vm);
+            {
+                int b = preemptBoundaryFrame(vm);
+                if (b >= 0) return preemptBoundaryError(vm, b, "a watchdog");
+            }
             return INTERPRET_SUSPENDED;
         }
     }
@@ -735,6 +781,10 @@ static InterpretResult handlePreemption(VM* vm) {
     vm->vm_cause         = ZYM_CAUSE_PREEMPT_BLOCKED;
     vm->cause_preempt_id = target->id;
     preemptArm(vm);
+    {
+        int b = preemptBoundaryFrame(vm);
+        if (b >= 0) return preemptBoundaryError(vm, b, "an unservable preempt callback");
+    }
     return INTERPRET_SUSPENDED;
 }
 
@@ -919,8 +969,12 @@ static InterpretResult run(VM* vm) {
         STORE_STATE(); \
         InterpretResult _pr = handlePreemption(vm); \
         /* A suspension must propagate out of the loop; falling through would
-           let a stop, a watchdog, or the memory ceiling be ignored. */ \
-        if (_pr == INTERPRET_SUSPENDED) return _pr; \
+           let a stop, a watchdog, or the memory ceiling be ignored. Anything
+           that is not OK propagates -- handlePreemption also reports a
+           runtime error when a suspension would have to cross a host call
+           boundary, and falling through there would resume the very script
+           the stop was meant to end. */ \
+        if (_pr != INTERPRET_OK) return _pr; \
         LOAD_STATE(); \
     } \
     instr = *ip++; \

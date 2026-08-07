@@ -69,6 +69,28 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
     uint32_t* preempt_saved_ip = NULL;
     Chunk* preempt_saved_chunk = NULL;
     for (int i = prompt_frame; i < vm->frame_count; i++) {
+        // A host call boundary cannot be part of a continuation. The frames
+        // above it only exist because native C code re-entered the VM, and
+        // that C frame is not ours to save: resuming would have to return
+        // through a caller whose stack has long since unwound. Natives are
+        // atomic with respect to capture, and this is where that is enforced.
+        //
+        // Checked before the preempt case and in frame order on purpose. A
+        // preempt frame truncates the capture, so a boundary *above* one is
+        // outside the captured range and is none of our business -- only a
+        // boundary we would actually have copied is an error.
+        if (vm->frames[i].flags & FRAME_FLAG_API_BOUNDARY) {
+            ObjClosure* cl = vm->frames[i].closure;
+            ObjFunction* fn = (cl != NULL) ? cl->function : NULL;
+            runtimeError(vm,
+                "Cannot capture: a continuation cannot span a host call. "
+                "'%.*s' was called from native code, and that native's frame "
+                "cannot be captured or resumed. Capture before entering the "
+                "native, or have it not call back into the VM.",
+                fn && fn->name ? fn->name->length : 6,
+                fn && fn->name ? fn->name->chars  : "<anon>");
+            return NULL;
+        }
         if (vm->frames[i].flags & FRAME_FLAG_PREEMPT) {
             capture_frame_count = i - prompt_frame;
             capture_stack_top = vm->frames[i].stack_base;
