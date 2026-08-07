@@ -1530,7 +1530,9 @@ static bool is_tco_compile_time_safe(Compiler* compiler, Token* name, int arg_co
     return false;
 }
 
-static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local);
+// Returns false when it found nothing to dispatch and therefore emitted
+// NOTHING -- callers must not treat that as a loaded callee.
+static bool emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local);
 
 static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, int call_base, int line) {
     int reg = -1;
@@ -1555,8 +1557,10 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
     }
     // 1b. No exact local match, but local has variadic — needs dispatcher
     if (reg == -1 && has_any_hoisted_local(compiler, name) && has_variadic_hoisted_local(compiler, name)) {
-        emit_dispatcher(compiler, name, call_base, line, true);
-        return;
+        // Fall through to normal resolution if there was nothing to dispatch:
+        // returning here would claim a callee had been loaded when no
+        // instruction was emitted at all.
+        if (emit_dispatcher(compiler, name, call_base, line, true)) return;
     }
 
     // 2. Check if it's a hoisted global function with this arity (before falling back to plain local)
@@ -1567,8 +1571,7 @@ static void compile_tco_callee(Compiler* compiler, Token* name, int arg_count, i
     // 2b. No exact global match but has variadic global — needs dispatcher
     else if (reg == -1 && has_any_hoisted_global(compiler, name) && has_variadic_hoisted_global(compiler, name)
              && !is_hoisted_global(compiler, name, arg_count)) {
-        emit_dispatcher(compiler, name, call_base, line, false);
-        return;
+        if (emit_dispatcher(compiler, name, call_base, line, false)) return;
     }
     // Fall back to plain locals or a single "<base>@digits" block-local
     else if (reg == -1) {
@@ -1684,22 +1687,39 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     }
 
     // For self-calls, we don't need to load the callee - the VM will get it from the frame
+    // Does any argument read this function's own name? That name resolves
+    // through R0, the self-slot, which is also call_base -- so loading the
+    // callee there before evaluating arguments would hand the argument the
+    // callee instead (`func me() { return other(me) }` passed `other` to
+    // itself). Only then is staging needed.
+    //
+    // Staging unconditionally is NOT safe: compile_tco_callee has paths that
+    // deliberately emit nothing because the callee is already sitting in R0,
+    // and those silently produce no load at all when handed a different
+    // target. Keep the direct path as the default and stage only on demand.
+    bool stage_callee = false;
+    if (!is_self_call && compiler->function && compiler->function->name) {
+        Token self_tok = { .start  = compiler->function->name->chars,
+                           .length = compiler->function->name->length,
+                           .line   = line };
+        for (int i = 0; i < arg_count && !stage_callee; i++) {
+            if (expr_reads_name(call_expr->args[i], &self_tok)) stage_callee = true;
+        }
+    }
+
     int callee_temp = -1;
     if (!is_self_call) {
-        // Stage the callee in a temp instead of writing call_base now. call_base
-        // is R0, this function's own self-slot, and an argument may still need to
-        // READ it -- `func me() { return other(me) }` passes `me`, which resolves
-        // through R0. Loading the callee there first meant the argument saw the
-        // callee instead of the enclosing function. Moved into place below, once
-        // every argument has been evaluated, for the same reason the arguments
-        // themselves are staged.
-        callee_temp = reserve_register(compiler);
+        int dest = call_base;
+        if (stage_callee) {
+            callee_temp = reserve_register(compiler);
+            dest = callee_temp;
+        }
         if (callee->type == EXPR_VARIABLE) {
             Token* name = &callee->as.variable.name;
-            compile_tco_callee(compiler, name, arg_count, callee_temp, callee->line);
+            compile_tco_callee(compiler, name, arg_count, dest, callee->line);
         } else {
             // TCO_AGGRESSIVE: Non-variable callee (e.g., arr[0], obj.method, lambda)
-            compile_expression(compiler, callee, callee_temp);
+            compile_expression(compiler, callee, dest);
         }
     } else {
         /* Phase 4.5d scope-aware TAIL_CALL_SELF parity: same rationale as
@@ -1763,7 +1783,7 @@ static bool try_compile_tail_call(Compiler* compiler, Expr* return_expr, int lin
     return true;
 }
 
-static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local) {
+static bool emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int line, bool is_local) {
     int overload_regs[MAX_OVERLOADS];
     int overload_count = 0;
     int variadic_reg = -1;
@@ -1883,7 +1903,9 @@ static void emit_dispatcher(Compiler* compiler, Token* name, int target_reg, int
         if (variadic_reg != -1) {
             emit_instruction(compiler, PACK_ABC(SET_VARIADIC_FALLBACK, target_reg, variadic_reg, variadic_min_arity), line);
         }
+        return true;
     }
+    return false;
 }
 
 static bool resolve_and_load_function(Compiler* compiler, Token* name, int arg_count, int target_reg, int line) {
