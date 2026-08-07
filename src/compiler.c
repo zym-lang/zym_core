@@ -2639,16 +2639,29 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
 
             bool can_optimize = true;
 
-            // Special case: for zero-argument calls (call_slots_needed == 1), the only slot
-            // used is target_reg itself. If target_reg is a local, we're assigning to it anyway,
-            // so overwriting it with the callee and then the result is safe.
-            bool is_zero_arg_local_target = (arg_count == 0 && is_local_reg(compiler, target_reg));
+            // There used to be an exception here: a zero-argument call whose target is a
+            // local skipped both checks below, on the reasoning that call_slots_needed == 1
+            // so "the only slot used is target_reg itself".
+            //
+            // That reasoning is wrong, and it is worth stating why so it is not
+            // reintroduced. `call_slots_needed` is the caller-visible operand window --
+            // callee plus arguments -- not the call's footprint. The callee's whole
+            // activation record is based at call_base: OP(CALL) sets
+            // `frame->stack_base = callee_slot` and reserves
+            // `callee_slot + max_regs + spill_count`. That width belongs to the callee and
+            // is not knowable here, so basing a call at a register that has anything live
+            // above it lets the callee's own locals overwrite the caller's.
+            //
+            // It was reachable from ordinary code: `acc = f()` where any local or temp was
+            // allocated after `acc` silently corrupted them. `existing = zeroArgCall()` is
+            // exactly the shape a method chain in a loop produces.
+            //
+            // The two checks below are the whole safety condition. Keep them unconditional.
 
             // Check 1: target_reg must be >= next_register_before_args (outside the local region)
             // We allow target_reg == next_register_before_args because it's at the boundary
             // We also allow target_reg == next_register_before_args - 1 if it's a temporary (not a local)
-            // Exception: zero-arg calls to a local target are always safe (only 1 slot used)
-            if (!is_zero_arg_local_target && target_reg < next_register_before_args) {
+            if (target_reg < next_register_before_args) {
                 if (target_reg != next_register_before_args - 1 || is_local_reg(compiler, target_reg)) {
                     can_optimize = false;
                     #ifdef DEBUG_CALL_OPT
@@ -2659,8 +2672,10 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
             }
 
             // Check 2: Verify no local variable uses any register in [target_reg, target_reg + call_slots_needed)
-            // For zero-arg calls targeting a local, skip this check (only the target slot is used)
-            if (can_optimize && !is_zero_arg_local_target) {
+            // Note this window is narrower than the callee's actual frame, so it is a
+            // secondary net only -- Check 1 is what makes the base sound, by requiring
+            // nothing live at or above target_reg in the first place.
+            if (can_optimize) {
                 for (int i = 0; i < compiler->local_count; i++) {
                     int local_reg = compiler->locals[i].reg;
                     if (local_reg >= target_reg && local_reg < target_reg + call_slots_needed) {
