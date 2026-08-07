@@ -566,6 +566,34 @@ bool zym_hasAnyFunction(ZymVM* vm, const char* funcName);
 // This is the question users actually want answered when guarding a call.
 bool zym_canCallWith(ZymVM* vm, const char* funcName, int argc);
 
+// ---- Calling into the VM ---------------------------------------------------
+//
+// READ THIS BEFORE CALLING IN FROM A NATIVE. These entry points are re-entrant
+// -- a native may call back into the same VM -- but re-entrancy is not free,
+// and three properties are the caller's responsibility, not the VM's:
+//
+// 1. NATIVES ARE ATOMIC WITH RESPECT TO SUSPENSION AND CAPTURE. While your C
+//    frame is live, the VM cannot suspend out past it and a continuation
+//    cannot be captured across it: doing either would mean slicing the C
+//    stack, and there is no protocol for a native to be unwound and rebuilt.
+//    Script that runs underneath your frame is still fully preemptible in
+//    place -- a preempt callback fires, runs, and execution continues -- but
+//    anything that has to hand control back to the host cannot cross you.
+//    If your API re-enters the VM, say so in its documentation. Callers who
+//    capture or arm a watchdog across it need to know it is not a plain call.
+//
+// 2. A FAILED VM STAYS FAILED. Calling in while `zym_vmState()` is
+//    ZYM_STATE_FAILED is permitted -- a teardown or a diagnostic is a fair
+//    reason -- and a call that succeeds does NOT clear the failure. The state
+//    and cause you observed before the call are still there afterwards. Check
+//    the state before deciding the VM is healthy; a successful call is not
+//    evidence of one.
+//
+// 3. A SUSPENSION SURVIVES YOUR CALL. Calling into a VM parked on a preemption
+//    or a stop is the supported way to run an event pump, and the parked run
+//    is restored when your call returns. What you must not do is start a
+//    nested run or resume from inside a preempt callback.
+//
 // Call a script function with varargs
 // Example: zym_call(vm, "add", 2, zym_newNumber(5), zym_newNumber(3))
 ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...);
@@ -573,7 +601,9 @@ ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...);
 // Call a script function with argument array
 ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv);
 
-// Call a closure directly
+// Call a closure directly. Note this one reports through its return status
+// only -- unlike zym_callv it does not write vm_state/vm_cause at all, so a
+// failure here leaves whatever the VM was last reporting in place.
 ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv);
 
 // Get the result of the last call

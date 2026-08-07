@@ -1237,6 +1237,69 @@ static ZymStatus settle_result(ZymVM* vm, InterpretResult result)
     }
 }
 
+// What the VM was reporting before a nested call, and how to put it back.
+//
+// zym_callv and zym_callClosurev differ only in how the callee is named -- a
+// global lookup versus a closure handed in. Both then run the identical
+// zym_call_execute, so the InterpretResult means the same thing on both paths
+// and must be reported the same way. Capture/settle live here so the two
+// cannot drift apart again.
+typedef struct {
+    ZymVmState   state;
+    ZymVmCause   cause;
+    bool         suspended;
+    ZymPreemptId pid;
+    size_t       wanted;
+} VmReport;
+
+static VmReport report_capture(const VM* vm)
+{
+    VmReport r;
+    r.state     = vm->vm_state;
+    r.cause     = vm->vm_cause;
+    r.suspended = vm->execution_suspended;
+    r.pid       = vm->cause_preempt_id;
+    r.wanted    = vm->cause_bytes_wanted;
+    return r;
+}
+
+// Settle the inner call's result, then hand the VM's *reported* state back to
+// whatever the outer activity was. A nested call is not what the host is
+// observing; it must not overwrite the answer to "what is this VM doing".
+static ZymStatus report_settle(VM* vm, InterpretResult result, VmReport prior)
+{
+    ZymStatus st = settle_result(vm, result);
+    if (st != ZYM_STATUS_OK) return st;
+
+    if (prior.state == ZYM_STATE_RUNNING) {
+        // The outer dispatch loop is still running.
+        vm->vm_state = ZYM_STATE_RUNNING;
+    } else if (prior.suspended) {
+        // Parked on a preemption or a stop. The host is entitled to call into
+        // the VM here -- an event pump handing the script a tick is the whole
+        // point -- so the suspension has to survive the call. Without this the
+        // parked run is silently abandoned and the next zym_resume reports a
+        // runtime error.
+        vm->vm_state            = prior.state;
+        vm->vm_cause            = prior.cause;
+        vm->execution_suspended = prior.suspended;
+        vm->cause_preempt_id    = prior.pid;
+        vm->cause_bytes_wanted  = prior.wanted;
+    } else if (prior.state == ZYM_STATE_FAILED) {
+        // Terminal, and a nested call succeeding does not undo it. The failure
+        // this VM is sitting on was never handled -- settle_result only knows
+        // the inner call went fine, so without this it reports IDLE/NONE and
+        // the host is told a run finished cleanly when it died. Calling into a
+        // failed VM is the caller's business (a teardown or a diagnostic is
+        // legitimate); laundering the state out from under them is not.
+        vm->vm_state           = prior.state;
+        vm->vm_cause           = prior.cause;
+        vm->cause_preempt_id   = prior.pid;
+        vm->cause_bytes_wanted = prior.wanted;
+    }
+    return st;
+}
+
 // A suspension the caller may transparently continue past. Only an unservable
 // preempt callback qualifies: the entry was rearmed before we gave up on it, so
 // resuming makes progress and the condition usually clears itself once the
@@ -2534,34 +2597,11 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     // chunk, frames, and cur_base, so the outer activity survives; only the
     // *reported* state would otherwise be overwritten by the inner call's
     // completion. Snapshot it and put it back.
-    ZymVmState   prior_state     = vm->vm_state;
-    ZymVmCause   prior_cause     = vm->vm_cause;
-    bool         prior_suspended = vm->execution_suspended;
-    ZymPreemptId prior_pid       = vm->cause_preempt_id;
-    size_t       prior_wanted    = vm->cause_bytes_wanted;
+    VmReport prior = report_capture(vm);
 
     InterpretResult result = zym_call_execute(vm, argc);
     ZYM_OOM_GUARD_END(vm);
-    ZymStatus st = settle_result(vm, result);
-
-    if (st == ZYM_STATUS_OK) {
-        if (prior_state == ZYM_STATE_RUNNING) {
-            // The outer dispatch loop is still running.
-            vm->vm_state = ZYM_STATE_RUNNING;
-        } else if (prior_suspended) {
-            // Parked on a preemption or a stop. The host is entitled to call
-            // into the VM here -- an event pump handing the script a tick is
-            // the whole point -- so the suspension has to survive the call.
-            // Without this the parked run is silently abandoned and the next
-            // zym_resume reports a runtime error.
-            vm->vm_state           = prior_state;
-            vm->vm_cause           = prior_cause;
-            vm->execution_suspended = prior_suspended;
-            vm->cause_preempt_id   = prior_pid;
-            vm->cause_bytes_wanted = prior_wanted;
-        }
-    }
-    return st;
+    return report_settle(vm, result, prior);
 }
 
 ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
@@ -2588,11 +2628,17 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     // (the symptom: a script local that was a map becomes null between
     // two adjacent statements). Conservatively reserve up through the
     // current frame's `stack_base + max_regs` instead.
+    // max_regs + spill_count, matching zym_call_prepare and every other
+    // frame-push site. Omitting the spill area lets this frame land inside a
+    // caller's spilled locals -- the same defect fixed in withPrompt/shift,
+    // and it bites hardest right here, since this is the function reentrant
+    // natives call back through.
     int frame_base = vm->stack_top;
     if (vm->current_frame && vm->current_frame->closure &&
         vm->current_frame->closure->function) {
         int caller_top = vm->current_frame->stack_base +
-                         vm->current_frame->closure->function->max_regs;
+                         vm->current_frame->closure->function->max_regs +
+                         vm->current_frame->closure->function->spill_count;
         if (caller_top > frame_base) frame_base = caller_top;
     }
     // Also walk all active frames to find the highest live slot, in case
@@ -2600,7 +2646,8 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
     for (int fi = 0; fi < vm->frame_count; fi++) {
         CallFrame* f = &vm->frames[fi];
         if (f->closure && f->closure->function) {
-            int ftop = f->stack_base + f->closure->function->max_regs;
+            int ftop = f->stack_base + f->closure->function->max_regs
+                                     + f->closure->function->spill_count;
             if (ftop > frame_base) frame_base = ftop;
         }
     }
@@ -2659,6 +2706,11 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
             vm->stack_top = saved_stack_top;
         }
     });
+    // Same nesting concern as zym_callv, and more acute: this is the entry
+    // point reentrant natives call back through, so the outer activity is
+    // almost always something the host is still observing.
+    VmReport prior = report_capture(vm);
+
     InterpretResult result = zym_call_execute(vm, argc);
     ZYM_OOM_GUARD_END(vm);
     // zym_call_execute leaves the result at stack[frame_base] and sets
@@ -2717,12 +2769,7 @@ ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv
         vm->stack_top = saved_stack_top;
     }
 
-    switch (result) {
-        case INTERPRET_OK: return ZYM_STATUS_OK;
-        case INTERPRET_RUNTIME_ERROR: return ZYM_STATUS_RUNTIME_ERROR;
-        case INTERPRET_SUSPENDED: return ZYM_STATUS_SUSPENDED;
-        default: return ZYM_STATUS_RUNTIME_ERROR;
-    }
+    return report_settle(vm, result, prior);
 }
 
 ZymStatus zym_call(ZymVM* vm, const char* funcName, int argc, ...) {
