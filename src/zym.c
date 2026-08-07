@@ -2528,14 +2528,38 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     vm->api_stack_top += argc;
 
     ZYM_OOM_GUARD_BEGIN(vm, {});
-    ZymVmState prior = vm->vm_state;
+    // A call can be nested inside something the VM is already doing: a native
+    // re-entering while the dispatch loop runs, or the host calling a script
+    // function while parked on a preemption. zym_call_execute restores ip,
+    // chunk, frames, and cur_base, so the outer activity survives; only the
+    // *reported* state would otherwise be overwritten by the inner call's
+    // completion. Snapshot it and put it back.
+    ZymVmState   prior_state     = vm->vm_state;
+    ZymVmCause   prior_cause     = vm->vm_cause;
+    bool         prior_suspended = vm->execution_suspended;
+    ZymPreemptId prior_pid       = vm->cause_preempt_id;
+    size_t       prior_wanted    = vm->cause_bytes_wanted;
+
     InterpretResult result = zym_call_execute(vm, argc);
     ZYM_OOM_GUARD_END(vm);
     ZymStatus st = settle_result(vm, result);
-    // Re-entrant call from a native: the outer dispatch loop is still running,
-    // so an inner completion must not report the VM as idle.
-    if (st == ZYM_STATUS_OK && prior == ZYM_STATE_RUNNING) {
-        vm->vm_state = ZYM_STATE_RUNNING;
+
+    if (st == ZYM_STATUS_OK) {
+        if (prior_state == ZYM_STATE_RUNNING) {
+            // The outer dispatch loop is still running.
+            vm->vm_state = ZYM_STATE_RUNNING;
+        } else if (prior_suspended) {
+            // Parked on a preemption or a stop. The host is entitled to call
+            // into the VM here -- an event pump handing the script a tick is
+            // the whole point -- so the suspension has to survive the call.
+            // Without this the parked run is silently abandoned and the next
+            // zym_resume reports a runtime error.
+            vm->vm_state           = prior_state;
+            vm->vm_cause           = prior_cause;
+            vm->execution_suspended = prior_suspended;
+            vm->cause_preempt_id   = prior_pid;
+            vm->cause_bytes_wanted = prior_wanted;
+        }
     }
     return st;
 }

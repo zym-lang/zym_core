@@ -3957,7 +3957,26 @@ bool zym_call_prepare(VM* vm, const char* functionName, int arity) {
     }
 
     // Reset the API stack and place the function at the base.
-    vm->api_stack_top = 0;
+    // Place the call above every live register window rather than at slot 0.
+    // Slot 0 is only safe when nothing else is on the stack; if the VM is
+    // mid-execution (a native calling back by name) or parked on a preemption
+    // (a host pumping an event into the script), slot 0 sits inside the
+    // caller's live registers and the call silently corrupts its locals.
+    // zym_callClosurev already computes this for the by-value path; the
+    // by-name path needs the same. Spill slots count: they live above
+    // max_regs and are just as live.
+    int api_base = vm->stack_top;
+    for (int fi = 0; fi < vm->frame_count; fi++) {
+        CallFrame* f = &vm->frames[fi];
+        if (f->closure && f->closure->function) {
+            int ftop = f->stack_base + f->closure->function->max_regs
+                                     + f->closure->function->spill_count;
+            if (ftop > api_base) api_base = ftop;
+        }
+    }
+    if (!growStackForCall(vm, api_base + 1 + arity, NULL)) return false;
+
+    vm->api_stack_top = api_base;
     vm->stack[vm->api_stack_top] = func_val;
     return true;
 }
