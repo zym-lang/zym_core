@@ -453,23 +453,98 @@ void closeUpvalues(VM* vm, Value* last) {
     #undef MAX_CLOSING_UPVALUES
 }
 
+// --- Preempt/shield bookkeeping owned by a CallFrame ------------------------
+//
+// Two frame flags mean "this frame is holding a mask open":
+//
+//   FRAME_FLAG_PREEMPT          the frame IS a preempt callback; its entry is
+//                               marked in_flight so it cannot re-enter itself.
+//   FRAME_FLAG_DISABLE_PREEMPT  the frame is a Preempt.shield(...) body; it
+//                               owns one level of vm->preempt_shield_depth.
+//
+// EVERY path that pops such a frame must release what it holds and then
+// re-arm, because preemptArm() skips masked entries: while the mask was up the
+// shared countdown was computed from whatever remained (INT32_MAX when nothing
+// else was live), so clearing the guard without recomputing leaves that value
+// in place forever. The entry then never fires again even though its own
+// `remaining` still looks healthy, and a shield permanently retires every
+// maskable entry it suppressed.
+//
+// This used to be open-coded at each pop site, and the two native tail-return
+// fast paths in OP(TAIL_CALL) silently omitted it. Route every pop through
+// these two helpers instead so a future pop site cannot repeat that.
+//
+// NOTE (@tco aggressive): TAIL_CALL to a *script* closure deliberately does NOT
+// release these -- it reuses the frame and keeps its flags/preempt_id so the
+// eventual RET performs one release for the whole tail chain. Only paths that
+// actually pop belong here.
+#define FRAME_PREEMPT_GUARD_FLAGS (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)
+
+// True when `frame` holds a mask. Callers gate on this so the overwhelmingly
+// common frame (neither flag) pays one AND + predicted-not-taken branch and
+// never leaves the caller's straight-line code.
+static inline bool frameHoldsPreemptGuard(const CallFrame* frame) {
+    return (frame->flags & FRAME_PREEMPT_GUARD_FLAGS) != 0;
+}
+
+// Release the guards `frame` holds, WITHOUT re-arming. Only for callers that
+// pop a run of frames and arm once at the end (unwindFrames).
+static void frameClearPreemptGuards(VM* vm, const CallFrame* frame) {
+    if (frame->flags & FRAME_FLAG_PREEMPT) {
+        // Release this entry's structural guard so it can fire again.
+        for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
+            PreemptEntry* e = &vm->preempt_table[i];
+            if (e->slice != 0 && e->id == frame->preempt_id) {
+                e->in_flight = false;
+                break;
+            }
+        }
+    }
+    if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
+        if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
+    }
+}
+
+// Release the guards `frame` holds and recompute the countdown. This is the
+// whole obligation of popping a guard-holding frame; call it from every single
+// pop site, gated on frameHoldsPreemptGuard().
+//
+// Marked cold+noinline on purpose: the interpreter's return paths are hot, this
+// body is not, and outlining keeps it out of their I-cache footprint.
+__attribute__((noinline, cold))
+static void frameReleasePreemptGuards(VM* vm, const CallFrame* frame) {
+    frameClearPreemptGuards(vm, frame);
+    preemptArm(vm);
+}
+
+// Pop-site one-liner. `vm` is in scope at every call site.
+#define RELEASE_FRAME_PREEMPT_GUARDS(frame)                       \
+    do {                                                          \
+        if (__builtin_expect(frameHoldsPreemptGuard(frame), 0)) { \
+            frameReleasePreemptGuards(vm, (frame));               \
+        }                                                         \
+    } while (0)
+
 void unwindFrames(VM* vm, int new_frame_count) {
+    bool unmasked_something = false;
     while (vm->frame_count > new_frame_count) {
         CallFrame* frame = &vm->frames[--vm->frame_count];
         vm->spill_top = frame->spill_base;   // release this frame's spills
-        if (frame->flags & FRAME_FLAG_PREEMPT) {
-            // Release this entry's structural guard so it can fire again.
-            for (int i = 0; i < ZYM_PREEMPT_MAX_ENTRIES; i++) {
-                PreemptEntry* e = &vm->preempt_table[i];
-                if (e->slice != 0 && e->id == frame->preempt_id) {
-                    e->in_flight = false;
-                    break;
-                }
-            }
+        if (__builtin_expect(frameHoldsPreemptGuard(frame), 0)) {
+            frameClearPreemptGuards(vm, frame);
+            unmasked_something = true;
         }
-        if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
-            if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
-        }
+    }
+    if (__builtin_expect(unmasked_something, 0)) {
+        // Arm once for the whole run rather than per frame (see the note above
+        // frameClearPreemptGuards for why arming is mandatory at all).
+        //
+        // Doing it here rather than at the three continuation.c call sites
+        // (capture / abort / shift) is deliberate: every non-local exit funnels
+        // through this function, and any future one inherits the fix. Guarded
+        // on a flag so an ordinary unwind -- no preempt frame, no shield --
+        // pays nothing but the branch, and nothing is added to the dispatch loop.
+        preemptArm(vm);
     }
     vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
     vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
@@ -2908,6 +2983,11 @@ static InterpretResult run(VM* vm) {
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
             RELOAD_SP();  // returning to caller frame: recompute spill base
 
+            // This pops a frame, so it owes the same guard release OP(RET)
+            // performs. (Tail-calling a *script* closure above does not -- it
+            // reuses the frame and keeps its flags for the eventual RET.)
+            RELEASE_FRAME_PREEMPT_GUARDS(frame);
+
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
                     WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
@@ -2998,6 +3078,9 @@ static InterpretResult run(VM* vm) {
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
             RELOAD_SP();  // returning to caller frame: recompute spill base
+
+            // Same obligation as the native tail-return path above.
+            RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
             if (__builtin_expect(vm->active_boundaries > 0, 0)) {
                 if (vm->with_prompt_depth > 0) {
@@ -3116,21 +3199,7 @@ static InterpretResult run(VM* vm) {
             base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
             vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
-            if (frame->flags & FRAME_FLAG_PREEMPT) {
-                for (int pi = 0; pi < ZYM_PREEMPT_MAX_ENTRIES; pi++) {
-                    PreemptEntry* pe = &vm->preempt_table[pi];
-                    if (pe->slice != 0 && pe->id == frame->preempt_id) {
-                        pe->in_flight = false;
-                        break;
-                    }
-                }
-            }
-            if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
-                if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
-            }
-            if ((frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) != 0) {
-                preemptArm(vm);   // see the matching note on the normal RET path
-            }
+            RELEASE_FRAME_PREEMPT_GUARDS(frame);
             STORE_STATE();
             return INTERPRET_OK;
         }
@@ -3143,28 +3212,7 @@ static InterpretResult run(VM* vm) {
         vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
         RELOAD_SP();  // returning to caller frame: recompute spill base
 
-        if (frame->flags & FRAME_FLAG_PREEMPT) {
-            for (int pi = 0; pi < ZYM_PREEMPT_MAX_ENTRIES; pi++) {
-                PreemptEntry* pe = &vm->preempt_table[pi];
-                if (pe->slice != 0 && pe->id == frame->preempt_id) {
-                    pe->in_flight = false;
-                    break;
-                }
-            }
-        }
-        if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
-            if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
-        }
-        if (__builtin_expect(
-                (frame->flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) != 0, 0)) {
-            // Re-arm now that something is unmasked again. preemptArm skips
-            // masked entries, so while the callback ran (or the shield was up)
-            // the counter was armed from whatever remained -- INT32_MAX when
-            // nothing else was live. Without this the counter keeps that value
-            // forever: a rearming entry fires exactly once, and a shield
-            // permanently retires every maskable entry it suppressed.
-            preemptArm(vm);
-        }
+        RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
         // Single check for any active boundary (withPrompt or resume)
         if (__builtin_expect(vm->active_boundaries > 0, 0)) {

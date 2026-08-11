@@ -19,6 +19,7 @@ typedef struct Table {
 typedef struct ObjPromptTag ObjPromptTag;
 typedef struct ObjContinuation ObjContinuation;
 typedef struct CallFrame CallFrame;
+typedef struct PromptEntry PromptEntry;
 
 #define isObjType(value, objectType) (IS_OBJ(value) && AS_OBJ(value)->type == objectType)
 #define OBJ_TYPE(value)     (AS_OBJ(value)->type)
@@ -234,6 +235,41 @@ typedef struct ObjContinuation {
     Value* stack;
     int stack_size;
     int stack_base_offset;
+    // Snapshot of the captured frames' spilled locals, and the vm->spill_stack
+    // offset it was taken from. Spilled locals do not live in the value stack
+    // (see CallFrame.spill_base), so copying `stack` does not carry them: the
+    // frames memcpy above brings each frame's spill_base along as a raw
+    // integer, which means nothing once vm->spill_top has moved on. Without
+    // this the resumed frame and the next callee pushed above it are handed the
+    // same spill offsets, and nothing roots the values in the meantime.
+    //
+    // The extent is [frames[prompt_frame].spill_base, top-of-captured-range),
+    // rebased on resume exactly as `stack` is rebased through
+    // stack_base_offset. Freed with the other two buffers at resume and in
+    // freeObject; marked alongside `stack` in blackenObject.
+    Value* spill;
+    int spill_size;
+    int spill_base_offset;
+    // Prompts that were live INSIDE the captured extent, i.e. everything the
+    // capture's own prompt entry delimits from below. They are as much a part
+    // of the extent as its frames: resuming puts the body back dynamically
+    // inside `withPrompt(INNER, ...)`, so the INNER bookmark has to come back
+    // with it or the resumed code cannot name a prompt it is demonstrably
+    // standing in.
+    //
+    // Entries hold absolute frame/stack indices, meaningless once the VM has
+    // moved on, so they are rebased on restore exactly as the frames are --
+    // frame_index through `frame_base_offset`, stack_base through
+    // `stack_base_offset`. The delimiting prompt itself is NOT in here: a
+    // captured continuation is undelimited until somebody wraps it again.
+    PromptEntry* prompts;
+    int prompt_count;
+    // Absolute frame index the captured frames started at (the delimiting
+    // prompt's frame_index). The frame counterpart of stack_base_offset /
+    // spill_base_offset: restored frame_index = vm->frame_count + (saved -
+    // this). Needed even when frame_count is 0, so it is stored rather than
+    // derived from frames[0].
+    int frame_base_offset;
     uint32_t* saved_ip;
     Chunk* saved_chunk;
     // The ObjFunction whose embedded chunk `saved_chunk` is, or NULL when the

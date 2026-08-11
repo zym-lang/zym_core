@@ -582,6 +582,26 @@ static void blackenObject(VM* vm, Obj* object) {
             for (int i = 0; i < cont->stack_size; i++) {
                 markValue(vm, cont->stack[i]);
             }
+
+            // markRoots covers vm->spill_stack[0, spill_top), but a suspended
+            // continuation's slots are above spill_top and its snapshot is not
+            // that array at all -- this is their only root. Without it a
+            // spilled local holding a heap object is freed while the
+            // continuation waits, and the resumed body reads a dangling
+            // pointer.
+            for (int i = 0; i < cont->spill_size; i++) {
+                markValue(vm, cont->spill[i]);
+            }
+
+            // Same argument as the spill snapshot: markRoots walks
+            // vm->prompt_stack[0, prompt_count), and these entries were taken
+            // OFF that stack when the extent was captured. Nothing else names
+            // their tags, and the resumed body is going to abort/shift to them.
+            for (int i = 0; i < cont->prompt_count; i++) {
+                if (cont->prompts[i].tag != NULL) {
+                    markObject(vm, (Obj*)cont->prompts[i].tag);
+                }
+            }
             break;
         }
     }
@@ -743,6 +763,14 @@ void freeObject(VM* vm, Obj* object) {
 
             if (cont->stack != NULL && cont->stack_size > 0) {
                 FREE_ARRAY(vm, Value, cont->stack, cont->stack_size);
+            }
+
+            if (cont->spill != NULL && cont->spill_size > 0) {
+                FREE_ARRAY(vm, Value, cont->spill, cont->spill_size);
+            }
+
+            if (cont->prompts != NULL && cont->prompt_count > 0) {
+                FREE_ARRAY(vm, PromptEntry, cont->prompts, cont->prompt_count);
             }
 
             FREE(vm, ObjContinuation, object);

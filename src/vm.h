@@ -18,7 +18,7 @@
  * These arrays are pre-allocated in the VM struct. Memory usage on 64-bit:
  *
  *   CallFrame:    32 bytes each (closure, ip, stack_base, caller_chunk + padding)
- *   PromptEntry:  16 bytes each (tag, frame_index, stack_base)
+ *   PromptEntry:  24 bytes each (tag, frame_index, stack_base, from_with_prompt + padding)
  *   ResumeContext: 8 bytes each (frame_boundary, result_slot)
  *   PreemptEntry: 24 bytes each (slice, remaining, callback, id, flags + padding)
  *
@@ -26,7 +26,7 @@
  * │   Count     │  8       16      32      64      256            │
  * ├─────────────┼─────────────────────────────────────────────────┤
  * │ FRAMES_MAX  │  0.25 KB 0.5 KB  1 KB    2 KB    8 KB           │
- * │ MAX_PROMPTS │  128 B   256 B   0.5 KB  1 KB    4 KB           │
+ * │ MAX_PROMPTS │  192 B   384 B   768 B   1.5 KB  6 KB           │
  * │ RESUME_DEPTH│  64 B    128 B   256 B   0.5 KB  2 KB           │
  * │ PREEMPT_MAX │  192 B   384 B   768 B   1.5 KB  6 KB           │
  * └─────────────┴─────────────────────────────────────────────────┘
@@ -110,10 +110,22 @@ struct CallFrame {
 };
 typedef struct CallFrame CallFrame;
 
-typedef struct {
+typedef struct PromptEntry {
     ObjPromptTag* tag;
     int frame_index;
     int stack_base;
+    // True when Cont.withPrompt pushed this entry, which means it also pushed a
+    // paired with_prompt_stack boundary at the SAME frame index (both are taken
+    // from vm->frame_count before the callee frame goes on). That pairing is
+    // what the RET path relies on to pop the prompt again, and it is the one
+    // thing a raw Cont.pushPrompt does NOT establish.
+    //
+    // Recorded because a continuation snapshots this slice: putting a prompt
+    // back on resume without its boundary would leak the entry (nothing pops
+    // it), and manufacturing a boundary for a manually pushed prompt would pop
+    // one the script still owns. The flag is only ever read on the
+    // capture/resume cold path.
+    bool from_with_prompt;
 } PromptEntry;
 
 typedef struct {

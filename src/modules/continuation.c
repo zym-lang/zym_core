@@ -19,12 +19,33 @@ bool pushPrompt(VM* vm, ObjPromptTag* tag) {
     entry->tag = tag;
     entry->frame_index = vm->frame_count;
     entry->stack_base = vm->stack_top;
+    // Cont.withPrompt overwrites this immediately after; every other pusher
+    // (the Cont.pushPrompt native) leaves it false, which is the truth: it
+    // pushes no with_prompt boundary and nothing will auto-pop the entry.
+    entry->from_with_prompt = false;
     return true;
 }
 
 void popPrompt(VM* vm) {
     if (vm->prompt_count > 0) {
         vm->prompt_count--;
+    }
+}
+
+// Discard the matched prompt AND every entry pushed inside its extent.
+//
+// findPrompt scans from the top, so it can legitimately match an OUTER tag
+// through inner prompts. The unwind that follows destroys the frames those
+// inner prompts bookmark, so they are dead either way -- but a single
+// popPrompt() removes only the topmost, i.e. an INNER entry, and leaves the
+// entry we actually matched behind. That survivor is a ghost: still findable,
+// pointing at a frame index and stack base that no longer exist, and holding a
+// MAX_PROMPTS slot forever. Truncating to the matched index is the whole fix,
+// and it is the same fix for capture, abort and shift because all three follow
+// findPrompt with exactly one unwind.
+static void popPromptsThrough(VM* vm, int prompt_index) {
+    if (prompt_index >= 0 && vm->prompt_count > prompt_index) {
+        vm->prompt_count = prompt_index;
     }
 }
 
@@ -62,6 +83,7 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
         return NULL;
     }
 
+    int prompt_index = (int)(prompt - vm->prompt_stack);
     int prompt_frame = prompt->frame_index;
     int capture_frame_count = vm->frame_count - prompt_frame;
     int capture_stack_top = vm->stack_top;
@@ -110,6 +132,52 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
 
     int capture_stack_size = capture_stack_top - capture_stack_base;
 
+    // Spilled locals are not in the window we just measured -- they live on
+    // vm->spill_stack, bump-allocated per frame (see CallFrame.spill_base). The
+    // frames memcpy below brings each frame's spill_base along as a raw
+    // integer, which is meaningless on restore, so the values need a snapshot
+    // of their own.
+    //
+    // The extent is exactly the captured frames' slice. Because the spill stack
+    // is bump-allocated in frame order, the captured frames own
+    // [frames[prompt_frame].spill_base, frames[end_frame].spill_base) -- and
+    // when nothing above them was excluded, the upper bound is vm->spill_top.
+    // Deriving the top from `end_frame` rather than always using spill_top is
+    // what keeps a preempt-truncated capture honest: the frames from the
+    // preempt frame upward are not part of this continuation, and neither are
+    // their spills. It also degenerates correctly when nothing was captured at
+    // all -- end_frame == prompt_frame makes the two bounds the same value.
+    int end_frame = prompt_frame + capture_frame_count;
+    int capture_spill_base = (prompt_frame < vm->frame_count)
+        ? vm->frames[prompt_frame].spill_base
+        : vm->spill_top;
+    int capture_spill_top = (end_frame < vm->frame_count)
+        ? vm->frames[end_frame].spill_base
+        : vm->spill_top;
+    int capture_spill_size = capture_spill_top - capture_spill_base;
+
+    // Prompts that live inside the extent, i.e. everything above the delimiter.
+    // The delimiter itself is excluded on purpose: the captured continuation is
+    // undelimited until somebody re-wraps it, which is what makes
+    // `Cont.resume` splice the body into the CALLER's prompt context rather
+    // than silently reinstating the one it escaped.
+    //
+    // The upper bound is `end_frame`, not vm->prompt_count, for the same reason
+    // the frame and spill slices use it: when a preempt frame truncates the
+    // capture, prompts pushed by that callback are above the truncation and are
+    // no more part of this continuation than its frames are. Entries are pushed
+    // in frame order, so the qualifying ones are a contiguous run and the scan
+    // can stop at the first that is out of range. `<= end_frame` rather than
+    // `<`: a prompt pushed when frame_count == end_frame belongs to the body of
+    // the last captured frame -- the preempt frame is what sits AT end_frame,
+    // and anything it pushed is at end_frame + 1 or above.
+    int capture_prompt_base = prompt_index + 1;
+    int capture_prompt_count = 0;
+    for (int i = capture_prompt_base; i < vm->prompt_count; i++) {
+        if (vm->prompt_stack[i].frame_index > end_frame) break;
+        capture_prompt_count++;
+    }
+
     closeUpvalues(vm, &vm->stack[capture_stack_base]);
 
     ObjContinuation* cont = newContinuation(vm);
@@ -131,11 +199,38 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
                capture_stack_size * sizeof(Value));
     }
 
+    Value* spill_buf = NULL;
+    if (capture_spill_size > 0) {
+        spill_buf = ALLOCATE(vm, Value, capture_spill_size);
+        for (int i = 0; i < capture_spill_size; i++) spill_buf[i] = NULL_VAL;
+        memcpy(spill_buf, &vm->spill_stack[capture_spill_base],
+               capture_spill_size * sizeof(Value));
+    }
+
+    // Safe to allocate before the entries are handed to `cont`: the tags are
+    // still on vm->prompt_stack (the caller truncates it only after this
+    // returns), and markRoots covers that. From the truncation onward
+    // blackenObject's walk of cont->prompts is their only root.
+    PromptEntry* prompts_buf = NULL;
+    if (capture_prompt_count > 0) {
+        prompts_buf = ALLOCATE(vm, PromptEntry, capture_prompt_count);
+        memcpy(prompts_buf, &vm->prompt_stack[capture_prompt_base],
+               capture_prompt_count * sizeof(PromptEntry));
+    }
+
     cont->frames = frames_buf;
     cont->frame_count = capture_frame_count;
 
     cont->stack = stack_buf;
     cont->stack_size = capture_stack_size;
+
+    cont->spill = spill_buf;
+    cont->spill_size = capture_spill_size;
+    cont->spill_base_offset = capture_spill_base;
+
+    cont->prompts = prompts_buf;
+    cont->prompt_count = capture_prompt_count;
+    cont->frame_base_offset = prompt_frame;
 
     if (preempt_saved_ip != NULL) {
         cont->saved_ip = preempt_saved_ip;
@@ -152,15 +247,63 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
     cont->prompt_tag = tag;
     cont->state = CONT_VALID;
     
-    int saved_depth = vm->preempt_shield_depth;
-    for (int i = capture_frame_count + prompt_frame; i < vm->frame_count; i++) {
-        if (vm->frames[i].flags & (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)) {
-            saved_depth--;
+    // The resumed continuation should run at the shield depth its OWN frames
+    // account for, so subtract the shields owned by the frames we are not
+    // capturing -- everything from the truncating preempt frame upward.
+    //
+    // Only FRAME_FLAG_DISABLE_PREEMPT owns a shield. preemptShieldPush() has
+    // exactly one caller: the point where Preempt.shield pushes such a frame.
+    // Every pop path (both RETs in run() and unwindFrames) decrements for
+    // exactly that same flag, so depth == the number of live DISABLE_PREEMPT
+    // frames, always. FRAME_FLAG_PREEMPT contributes nothing -- a preempt
+    // callback is masked structurally by its entry's in_flight guard, not by
+    // this counter -- so subtracting for one takes away a shield that was never
+    // pushed and drives the saved depth negative. resumeContinuation() installs
+    // the value verbatim, and from -1 the next Preempt.shield only reaches 0:
+    // the script's critical section then runs completely unmasked.
+    //
+    // Because of that 1:1 correspondence the excluded shields are a subset of
+    // the live ones, so this cannot go below zero by construction. The clamp
+    // exists only to stop a future break in that invariant from escaping the
+    // function, and it lives here, at the single place the field is written, so
+    // that every reader -- resumeContinuation included -- can take
+    // `cont->preempt_shield_depth >= 0` for granted rather than each re-testing
+    // it and none of them owning the invariant.
+    // Store what the CAPTURED FRAMES THEMSELVES contribute, not the capturer's
+    // total. The two differ by every shield living below the prompt, which is
+    // the resumer's business and not this continuation's: a continuation may be
+    // resumed anywhere, including inside a shield the capturer never saw.
+    // Recording the total and installing it verbatim made resume overwrite the
+    // resumer's live shields with the capturer's -- the shield frames stayed on
+    // the stack and still decremented on the way out, but the counter they
+    // depend on had been replaced, so a supposedly masked section ran unmasked.
+    // Counting only the captured extent makes the value compositional: resume
+    // adds it to whatever the resumer already has.
+    int shield_delta = 0;
+    for (int i = prompt_frame; i < prompt_frame + capture_frame_count; i++) {
+        if (vm->frames[i].flags & FRAME_FLAG_DISABLE_PREEMPT) {
+            shield_delta++;
         }
     }
-    cont->preempt_shield_depth = saved_depth;
+    cont->preempt_shield_depth = shield_delta;
 
-    cont->return_slot = return_slot + (prompt->stack_base - capture_stack_base);
+    // return_slot is derived from the frame that called Cont.capture. That is
+    // the right slot for an ordinary capture, where resuming re-enters that
+    // call and the resume value is its result.
+    //
+    // It is meaningless for a preempt-truncated capture. There the captured
+    // extent stops BELOW the preempt frame, so the calling frame -- the
+    // callback's -- is not part of what gets restored, and its slot does not
+    // exist in the restored slice. The continuation instead resumes the
+    // interrupted computation at preempt_saved_ip, mid instruction stream,
+    // with no call expression waiting on a value. Writing resume_value
+    // anywhere would land outside the slice (an out-of-bounds stack write) or
+    // clobber a live register of the resumed frame.
+    //
+    // -1 marks that: resume skips the result write entirely.
+    cont->return_slot = (preempt_saved_ip != NULL)
+        ? -1
+        : return_slot + (prompt->stack_base - capture_stack_base);
 
     popTempRoot(vm);
     return cont;
@@ -177,10 +320,39 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         return false;
     }
 
-    int needed_top = vm->stack_top + cont->stack_size;
+    // The resume writes two things into the value stack: the captured slice
+    // (stack_size slots from restore_base) and the resume value, at
+    // restore_base + return_slot. return_slot is NOT bounded by stack_size --
+    // it is the caller's result slot, rebased at capture, and when the prompt
+    // sat at the top of the captured extent it lands just past the slice. So
+    // reserve for whichever reaches further, or the write at result_slot goes
+    // off the end of the allocation. ASAN caught exactly that: an 8-byte write
+    // one Value past a stack still at STACK_INITIAL.
+    int slice_top  = cont->stack_size;
+    int result_top = cont->return_slot + 1;
+    int needed_top = vm->stack_top + (slice_top > result_top ? slice_top : result_top);
 
     if (needed_top > STACK_MAX) {
         runtimeError(vm, "Stack overflow: resuming continuation needs %d slots, max is %d.", needed_top, STACK_MAX);
+        return false;
+    }
+
+    // The extent's own prompts are about to go back on both stacks, so their
+    // capacity is a precondition of the resume exactly like FRAMES_MAX and
+    // STACK_MAX are. Checked up here, with the other preconditions, because
+    // everything below the spill reservation is deliberately infallible.
+    if (vm->prompt_count + cont->prompt_count > MAX_PROMPTS) {
+        runtimeError(vm, "Prompt stack overflow: resuming continuation needs %d prompts, max is %d.",
+                     vm->prompt_count + cont->prompt_count, MAX_PROMPTS);
+        return false;
+    }
+
+    int restore_boundary_count = 0;
+    for (int i = 0; i < cont->prompt_count; i++) {
+        if (cont->prompts[i].from_with_prompt) restore_boundary_count++;
+    }
+    if (vm->with_prompt_depth + restore_boundary_count > MAX_WITH_PROMPT_DEPTH) {
+        runtimeError(vm, "Cont.resume: maximum withPrompt nesting depth exceeded.");
         return false;
     }
 
@@ -192,6 +364,28 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         return false;
     }
 
+    // Put the spilled locals back before anything else moves, so the rest of
+    // the restore can rebase against a base that already exists. Done through
+    // reserveSpillSlots rather than by hand because that is the same path a
+    // frame push takes: it grows the array, NULL-fills the new region, and
+    // bumps spill_top, and the fill matters -- the growth can collect, and the
+    // collector scans the whole live region.
+    //
+    // Placed below the last failure check (growStackForCall) on purpose:
+    // spill_top is VM state and this bump is not undone on the way out, so a
+    // resume that still had a way to bail after it would silently strand slots
+    // for the rest of the run. Nothing from here on can fail.
+    //
+    // The extent is a slice of the array, so the whole restore is one memcpy at
+    // one base -- the per-frame rebase below is arithmetic on spill_base only,
+    // not a second copy.
+    int restore_spill_base = vm->spill_top;
+    if (cont->spill_size > 0) {
+        restore_spill_base = reserveSpillSlots(vm, cont->spill_size);
+        memcpy(&vm->spill_stack[restore_spill_base], cont->spill,
+               cont->spill_size * sizeof(Value));
+    }
+
     cont->state = CONT_CONSUMED;
 
     int restore_base = vm->stack_top;
@@ -201,6 +395,8 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         memcpy(&vm->stack[restore_base], cont->stack, cont->stack_size * sizeof(Value));
     }
     vm->stack_top = restore_base + cont->stack_size;
+
+    int restore_frame_base = vm->frame_count;
 
     for (int i = 0; i < cont->frame_count; i++) {
         CallFrame* src = &cont->frames[i];
@@ -217,17 +413,70 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
 
         int original_offset = src->stack_base - cont->stack_base_offset;
         dst->stack_base = restore_base + original_offset;
+
+        // Same rebase as stack_base, against the spill snapshot's own origin.
+        // Per-frame rather than one shared base: the captured frames sit at
+        // different offsets inside the snapshot, and copying spill_base
+        // verbatim (which is what happened before) hands the resumed frame an
+        // offset the VM has since re-issued to somebody else.
+        dst->spill_base = restore_spill_base + (src->spill_base - cont->spill_base_offset);
     }
     vm->frame_count += cont->frame_count;
     vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
     vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
 
+    // Put the extent's own prompts back, rebased the same way the frames were:
+    // frame_index against restore_frame_base, stack_base against restore_base.
+    // Without this the resumed body stands dynamically inside a withPrompt it
+    // cannot name -- `Cont.capture(INNER)` right after a resume reports "prompt
+    // tag not found" for a prompt that is, by construction, live.
+    //
+    // A restored entry sorts above every live one: restore_frame_base ==
+    // vm->frame_count before the splice, and a live with_prompt boundary is the
+    // index of a frame that already exists, hence strictly smaller. So pushing
+    // in snapshot order keeps both stacks ordered.
+    //
+    // The paired with_prompt boundary is re-pushed for exactly the entries that
+    // had one. unwindFrames dropped those boundaries at capture time -- rightly,
+    // the frames were gone -- and the frames are back now, so the boundary that
+    // pops the prompt on RET has to come back too. Its frame_boundary is the
+    // entry's own frame_index because Cont.withPrompt reads both from the same
+    // vm->frame_count. Skipping this half would swap the lost prompt for a
+    // leaked one.
+    int prompt_frame_delta = restore_frame_base - cont->frame_base_offset;
+    for (int i = 0; i < cont->prompt_count; i++) {
+        PromptEntry* src = &cont->prompts[i];
+        PromptEntry* dst = &vm->prompt_stack[vm->prompt_count++];
+
+        dst->tag = src->tag;
+        dst->frame_index = src->frame_index + prompt_frame_delta;
+        dst->stack_base = restore_base + (src->stack_base - cont->stack_base_offset);
+        dst->from_with_prompt = src->from_with_prompt;
+
+        if (src->from_with_prompt) {
+            vm->with_prompt_stack[vm->with_prompt_depth].frame_boundary = dst->frame_index;
+            vm->with_prompt_depth++;
+            vm->active_boundaries++;
+        }
+    }
+
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
-    vm->preempt_shield_depth = cont->preempt_shield_depth;
+    // Added, not assigned. The field counts only what the captured frames
+    // contribute (captureContinuation is its sole writer and counts DISABLE_
+    // PREEMPT frames inside the captured extent, so it is >= 0 by construction
+    // and needs no clamp here). The resumer's own shields stay live: its frames
+    // are still on the stack below the splice point and will decrement on their
+    // way out, so their depth must survive the resume that runs between.
+    vm->preempt_shield_depth += cont->preempt_shield_depth;
 
-    int result_slot = restore_base + cont->return_slot;
-    vm->stack[result_slot] = resume_value;
+    // -1 means the capture was preempt-truncated: the interrupted computation
+    // resumes mid instruction stream and nothing is waiting on a value. See the
+    // matching note in captureContinuation.
+    if (cont->return_slot >= 0) {
+        int result_slot = restore_base + cont->return_slot;
+        vm->stack[result_slot] = resume_value;
+    }
 
     // The snapshot is dead the instant the state flips to CONT_CONSUMED: the
     // guard at the top makes the continuation permanently unresumable, and
@@ -250,6 +499,18 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
     }
     cont->stack = NULL;
     cont->stack_size = 0;
+
+    if (cont->spill != NULL && cont->spill_size > 0) {
+        FREE_ARRAY(vm, Value, cont->spill, cont->spill_size);
+    }
+    cont->spill = NULL;
+    cont->spill_size = 0;
+
+    if (cont->prompts != NULL && cont->prompt_count > 0) {
+        FREE_ARRAY(vm, PromptEntry, cont->prompts, cont->prompt_count);
+    }
+    cont->prompts = NULL;
+    cont->prompt_count = 0;
 
     return true;
 }
@@ -398,6 +659,9 @@ static ZymValue cont_withPrompt(ZymVM* vm, ZymValue context, ZymValue tag, ZymVa
     if (!pushPrompt(vm, promptTag)) {
         return ZYM_ERROR;
     }
+    // Marks the entry as owning the with_prompt boundary pushed just below, so
+    // a continuation that snapshots this prompt knows to re-push both halves.
+    vm->prompt_stack[vm->prompt_count - 1].from_with_prompt = true;
 
     vm->with_prompt_stack[vm->with_prompt_depth].frame_boundary = vm->frame_count;
     vm->with_prompt_depth++;
@@ -440,6 +704,10 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         zym_runtimeError(vm, "Cont.capture: prompt tag not found.");
         return ZYM_ERROR;
     }
+    // Taken before the unwind, while the stack still holds the entry. Nothing
+    // between here and the pop touches vm->prompt_count, and prompt_stack is a
+    // fixed array, so the pointer and the index stay in step.
+    int prompt_index = (int)(prompt - vm->prompt_stack);
 
     int return_slot = 0;
 
@@ -485,7 +753,7 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
         vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
-    popPrompt(vm);
+    popPromptsThrough(vm, prompt_index);
 
     while (vm->resume_depth > 0 &&
            vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
@@ -589,6 +857,7 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         zym_runtimeError(vm, "Cont.abort: prompt tag not found.");
         return ZYM_ERROR;
     }
+    int prompt_index = (int)(prompt - vm->prompt_stack);
 
     closeUpvalues(vm, &vm->stack[prompt->stack_base]);
 
@@ -616,7 +885,7 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
-    popPrompt(vm);
+    popPromptsThrough(vm, prompt_index);
 
     while (vm->resume_depth > 0 &&
            vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
@@ -676,6 +945,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         zym_runtimeError(vm, "Cont.shift: prompt tag not found.");
         return ZYM_ERROR;
     }
+    int prompt_index = (int)(prompt - vm->prompt_stack);
 
     int return_slot = 0;
     if (vm->chunk != NULL && vm->ip > vm->chunk->code) {
@@ -717,7 +987,7 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
         vm->chunk = frame->caller_chunk ? frame->caller_chunk : &frame->closure->function->chunk;
     }
 
-    popPrompt(vm);
+    popPromptsThrough(vm, prompt_index);
 
     int callee_slot = -1;
     if (vm->chunk != NULL && vm->ip > vm->chunk->code) {

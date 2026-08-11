@@ -231,6 +231,12 @@ ObjContinuation* newContinuation(VM* vm) {
     cont->stack = NULL;
     cont->stack_size = 0;
     cont->stack_base_offset = 0;
+    cont->spill = NULL;
+    cont->spill_size = 0;
+    cont->spill_base_offset = 0;
+    cont->prompts = NULL;
+    cont->prompt_count = 0;
+    cont->frame_base_offset = 0;
     cont->saved_ip = NULL;
     cont->saved_chunk = NULL;
     cont->saved_owner = NULL;
