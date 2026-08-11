@@ -213,6 +213,33 @@ void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
 
+// NOTE: the OOM recovery guard is independent of ZYM_RUNTIME_ONLY and lives here
+// unconditionally: the runtime uses it too, not just the compiler.
+// Arm a recovery boundary for unrecoverable allocation failure, saving whatever
+// was armed before. Nesting matters: a native that re-enters the VM installs its
+// own, so a failure unwinds only as far as that native's call and it returns a
+// status normally, instead of the jump skipping over its C++ frame.
+#define ZYM_OOM_GUARD_BEGIN(vm, on_oom)                                        \
+    jmp_buf _zym_saved_jmp;                                                    \
+    bool _zym_saved_armed = (vm)->oom_jmp_armed;                               \
+    if (_zym_saved_armed) memcpy(&_zym_saved_jmp, &(vm)->oom_jmp, sizeof(jmp_buf)); \
+    if (setjmp((vm)->oom_jmp) != 0) {                                          \
+        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
+        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
+        (vm)->vm_state = ZYM_STATE_FAILED;                                     \
+        (vm)->vm_cause = ZYM_CAUSE_OUT_OF_MEMORY;                              \
+        (vm)->execution_suspended = false;   /* frames are not continuable */   \
+        on_oom;                                                                \
+        return ZYM_STATUS_RUNTIME_ERROR;                                       \
+    }                                                                          \
+    (vm)->oom_jmp_armed = true;
+
+#define ZYM_OOM_GUARD_END(vm)                                                  \
+    do {                                                                       \
+        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
+        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
+    } while (0)
+
 #ifndef ZYM_RUNTIME_ONLY
 // ---- Phase 1.1 / 1.2 / 1.6: SourceFile registry + SourceMap public API ----
 //
@@ -272,30 +299,6 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src)
     return dst;
 }
 
-// Arm a recovery boundary for unrecoverable allocation failure, saving whatever
-// was armed before. Nesting matters: a native that re-enters the VM installs its
-// own, so a failure unwinds only as far as that native's call and it returns a
-// status normally, instead of the jump skipping over its C++ frame.
-#define ZYM_OOM_GUARD_BEGIN(vm, on_oom)                                        \
-    jmp_buf _zym_saved_jmp;                                                    \
-    bool _zym_saved_armed = (vm)->oom_jmp_armed;                               \
-    if (_zym_saved_armed) memcpy(&_zym_saved_jmp, &(vm)->oom_jmp, sizeof(jmp_buf)); \
-    if (setjmp((vm)->oom_jmp) != 0) {                                          \
-        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
-        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
-        (vm)->vm_state = ZYM_STATE_FAILED;                                     \
-        (vm)->vm_cause = ZYM_CAUSE_OUT_OF_MEMORY;                              \
-        (vm)->execution_suspended = false;   /* frames are not continuable */   \
-        on_oom;                                                                \
-        return ZYM_STATUS_RUNTIME_ERROR;                                       \
-    }                                                                          \
-    (vm)->oom_jmp_armed = true;
-
-#define ZYM_OOM_GUARD_END(vm)                                                  \
-    do {                                                                       \
-        if (_zym_saved_armed) memcpy(&(vm)->oom_jmp, &_zym_saved_jmp, sizeof(jmp_buf)); \
-        (vm)->oom_jmp_armed = _zym_saved_armed;                                \
-    } while (0)
 
 ZymStatus zym_preprocess(ZymVM* vm, const char* source,
                          ZymSourceMap* source_map, ZymFileId origin_file_id,
