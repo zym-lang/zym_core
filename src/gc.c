@@ -773,6 +773,12 @@ void freeObject(VM* vm, Obj* object) {
                 FREE_ARRAY(vm, PromptEntry, cont->prompts, cont->prompt_count);
             }
 
+            // No blacken counterpart: a ResumeContext is two ints, so there is
+            // nothing in here for the GC to reach. It still has to be freed.
+            if (cont->resumes != NULL && cont->resume_count > 0) {
+                FREE_ARRAY(vm, ResumeContext, cont->resumes, cont->resume_count);
+            }
+
             FREE(vm, ObjContinuation, object);
             break;
         }

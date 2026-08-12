@@ -20,6 +20,7 @@ typedef struct ObjPromptTag ObjPromptTag;
 typedef struct ObjContinuation ObjContinuation;
 typedef struct CallFrame CallFrame;
 typedef struct PromptEntry PromptEntry;
+typedef struct ResumeContext ResumeContext;
 
 #define isObjType(value, objectType) (IS_OBJ(value) && AS_OBJ(value)->type == objectType)
 #define OBJ_TYPE(value)     (AS_OBJ(value)->type)
@@ -264,6 +265,28 @@ typedef struct ObjContinuation {
     // captured continuation is undelimited until somebody wraps it again.
     PromptEntry* prompts;
     int prompt_count;
+    // Resume boundaries that were live INSIDE the captured extent. A boundary
+    // is the only thing that tells RET where a restored frame's return value
+    // goes: the bottom frame of a splice sits at a stack_base the restore
+    // picked, not at its caller's result register, so the callee-writes-to-its-
+    // own-stack_base convention RET otherwise uses lands the value in a dead
+    // slot. vm->resume_stack carries that mapping while the computation runs.
+    //
+    // A continuation captured across a previous resume contains such a splice
+    // point, and it is as much part of the extent as the frames on either side
+    // of it. Dropping it made the defect invisible until the computation
+    // actually ran to completion -- every re-suspension unwinds through capture
+    // instead of returning, so only the final step exercises the linkage, and
+    // it delivered whatever stale value the result register happened to hold
+    // (in practice the callee: `Cont.resume` itself).
+    //
+    // Entries hold absolute indices and are rebased on restore exactly as the
+    // prompts are: frame_boundary through `frame_base_offset`, result_slot
+    // through `stack_base_offset`. The boundary belonging to the resume that is
+    // splicing this extent back in is NOT in here -- that one exits the extent,
+    // and Cont.resume pushes it for itself.
+    ResumeContext* resumes;
+    int resume_count;
     // Absolute frame index the captured frames started at (the delimiting
     // prompt's frame_index). The frame counterpart of stack_base_offset /
     // spill_base_offset: restored frame_index = vm->frame_count + (saved -

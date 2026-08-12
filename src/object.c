@@ -236,6 +236,8 @@ ObjContinuation* newContinuation(VM* vm) {
     cont->spill_base_offset = 0;
     cont->prompts = NULL;
     cont->prompt_count = 0;
+    cont->resumes = NULL;
+    cont->resume_count = 0;
     cont->frame_base_offset = 0;
     cont->saved_ip = NULL;
     cont->saved_chunk = NULL;

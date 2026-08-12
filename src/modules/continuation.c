@@ -76,6 +76,36 @@ static ObjFunction* ownerOfChunk(VM* vm, Chunk* chunk) {
     return NULL;   // top-level/host chunk: nothing to mark
 }
 
+// Does this resume boundary belong to the extent being captured?
+//
+// A boundary at F fires when frames[F] returns, so it is ours only if frames[F]
+// is ours: prompt_frame <= F < end_frame. The lower bound is strict on top of
+// that -- F == prompt_frame is the boundary that carries the value OUT of the
+// extent, into whoever resumed it, and that is the resumer's to push
+// (Cont.resume does exactly that, for itself) rather than something this
+// continuation should carry around. Above end_frame is the truncated-off
+// preempt region, excluded for the same reason its frames and prompts are.
+//
+// The two slot bounds hold by construction -- result_slot is in
+// frames[F - 1]'s window and saved_stack_top is the mark that frame's splice
+// was based at, and both frames are captured whenever the boundary is. They
+// are checked because each is rebased and written through on resume: an
+// out-of-range result_slot is a stack write past the restored slice, and an
+// out-of-range saved_stack_top moves the mark that bounds the GC's scan of the
+// value stack. `<=` on the saved_stack_top upper bound because a mark may
+// legitimately sit at the top of the slice; result_slot is a real slot and may
+// not.
+//
+// Shared by the counting pass and the copying pass so the two cannot drift.
+static inline bool resumeEntryInExtent(const ResumeContext* ctx, int prompt_frame,
+                                       int end_frame, int stack_base, int stack_top) {
+    if (ctx->frame_boundary <= prompt_frame) return false;
+    if (ctx->frame_boundary >= end_frame) return false;
+    if (ctx->result_slot < stack_base || ctx->result_slot >= stack_top) return false;
+    if (ctx->saved_stack_top < stack_base || ctx->saved_stack_top > stack_top) return false;
+    return true;
+}
+
 ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot) {
     PromptEntry* prompt = findPrompt(vm, tag);
     if (prompt == NULL) {
@@ -178,6 +208,29 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
         capture_prompt_count++;
     }
 
+    // Resume boundaries whose returning frame lives inside the extent. Same
+    // argument as the prompts: the mapping is state the captured frames depend
+    // on, it is not reconstructible from the frames themselves, and leaving it
+    // behind silently breaks the extent the next time it is resumed.
+    // resumeEntryInExtent above owns the membership test.
+    //
+    // Counted here and copied entry by entry further down rather than block-
+    // copied from a base index. Entries are pushed in frame order, so the
+    // qualifying ones ARE a contiguous run today and a memcpy would work -- but
+    // it would work only for as long as that stays true. The membership test
+    // includes two bounds checks that are meant never to fire, and if one ever
+    // did, a base-and-count memcpy would not drop that entry: it would shift
+    // the whole run by one and copy a neighbour in its place, turning a guard
+    // into silent corruption. A filtered copy cannot do that.
+    int capture_resume_count = 0;
+    for (int i = 0; i < vm->resume_depth; i++) {
+        if (vm->resume_stack[i].frame_boundary >= end_frame) break;
+        if (resumeEntryInExtent(&vm->resume_stack[i], prompt_frame, end_frame,
+                                capture_stack_base, capture_stack_top)) {
+            capture_resume_count++;
+        }
+    }
+
     closeUpvalues(vm, &vm->stack[capture_stack_base]);
 
     ObjContinuation* cont = newContinuation(vm);
@@ -218,6 +271,23 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
                capture_prompt_count * sizeof(PromptEntry));
     }
 
+    // Plain ints, so unlike the three buffers above this one has no bearing on
+    // the GC: nothing to mark, and blackenObject deliberately says nothing
+    // about it.
+    ResumeContext* resumes_buf = NULL;
+    if (capture_resume_count > 0) {
+        resumes_buf = ALLOCATE(vm, ResumeContext, capture_resume_count);
+        int n = 0;
+        for (int i = 0; i < vm->resume_depth && n < capture_resume_count; i++) {
+            if (vm->resume_stack[i].frame_boundary >= end_frame) break;
+            if (resumeEntryInExtent(&vm->resume_stack[i], prompt_frame, end_frame,
+                                    capture_stack_base, capture_stack_top)) {
+                resumes_buf[n++] = vm->resume_stack[i];
+            }
+        }
+        capture_resume_count = n;   // the two passes agree, but do not assume it
+    }
+
     cont->frames = frames_buf;
     cont->frame_count = capture_frame_count;
 
@@ -230,6 +300,10 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
 
     cont->prompts = prompts_buf;
     cont->prompt_count = capture_prompt_count;
+
+    cont->resumes = resumes_buf;
+    cont->resume_count = capture_resume_count;
+
     cont->frame_base_offset = prompt_frame;
 
     if (preempt_saved_ip != NULL) {
@@ -356,6 +430,15 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         return false;
     }
 
+    // The extent's resume boundaries go back on vm->resume_stack, which is
+    // fixed-size for the same reason the other three are. Cont.resume has
+    // already pushed its own entry by the time it calls this, so the count it
+    // checked does not cover these.
+    if (vm->resume_depth + cont->resume_count > MAX_RESUME_DEPTH) {
+        runtimeError(vm, "Cont.resume: maximum resume nesting depth exceeded.");
+        return false;
+    }
+
     // growStackForCall disables the GC across the realloc and NULL-fills slots
     // above the OLD capacity; the hand-rolled GROW_ARRAY this replaced did
     // neither. Note the fill only covers newly added capacity -- slots already
@@ -460,6 +543,30 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         }
     }
 
+    // Put the extent's own splice points back, rebased the same way. Ordering
+    // works out for the same reason the prompts' does, and the entry Cont.
+    // resume pushed for this very resume stays correctly at the bottom of the
+    // run: its frame_boundary is restore_frame_base, and every entry here is
+    // strictly above that (captureContinuation kept only boundaries above the
+    // delimiting frame).
+    //
+    // Without this, every RET inside a multi-splice extent below the outermost
+    // one falls through to the ordinary path and writes the value to the
+    // returning frame's own stack_base -- which for a spliced-in frame is a
+    // slot its caller never reads.
+    for (int i = 0; i < cont->resume_count; i++) {
+        ResumeContext* src = &cont->resumes[i];
+        ResumeContext* dst = &vm->resume_stack[vm->resume_depth++];
+
+        dst->frame_boundary = src->frame_boundary + prompt_frame_delta;
+        dst->result_slot = restore_base + (src->result_slot - cont->stack_base_offset);
+        // A stack index like result_slot, so it rebases the same way: the mark
+        // this boundary has to put back is the one that was live at its own
+        // splice point, which sits inside the slice being laid down here.
+        dst->saved_stack_top = restore_base + (src->saved_stack_top - cont->stack_base_offset);
+        vm->active_boundaries++;
+    }
+
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
     // Added, not assigned. The field counts only what the captured frames
@@ -511,6 +618,12 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
     }
     cont->prompts = NULL;
     cont->prompt_count = 0;
+
+    if (cont->resumes != NULL && cont->resume_count > 0) {
+        FREE_ARRAY(vm, ResumeContext, cont->resumes, cont->resume_count);
+    }
+    cont->resumes = NULL;
+    cont->resume_count = 0;
 
     return true;
 }
@@ -737,7 +850,11 @@ static ZymValue cont_capture(ZymVM* vm, ZymValue context, ZymValue tag_val) {
     pushTempRoot(vm, (Obj*)cont);
 
     unwindFrames(vm, prompt->frame_index);
-    vm->stack_top = prompt->stack_base;
+    // Releases every slot the unwind just abandoned. Through lowerStackTop
+    // rather than by assignment: the released slots have to be cleared, or
+    // the objects they name are collected and the next call raises the mark
+    // back over the dangling pointers. See the note on lowerStackTop.
+    lowerStackTop(vm, prompt->stack_base);
 
     if (cont->frame_count > 0) {
         CallFrame* captured_frame = &cont->frames[0];
@@ -825,6 +942,12 @@ static ZymValue cont_resume(ZymVM* vm, ZymValue context, ZymValue continuation, 
 
     vm->resume_stack[vm->resume_depth].frame_boundary = frames_before;
     vm->resume_stack[vm->resume_depth].result_slot = resume_result_slot;
+    // Recorded here rather than inside resumeContinuation because this is the
+    // last point at which the value is unambiguously "before the splice" --
+    // and it is the same value resumeContinuation goes on to use as its
+    // restore_base. growStackForCall, the only thing that runs in between,
+    // moves capacity and not the mark.
+    vm->resume_stack[vm->resume_depth].saved_stack_top = vm->stack_top;
     vm->resume_depth++;
     vm->active_boundaries++;
 
@@ -870,7 +993,11 @@ static ZymValue cont_abort(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     }
 
     unwindFrames(vm, prompt->frame_index);
-    vm->stack_top = prompt->stack_base;
+    // Releases every slot the unwind just abandoned. Through lowerStackTop
+    // rather than by assignment: the released slots have to be cleared, or
+    // the objects they name are collected and the next call raises the mark
+    // back over the dangling pointers. See the note on lowerStackTop.
+    lowerStackTop(vm, prompt->stack_base);
 
     if (saved_ip != NULL) {
         vm->ip = saved_ip;
@@ -971,7 +1098,11 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     pushTempRoot(vm, (Obj*)handler_closure);
 
     unwindFrames(vm, prompt->frame_index);
-    vm->stack_top = prompt->stack_base;
+    // Releases every slot the unwind just abandoned. Through lowerStackTop
+    // rather than by assignment: the released slots have to be cleared, or
+    // the objects they name are collected and the next call raises the mark
+    // back over the dangling pointers. See the note on lowerStackTop.
+    lowerStackTop(vm, prompt->stack_base);
 
     if (cont->frame_count > 0) {
         CallFrame* captured_frame = &cont->frames[0];
@@ -988,6 +1119,34 @@ static ZymValue cont_shift(ZymVM* vm, ZymValue context, ZymValue tag_val, ZymVal
     }
 
     popPromptsThrough(vm, prompt_index);
+
+    // Drop the resume boundaries the unwind above just invalidated. cont_capture
+    // and cont_abort have run this loop all along; shift did not, and every
+    // non-local exit past a splice point owes it -- a boundary left behind names
+    // a frame index that no longer exists, and it fires on whatever unrelated
+    // call next returns at that depth.
+    //
+    // No value is written into their result_slots, which is the one difference
+    // from the other two. Capture delivers the continuation there and abort
+    // delivers the abort value because for them that write IS the delivery.
+    // Shift's value is the handler's return, and the handler frame pushed below
+    // is based at callee_slot, so its ordinary RET writes exactly that slot --
+    // the same slot this loop would have written, derived from the same call
+    // instruction. Writing here too would only put a placeholder in a slot that
+    // is about to be overwritten. The deeper entries address unwound frames and
+    // now sit above stack_top, so nothing is owed there either.
+    //
+    // Left un-drained, this was already a silently misrouted return value. It
+    // became memory-unsafe once the boundary started carrying a stack_top to
+    // reinstate: a stale entry restores a mark from a torn-down layout, and if
+    // that mark is below the live registers of the frame that is running when it
+    // fires, markRoots stops scanning them and the next allocation collects
+    // locals that are still in use.
+    while (vm->resume_depth > 0 &&
+           vm->resume_stack[vm->resume_depth - 1].frame_boundary >= vm->frame_count) {
+        vm->resume_depth--;
+        vm->active_boundaries--;
+    }
 
     int callee_slot = -1;
     if (vm->chunk != NULL && vm->ip > vm->chunk->code) {

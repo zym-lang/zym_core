@@ -25,10 +25,11 @@
  * ┌─────────────┬─────────────────────────────────────────────────┐
  * │   Count     │  8       16      32      64      256            │
  * ├─────────────┼─────────────────────────────────────────────────┤
- * │ FRAMES_MAX  │  0.25 KB 0.5 KB  1 KB    2 KB    8 KB           │
+ * │ FRAMES_MAX  │  384 B   768 B   1.5 KB  3 KB    12 KB          │
  * │ MAX_PROMPTS │  192 B   384 B   768 B   1.5 KB  6 KB           │
- * │ RESUME_DEPTH│  64 B    128 B   256 B   0.5 KB  2 KB           │
+ * │ RESUME_DEPTH│  96 B    192 B   384 B   768 B   3 KB           │  (= FRAMES_MAX)
  * │ PREEMPT_MAX │  192 B   384 B   768 B   1.5 KB  6 KB           │
+ * │ WITH_PROMPT │  32 B    64 B    128 B   256 B   1 KB           │
  * └─────────────┴─────────────────────────────────────────────────┘
  *
  * Notes:
@@ -36,6 +37,11 @@
  *   - MAX_PROMPTS limits concurrent prompt boundaries (bookmarks for continuations)
  *   - Captured continuations are heap-allocated, not limited by these values
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
+ *   - This table covers only these five arrays. It is NOT the size of a VM:
+ *     at the default counts they come to ~12 KB of a sizeof(VM) that measures
+ *     18072 bytes, the rest being the globals/strings tables, the API
+ *     trampoline chunk, the source-file registry, the diagnostic sink and the
+ *     recovery jmp_buf. Size a VM pool from sizeof(ZymVM), not from here.
  *   - ZYM_PREEMPT_MAX_ENTRIES is one table shared by host and script entries.
  *     handlePreemption also builds a scratch array of one pointer per slot on
  *     the C stack, so a slot costs 24 bytes of VM plus 8 bytes of stack during
@@ -51,7 +57,17 @@
 #define STACK_INITIAL 256
 #define MAX_PROMPTS 64
 #define DEFAULT_TIMESLICE 10000
-#define MAX_RESUME_DEPTH 64
+// Every live resume boundary names a distinct frame, so the frame limit already
+// bounds this one: a separate, smaller ceiling can only fail a program the call
+// stack would have carried. That mattered once a continuation started carrying
+// the boundaries inside its extent -- the trampoline idiom
+// `withPrompt(P, func() { return Cont.resume(k, v) })` grows the delimited
+// extent by one frame and one boundary per round trip, so a 64-entry stack
+// stopped a scheduler at 64 slices that FRAMES_MAX would have run to 256. Tied
+// to FRAMES_MAX so there is one ceiling to explain and one to raise; the check
+// in resumeContinuation stays, as the two are not provably equal in the
+// degenerate case of resuming a zero-frame continuation.
+#define MAX_RESUME_DEPTH FRAMES_MAX
 #define MAX_WITH_PROMPT_DEPTH 64
 // ---- Preemption entry table ---------------------------------------------
 // Fixed size, no allocation: registration fails when full. Keeps the MCU
@@ -128,9 +144,31 @@ typedef struct PromptEntry {
     bool from_with_prompt;
 } PromptEntry;
 
-typedef struct {
+// Where a resumed computation's final value goes. Cont.resume splices the
+// captured frames on top of the resumer's, and the bottom of that splice has no
+// ordinary caller/callee relationship with the frame below it -- its stack_base
+// was chosen by the restore, not by a CALL -- so RET cannot derive the
+// destination the usual way. This records it: when frame_count falls back to
+// frame_boundary, the returning frame's value is written to result_slot.
+//
+// Tagged (rather than an anonymous typedef) so object.h can forward-declare it:
+// a continuation snapshots the entries that live inside its extent, exactly as
+// it snapshots prompts. See ObjContinuation.resumes.
+typedef struct ResumeContext {
     int frame_boundary;
     int result_slot;
+    // vm->stack_top from just before the splice, and the slot the splice was
+    // laid down at. stack_top is a high-water mark: the CALL opcodes only ever
+    // raise it and RET does not lower it, which costs nothing for ordinary
+    // calls because a given call depth always needs the same top. A resume is
+    // the exception -- it bases its slice AT the mark and then raises it, so
+    // without an owner to put the mark back, every resumed extent that returns
+    // rather than re-suspending leaves its slice behind forever. Worse than
+    // linear, too: the next capture measures its own slice up to the drifted
+    // mark, so each leak enlarges the next one. A capture already reclaims
+    // (unwinding sets stack_top back to the prompt's base); this is the same
+    // reclaim for the path that returns.
+    int saved_stack_top;
 } ResumeContext;
 
 typedef struct {
@@ -344,6 +382,15 @@ void closeUpvalues(VM* vm, Value* last);
 // native modules that push their own call frames can use it.
 bool growStackForCall(VM* vm, int needed_top, Value** old_stack_out);
 void unwindFrames(VM* vm, int new_frame_count);
+// Move vm->stack_top DOWN, releasing [new_top, stack_top). The only supported
+// way to lower the mark: it closes any upvalue still pointing into the released
+// region and clears the slots, which is what keeps "every slot below stack_top
+// holds a valid Value" true. markRoots walks [0, stack_top) and dereferences
+// what it finds, and a later call raises the mark straight back over these
+// slots, so a released region left populated hands the collector pointers to
+// objects it has since freed. A no-op if new_top is already at or above the
+// mark; never raises it.
+void lowerStackTop(VM* vm, int new_top);
 // Reserve a frame's spill slots on the parallel spill stack; see CallFrame.spill_base.
 // Slow path only -- go through frameReserveSpills(), which keeps the zero case
 // (nearly every call) out of line-free.

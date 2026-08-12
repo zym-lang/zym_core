@@ -517,6 +517,66 @@ static void frameReleasePreemptGuards(VM* vm, const CallFrame* frame) {
     preemptArm(vm);
 }
 
+// Reinstate the value-stack mark a finished resume splice recorded, without
+// ever letting it fall below the live registers of the frame we are returning
+// into.
+//
+// The floor is defence, not the mechanism. For a boundary that is genuinely
+// this frame's, it can never bind: saved_stack_top was vm->stack_top at the
+// moment that same frame called Cont.resume, and a frame's whole window is
+// reserved when it is called, so the recorded mark is already at or above the
+// window top. It binds only for a STALE boundary -- one naming a frame index
+// some unwind destroyed -- where the recorded mark belongs to a torn-down
+// layout and can sit anywhere.
+//
+// It matters because markRoots scans the value stack over [0, stack_top). A
+// mark restored below a running frame's registers takes live locals out of the
+// root set, and the next allocation collects them: a stale boundary that used
+// to cost one misrouted return value would instead be a heap-use-after-free.
+// Every unwind past a splice point is supposed to drain its boundaries -- all
+// three of capture, abort and shift now do -- so this should be unreachable.
+// It is here so that a future path that forgets stays a wrong-value bug rather
+// than a memory-safety one.
+// Releasing value-stack slots is not just an assignment to stack_top, and that
+// is not tidiness. The invariant the rest of the VM relies on is that every
+// slot below the mark holds a VALID Value -- markRoots walks [0, stack_top) and
+// dereferences what it finds. Monotonicity used to guarantee it: the mark only
+// ever rose, growStackForCall NULL-fills each newly added stretch of capacity
+// once, and a slot left over from an earlier call still held a real object, so
+// the worst a stale slot cost was over-retention.
+//
+// Lowering the mark breaks that. The released slots stop being roots, their
+// objects are collected on the next cycle, and then the next call raises the
+// mark back over the very same slots -- still holding the pointers, now
+// dangling. markObject reads freed memory. Clearing on the way down is what
+// keeps "below the mark is valid" true in both directions.
+//
+// Upvalues are closed first: clearing a slot an open upvalue still points at
+// would strand it reading NULL.
+void lowerStackTop(VM* vm, int new_top) {
+    if (new_top >= vm->stack_top) {
+        return;
+    }
+    if (__builtin_expect(vm->open_upvalues != NULL, 0)) {
+        closeUpvalues(vm, &vm->stack[new_top]);
+    }
+    for (int i = new_top; i < vm->stack_top; i++) {
+        vm->stack[i] = NULL_VAL;
+    }
+    vm->stack_top = new_top;
+}
+
+static inline void restoreResumeMark(VM* vm, const ResumeContext* ctx) {
+    int floor = 0;
+    if (vm->frame_count > 0) {
+        const CallFrame* into = &vm->frames[vm->frame_count - 1];
+        if (into->closure != NULL && into->closure->function != NULL) {
+            floor = into->stack_base + into->closure->function->max_regs;
+        }
+    }
+    lowerStackTop(vm, ctx->saved_stack_top > floor ? ctx->saved_stack_top : floor);
+}
+
 // Pop-site one-liner. `vm` is in scope at every call site.
 #define RELEASE_FRAME_PREEMPT_GUARDS(frame)                       \
     do {                                                          \
@@ -3002,6 +3062,13 @@ static InterpretResult run(VM* vm) {
                     ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
                     if (vm->frame_count == ctx->frame_boundary) {
                         stack[ctx->result_slot] = result;
+                        // The splice this boundary owns is finished, so put
+                        // the high-water mark back where it stood before it.
+                        // Only this path does so: the capture and abort paths
+                        // also pop resume contexts, but they have already
+                        // unwound stack_top to the prompt's base, which is
+                        // lower -- restoring there would raise it again.
+                        restoreResumeMark(vm, ctx);
                         vm->resume_depth--;
                         vm->active_boundaries--;
                         ip    = frame->ip;
@@ -3096,6 +3163,13 @@ static InterpretResult run(VM* vm) {
                     ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
                     if (vm->frame_count == ctx->frame_boundary) {
                         stack[ctx->result_slot] = result;
+                        // The splice this boundary owns is finished, so put
+                        // the high-water mark back where it stood before it.
+                        // Only this path does so: the capture and abort paths
+                        // also pop resume contexts, but they have already
+                        // unwound stack_top to the prompt's base, which is
+                        // lower -- restoring there would raise it again.
+                        restoreResumeMark(vm, ctx);
                         vm->resume_depth--;
                         vm->active_boundaries--;
                         ip    = frame->ip;
@@ -3231,6 +3305,13 @@ static InterpretResult run(VM* vm) {
                 ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
                 if (vm->frame_count == ctx->frame_boundary) {
                     stack[ctx->result_slot] = return_value;
+                    // The splice this boundary owns is finished, so put
+                    // the high-water mark back where it stood before it.
+                    // Only this path does so: the capture and abort paths
+                    // also pop resume contexts, but they have already
+                    // unwound stack_top to the prompt's base, which is
+                    // lower -- restoring there would raise it again.
+                    restoreResumeMark(vm, ctx);
                     vm->resume_depth--;
                     vm->active_boundaries--;
                     ip    = frame->ip;
