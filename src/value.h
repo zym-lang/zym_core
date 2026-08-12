@@ -55,6 +55,31 @@ static inline Value double_to_value(double num) {
     return x.u;
 }
 
+// JavaScript ToInt32 (ECMA-262 7.1.6): truncate toward zero, reduce modulo
+// 2^32, reinterpret as signed. A bare (int32_t) cast is undefined outside
+// int32 range - x86 hands back INT32_MIN, wasm's trunc_sat clamps - so
+// out-of-range doubles have to be wrapped explicitly.
+static inline int32_t double_to_int32(double num) {
+    // Fast path: anything representable as an int64 wraps correctly under
+    // truncation, which covers every value short of 2^63.
+    if (num >= -9223372036854775808.0 && num < 9223372036854775808.0) {
+        return (int32_t)(uint32_t)(uint64_t)(int64_t)num;
+    }
+    // What's left is NaN, an infinity, or |num| >= 2^63 - all integral, so the
+    // low 32 bits can be read straight off the significand. The exponent field
+    // is at least 1086 here, making the shift below land in [11, 31].
+    uint64_t bits = double_to_value(num);
+    int shift = (int)((bits >> 52) & 0x7FF) - 1075;  // 1023 exponent bias + 52 significand bits
+    if (shift >= 32) return 0;                       // NaN, infinity, or a multiple of 2^32
+    uint32_t low = (uint32_t)(((bits & 0xFFFFFFFFFFFFFULL) | 0x10000000000000ULL) << shift);
+    return (int32_t)((bits & SIGN_BIT) ? (uint32_t)0 - low : low);
+}
+
+// JavaScript ToUint32 (ECMA-262 7.1.7): same reduction, unsigned reading.
+static inline uint32_t double_to_uint32(double num) {
+    return (uint32_t)double_to_int32(num);
+}
+
 typedef struct {
     int capacity;
     int count;

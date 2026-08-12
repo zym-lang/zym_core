@@ -630,13 +630,11 @@ static int try_emit_branch_compare(Compiler* compiler, Expr* condition, bool jum
         const_value = parse_number_literal(bin->right->as.literal.literal.start,
                                           bin->right->as.literal.literal.length);
 
-        if (const_value == floor(const_value)) {
-            int64_t int_val = (int64_t)const_value;
-            if (int_val >= -32768 && int_val <= 32767) {
-                use_immediate = true;
-            } else {
-                use_literal = true;
-            }
+        // Bounds are checked on the double, before any narrowing cast, so
+        // literals like 1e300 can't trip on undefined double->int64 conversion.
+        if (const_value >= -32768.0 && const_value <= 32767.0 &&
+            const_value == floor(const_value)) {
+            use_immediate = true;
         } else {
             use_literal = true;
         }
@@ -2448,16 +2446,15 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 if (prefer_literal) {
                     // Use _L for 3-register operation (no MOVE needed)
                     use_literal = true;
-                } else if (const_value == floor(const_value)) {
-                    // Check if it's an integer in 16-bit signed range [-32768, 32767]
-                    int64_t int_val = (int64_t)const_value;
-                    if (int_val >= -32768 && int_val <= 32767) {
-                        use_immediate = true;
-                    } else {
-                        use_literal = true;
-                    }
+                } else if (const_value >= -32768.0 && const_value <= 32767.0 &&
+                           const_value == floor(const_value)) {
+                    // An integer inside the 16-bit signed immediate range. The
+                    // bounds are checked on the double, before any narrowing
+                    // cast, so literals like 1e300 can't trip on undefined
+                    // double->int64 conversion.
+                    use_immediate = true;
                 } else {
-                    // Non-integer, must use _L
+                    // Out of immediate range, or not an integer, must use _L
                     use_literal = true;
                 }
             }

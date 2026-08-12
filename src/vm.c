@@ -1555,8 +1555,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             int32_t result = lhs & rhs;
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
         } else {
@@ -1571,8 +1571,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             int32_t result = lhs | rhs;
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
         } else {
@@ -1587,8 +1587,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             int32_t result = lhs ^ rhs;
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
         } else {
@@ -1603,10 +1603,10 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             // Mask shift amount to 0-31 for i32
-            int32_t result = lhs << (rhs & 0x1F);
+            int32_t result = (int32_t)((uint32_t)lhs << (rhs & 0x1F));
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
         } else {
             STORE_IP(); runtimeError(vm, "Operands for '<<' must be numbers.");
@@ -1620,11 +1620,9 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            // JavaScript behavior: convert to uint32, logical shift with 0-31 mask.
-            // Go through int32 first; direct double->uint32 saturates negatives
-            // to 0 under wasm's trunc_sat_f64_u, breaking e.g. (-1) >>> 1.
-            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            // JavaScript behavior: ToUint32, logical shift with 0-31 mask.
+            uint32_t lhs = double_to_uint32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             // Mask shift amount to 0-31 for i32
             uint32_t result = lhs >> (rhs & 0x1F);
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
@@ -1640,8 +1638,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb) && IS_DOUBLE(vc)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);  // Signed for arithmetic shift
-            int32_t rhs = (int32_t)AS_DOUBLE(vc);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));  // Signed for arithmetic shift
+            int32_t rhs = double_to_int32(AS_DOUBLE(vc));
             // Mask shift amount to 0-31 for 32-bit signed
             int32_t result = lhs >> (rhs & 0x1F);
             bp[REG_A(instr)] = DOUBLE_VAL((double)result);
@@ -1841,7 +1839,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(va);
+            int32_t lhs = double_to_int32(AS_DOUBLE(va));
             int32_t result = lhs & (int32_t)imm;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1858,7 +1856,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(va);
+            int32_t lhs = double_to_int32(AS_DOUBLE(va));
             int32_t result = lhs | (int32_t)imm;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1875,7 +1873,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(va);
+            int32_t lhs = double_to_int32(AS_DOUBLE(va));
             int32_t result = lhs ^ (int32_t)imm;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1892,8 +1890,8 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(va);
-            int32_t result = lhs << ((int32_t)imm & 0x1F);
+            int32_t lhs = double_to_int32(AS_DOUBLE(va));
+            int32_t result = (int32_t)((uint32_t)lhs << ((int32_t)imm & 0x1F));
             stack[a] = DOUBLE_VAL((double)result);
         } else {
             STORE_IP(); runtimeError(vm, "Operand for '<<' must be a number.");
@@ -1909,8 +1907,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            // Go through int32 first to avoid wasm trunc_sat_f64_u saturating negatives to 0.
-            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(va);
+            uint32_t lhs = double_to_uint32(AS_DOUBLE(va));
             uint32_t result = lhs >> ((int32_t)imm & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1927,7 +1924,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(va)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(va);
+            int32_t lhs = double_to_int32(AS_DOUBLE(va));
             int32_t result = lhs >> ((int32_t)imm & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1949,8 +1946,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
             int32_t result = lhs & rhs;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1970,8 +1967,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
             int32_t result = lhs | rhs;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -1991,8 +1988,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
             int32_t result = lhs ^ rhs;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -2012,9 +2009,9 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
-            int32_t result = lhs << (rhs & 0x1F);
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
+            int32_t result = (int32_t)((uint32_t)lhs << (rhs & 0x1F));
             stack[a] = DOUBLE_VAL((double)result);
         } else {
             STORE_IP(); runtimeError(vm, "Operand for '<<' must be a number.");
@@ -2033,9 +2030,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            // Go through int32 first to avoid wasm trunc_sat_f64_u saturating negatives to 0.
-            uint32_t lhs = (uint32_t)(int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
+            uint32_t lhs = double_to_uint32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
             uint32_t result = lhs >> (rhs & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -2055,8 +2051,8 @@ static InterpretResult run(VM* vm) {
         Value vb = bp[REG_B(instr)];
 
         if (IS_DOUBLE(vb)) {
-            int32_t lhs = (int32_t)AS_DOUBLE(vb);
-            int32_t rhs = (int32_t)literal;
+            int32_t lhs = double_to_int32(AS_DOUBLE(vb));
+            int32_t rhs = double_to_int32(literal);
             int32_t result = lhs >> (rhs & 0x1F);
             stack[a] = DOUBLE_VAL((double)result);
         } else {
@@ -2085,7 +2081,7 @@ static InterpretResult run(VM* vm) {
 
 
         if (IS_DOUBLE(vb)) {
-            int32_t val = (int32_t)AS_DOUBLE(vb);
+            int32_t val = double_to_int32(AS_DOUBLE(vb));
             int32_t result = ~val;
             stack[a] = DOUBLE_VAL((double)result);
         } else {
