@@ -23,12 +23,18 @@ Obj* allocateObject(VM* vm, size_t size, ObjType type) {
     return object;
 }
 
-static ObjString* allocateString(VM* vm, char* chars, int byte_length, uint32_t hash) {
-    ObjString* string = ALLOCATE_OBJ(vm, ObjString, OBJ_STRING);
+// Allocate the string as ONE block (header + content tail) and intern it.
+// `src` is a borrowed, non-GC buffer: allocateObject may collect, but plain
+// heap memory is never moved or freed by the GC, so copying after the
+// allocation is safe. The free path in gc.c must mirror this size.
+static ObjString* allocateString(VM* vm, const char* src, int byte_length, uint32_t hash) {
+    ObjString* string = (ObjString*)allocateObject(vm,
+        sizeof(ObjString) + (size_t)byte_length + 1, OBJ_STRING);
     string->byte_length = byte_length;
-    string->chars = chars;
     string->hash = hash;
-    string->length = utf8_strlen(chars, byte_length);
+    memcpy(string->chars, src, (size_t)byte_length);
+    string->chars[byte_length] = '\0';
+    string->length = utf8_strlen(string->chars, byte_length);
 
     pushTempRoot(vm, (Obj*)string);
     tableSet(vm, &vm->strings, string, NULL_VAL);
@@ -53,7 +59,12 @@ ObjString* takeString(VM* vm, char* chars, int length) {
         return interned;
     }
 
-    return allocateString(vm, chars, length, hash);
+    // Content is copied into the string's tail; the donated buffer (always
+    // a vm-accounted allocation of length+1, per this function's contract)
+    // is released either way.
+    ObjString* result = allocateString(vm, chars, length, hash);
+    reallocate(vm, chars, length + 1, 0);
+    return result;
 }
 
 ObjString* copyString(VM* vm, const char* chars, int length) {
@@ -63,11 +74,46 @@ ObjString* copyString(VM* vm, const char* chars, int length) {
         return interned;
     }
 
-    char* heapChars = (char*)reallocate(vm, NULL, 0, length + 1);
-    memcpy(heapChars, chars, length);
-    heapChars[length] = '\0';
+    // No intermediate heap copy anymore — the single allocation in
+    // allocateString IS the copy.
+    return allocateString(vm, chars, length, hash);
+}
 
-    return allocateString(vm, heapChars, length, hash);
+ObjString* concatStrings(VM* vm, ObjString* a, ObjString* b) {
+    // Buffer-free concat: stream the hash across both halves, probe the
+    // intern table with a two-segment compare, and only on a miss write
+    // the content directly into the new string's tail. One allocation,
+    // two memcpys, no temporary. GC safety: `a` and `b` are reachable
+    // from the caller's stack slots and strings never move, so the
+    // pointers stay valid across the allocation.
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < a->byte_length; i++) {
+        hash ^= (uint8_t)a->chars[i];
+        hash *= 16777619;
+    }
+    for (int i = 0; i < b->byte_length; i++) {
+        hash ^= (uint8_t)b->chars[i];
+        hash *= 16777619;
+    }
+
+    ObjString* interned = tableFindStringPair(&vm->strings,
+        a->chars, a->byte_length, b->chars, b->byte_length, hash);
+    if (interned != NULL) return interned;
+
+    int byte_length = a->byte_length + b->byte_length;
+    ObjString* string = (ObjString*)allocateObject(vm,
+        sizeof(ObjString) + (size_t)byte_length + 1, OBJ_STRING);
+    string->byte_length = byte_length;
+    string->hash = hash;
+    memcpy(string->chars, a->chars, (size_t)a->byte_length);
+    memcpy(string->chars + a->byte_length, b->chars, (size_t)b->byte_length);
+    string->chars[byte_length] = '\0';
+    string->length = utf8_strlen(string->chars, byte_length);
+
+    pushTempRoot(vm, (Obj*)string);
+    tableSet(vm, &vm->strings, string, NULL_VAL);
+    popTempRoot(vm);
+    return string;
 }
 
 ObjFunction* newFunction(VM* vm) {

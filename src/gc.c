@@ -648,8 +648,10 @@ void freeObject(VM* vm, Obj* object) {
     switch (object->type) {
         case OBJ_STRING: {
             ObjString* string = (ObjString*)object;
-            FREE_ARRAY(vm, char, string->chars, string->byte_length + 1);
-            FREE(vm, ObjString, object);
+            // One block: header + content tail. Un-charge exactly what
+            // allocateString charged or bytes_allocated drifts.
+            reallocate(vm, object,
+                sizeof(ObjString) + (size_t)string->byte_length + 1, 0);
             break;
         }
 

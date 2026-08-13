@@ -92,8 +92,12 @@ typedef struct ObjString {
     Obj obj;
     int length;
     int byte_length;
-    char* chars;
     uint32_t hash;
+    // Single allocation: content lives on the string's tail
+    // (NUL-terminated). Strings are immutable and interned, so nothing
+    // ever resizes or re-points this. Header, hash, and short-string
+    // content share a cache line; one malloc per string instead of two.
+    char chars[];
 } ObjString;
 
 typedef struct ObjFunction {
@@ -318,6 +322,10 @@ ObjNativeContext* newNativeContext(VM* vm, void* native_data, NativeFinalizerFun
 ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher, Value context);
 ObjString* takeString(VM* vm, char* chars, int length);
 ObjString* copyString(VM* vm, const char* chars, int length);
+// Concatenation without a temporary buffer: hash streams across both
+// halves, the intern probe compares in two segments, and on a miss the
+// content is written directly into the new string's tail.
+ObjString* concatStrings(VM* vm, ObjString* a, ObjString* b);
 void printObject(Value value);
 Obj* allocateObject(VM* vm, size_t size, ObjType type);
 ObjClosure* newClosure(VM* vm, ObjFunction* function);

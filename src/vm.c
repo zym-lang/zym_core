@@ -1229,23 +1229,13 @@ static InterpretResult run(VM* vm) {
         if (IS_DOUBLE(val_b) && IS_DOUBLE(val_c)) {
             bp[REG_A(instr)] = DOUBLE_VAL(AS_DOUBLE(val_b) + AS_DOUBLE(val_c));
         } else if (IS_STRING(val_b) && IS_STRING(val_c)) {
-            ObjString* str_b = AS_STRING(val_b);
-            ObjString* str_c = AS_STRING(val_c);
-
-            int byte_len = str_b->byte_length + str_c->byte_length;
-            char* chars = (char*)reallocate(vm, NULL, 0, byte_len + 1);
-            memcpy(chars, str_b->chars, str_b->byte_length);
-            memcpy(chars + str_b->byte_length, str_c->chars, str_c->byte_length);
-            chars[byte_len] = '\0';
-
-            // takeString takes ownership of the 'chars' buffer
-            ObjString* result = takeString(vm, chars, byte_len);
+            // Buffer-free concat: hash streams over both halves, the intern
+            // probe compares in two segments, and a miss writes straight
+            // into the new string's tail. See concatStrings.
+            ObjString* result = concatStrings(vm, AS_STRING(val_b), AS_STRING(val_c));
             RELOAD_STACK(); // GC may have reallocated stack
 
-            // Protect the string before the write (which can trigger GC via tableSet)
-            pushTempRoot(vm, (Obj*)result);
             bp[REG_A(instr)] = OBJ_VAL(result);
-            popTempRoot(vm);
 
         } else {
             STORE_IP(); runtimeError(vm, "Operands for '+' must be two numbers or two strings.");
