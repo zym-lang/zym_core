@@ -139,6 +139,9 @@ void initVM(VM* vm) {
 void freeVM(VM* vm) {
     vm->gc_enabled = false;
     vm->gc_debt = INT32_MAX;
+#ifdef ZYM_HEAP_CENSUS
+    zymCensusTeardown();   // shutdown frees are not deaths
+#endif
 
     freeTable(vm, &vm->globals);
     freeValueArray(vm, &vm->globalSlots);
@@ -177,6 +180,9 @@ void freeVM(VM* vm) {
 
     diagsink_free(vm, &vm->diagnostics);
     sfr_free(vm, &vm->source_files);
+#ifdef ZYM_HEAP_CENSUS
+    zymCensusDump();
+#endif
 }
 
 bool globalGet(VM* vm, ObjString* name, Value* out_value) {

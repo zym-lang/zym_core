@@ -45,3 +45,18 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize);
 #define FREE_ARRAY(vm, type, pointer, oldCapacity) reallocate(vm, pointer, sizeof(type) * (oldCapacity), 0)
 #define ALLOCATE(vm, type, count) (type*)reallocate(vm, NULL, 0, sizeof(type) * (count))
 #define FREE(vm, type, pointer) reallocate(vm, pointer, sizeof(type), 0)
+// ---- Heap census (ZYM_HEAP_CENSUS builds only; compiles to nothing
+// otherwise). One-shot instrumentation for the arena/GC decision
+// (future/indirection_audit.md items 3+4): per-type object counts, size
+// histograms, raw-buffer traffic, GC epochs, death ages, live snapshots.
+// Global (not per-VM) state — census runs are single-VM benchmarks.
+#ifdef ZYM_HEAP_CENSUS
+#include <stdint.h>
+extern uint32_t zym_census_epoch;
+void zymCensusObject(int type, size_t size);        // allocateObject
+void zymCensusDeath(int type, uint32_t birth);       // freeObject (sweep)
+void zymCensusRaw(size_t old_size, size_t new_size); // every reallocate
+void zymCensusGcEnd(size_t live_bytes, uint64_t live_objects);
+void zymCensusTeardown(void);                        // freeVM: stop counting deaths
+void zymCensusDump(void);                            // freeVM end: stderr report
+#endif

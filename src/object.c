@@ -20,6 +20,11 @@ Obj* allocateObject(VM* vm, size_t size, ObjType type) {
     object->next = vm->objects;
     vm->objects = object;
 
+#ifdef ZYM_HEAP_CENSUS
+    zymCensusObject((int)type, size);
+    object->census_birth = zym_census_epoch;
+#endif
+
     return object;
 }
 

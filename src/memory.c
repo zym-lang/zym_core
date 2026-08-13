@@ -60,6 +60,9 @@ void zymOutOfMemory(VM* vm)
 }
 
 void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
+#ifdef ZYM_HEAP_CENSUS
+    zymCensusRaw(oldSize, newSize);
+#endif
     vm->bytes_allocated += newSize - oldSize;
 
     if (newSize > oldSize) {
@@ -131,3 +134,121 @@ void* reallocate(VM* vm, void* pointer, size_t oldSize, size_t newSize) {
     }
     return result;
 }
+
+// ============================================================================
+// Heap census (ZYM_HEAP_CENSUS builds only) — see memory.h.
+// ============================================================================
+#ifdef ZYM_HEAP_CENSUS
+#include <stdint.h>
+
+#define CENSUS_TYPES 32
+// Size buckets: exact 8-byte steps up to 1024 (128 buckets), then log2
+// overflow buckets for 1KB..>1MB (11 more).
+#define CENSUS_SMALL_BUCKETS 128
+#define CENSUS_BUCKETS (CENSUS_SMALL_BUCKETS + 11)
+
+uint32_t zym_census_epoch = 0;
+
+static uint64_t c_obj_count[CENSUS_TYPES];
+static uint64_t c_obj_bytes[CENSUS_TYPES];
+static uint64_t c_obj_hist[CENSUS_TYPES][CENSUS_BUCKETS];
+static uint64_t c_death_age[CENSUS_TYPES][5];   // 0, 1, 2, 3-7, 8+
+static uint64_t c_death_teardown[CENSUS_TYPES];
+static int      c_teardown = 0;
+
+static uint64_t c_raw_alloc_count, c_raw_alloc_bytes;
+static uint64_t c_raw_grow_count,  c_raw_grow_bytes;
+static uint64_t c_raw_shrink_count, c_raw_free_count;
+static uint64_t c_raw_hist[CENSUS_BUCKETS];
+
+#define CENSUS_LIVE_LOG 4096
+static uint64_t c_live_bytes[CENSUS_LIVE_LOG];
+static uint64_t c_live_objs[CENSUS_LIVE_LOG];
+
+static int censusBucket(size_t size) {
+    if (size < 1024) return (int)(size / 8);
+    int b = CENSUS_SMALL_BUCKETS;
+    size_t s = 1024;
+    while (b < CENSUS_BUCKETS - 1 && size >= (s << 1)) { s <<= 1; b++; }
+    return b;
+}
+
+void zymCensusObject(int type, size_t size) {
+    if (type < 0 || type >= CENSUS_TYPES) type = CENSUS_TYPES - 1;
+    c_obj_count[type]++;
+    c_obj_bytes[type] += size;
+    c_obj_hist[type][censusBucket(size)]++;
+}
+
+void zymCensusDeath(int type, uint32_t birth) {
+    if (type < 0 || type >= CENSUS_TYPES) type = CENSUS_TYPES - 1;
+    if (c_teardown) { c_death_teardown[type]++; return; }
+    uint32_t age = zym_census_epoch - birth;
+    int slot = age == 0 ? 0 : age == 1 ? 1 : age == 2 ? 2 : age < 8 ? 3 : 4;
+    c_death_age[type][slot]++;
+}
+
+void zymCensusRaw(size_t old_size, size_t new_size) {
+    if (old_size == 0 && new_size > 0) {
+        c_raw_alloc_count++; c_raw_alloc_bytes += new_size;
+        c_raw_hist[censusBucket(new_size)]++;
+    } else if (new_size == 0 && old_size > 0) {
+        c_raw_free_count++;
+    } else if (new_size > old_size) {
+        c_raw_grow_count++; c_raw_grow_bytes += new_size - old_size;
+    } else if (new_size < old_size) {
+        c_raw_shrink_count++;
+    }
+}
+
+void zymCensusGcEnd(size_t live_bytes, uint64_t live_objects) {
+    if (zym_census_epoch < CENSUS_LIVE_LOG) {
+        c_live_bytes[zym_census_epoch] = live_bytes;
+        c_live_objs[zym_census_epoch]  = live_objects;
+    }
+    zym_census_epoch++;
+}
+
+void zymCensusTeardown(void) { c_teardown = 1; }
+
+void zymCensusDump(void) {
+    fprintf(stderr, "CENSUS begin epochs=%u\n", zym_census_epoch);
+    for (int t = 0; t < CENSUS_TYPES; t++) {
+        if (c_obj_count[t] == 0) continue;
+        fprintf(stderr, "CENSUS obj type=%d count=%llu bytes=%llu deaths=%llu,%llu,%llu,%llu,%llu teardown=%llu\n",
+                t,
+                (unsigned long long)c_obj_count[t],
+                (unsigned long long)c_obj_bytes[t],
+                (unsigned long long)c_death_age[t][0],
+                (unsigned long long)c_death_age[t][1],
+                (unsigned long long)c_death_age[t][2],
+                (unsigned long long)c_death_age[t][3],
+                (unsigned long long)c_death_age[t][4],
+                (unsigned long long)c_death_teardown[t]);
+        for (int b = 0; b < CENSUS_BUCKETS; b++) {
+            if (c_obj_hist[t][b] == 0) continue;
+            fprintf(stderr, "CENSUS hist type=%d bucket=%d count=%llu\n",
+                    t, b, (unsigned long long)c_obj_hist[t][b]);
+        }
+    }
+    fprintf(stderr, "CENSUS raw alloc_count=%llu alloc_bytes=%llu grow_count=%llu grow_bytes=%llu shrink=%llu free=%llu\n",
+            (unsigned long long)c_raw_alloc_count, (unsigned long long)c_raw_alloc_bytes,
+            (unsigned long long)c_raw_grow_count,  (unsigned long long)c_raw_grow_bytes,
+            (unsigned long long)c_raw_shrink_count, (unsigned long long)c_raw_free_count);
+    for (int b = 0; b < CENSUS_BUCKETS; b++) {
+        if (c_raw_hist[b] == 0) continue;
+        fprintf(stderr, "CENSUS rawhist bucket=%d count=%llu\n", b, (unsigned long long)c_raw_hist[b]);
+    }
+    uint32_t n = zym_census_epoch < CENSUS_LIVE_LOG ? zym_census_epoch : CENSUS_LIVE_LOG;
+    uint64_t peak_b = 0, peak_o = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (c_live_bytes[i] > peak_b) peak_b = c_live_bytes[i];
+        if (c_live_objs[i] > peak_o) peak_o = c_live_objs[i];
+    }
+    fprintf(stderr, "CENSUS live peak_bytes=%llu peak_objs=%llu last_bytes=%llu last_objs=%llu\n",
+            (unsigned long long)peak_b, (unsigned long long)peak_o,
+            (unsigned long long)(n ? c_live_bytes[n-1] : 0),
+            (unsigned long long)(n ? c_live_objs[n-1] : 0));
+    fprintf(stderr, "CENSUS end\n");
+}
+#endif

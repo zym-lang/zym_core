@@ -644,6 +644,9 @@ void freeObject(VM* vm, Obj* object) {
     printf("%p free type %d\n", (void*)object, object->type);
     fflush(stdout);
     #endif
+    #ifdef ZYM_HEAP_CENSUS
+    zymCensusDeath((int)object->type, object->census_birth);
+    #endif
 
     switch (object->type) {
         case OBJ_STRING: {
@@ -837,6 +840,14 @@ void collectGarbage(VM* vm) {
     fflush(stdout);
     #endif
     sweep(vm);
+
+    #ifdef ZYM_HEAP_CENSUS
+    {
+        uint64_t live = 0;
+        for (Obj* o = vm->objects; o != NULL; o = o->next) live++;
+        zymCensusGcEnd(vm->bytes_allocated, live);
+    }
+    #endif
 
     vm->next_gc = vm->bytes_allocated * GC_HEAP_GROW_FACTOR;
 

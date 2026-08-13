@@ -81,6 +81,11 @@ struct Obj {
     ObjType type;
     bool is_marked;
     struct Obj* next;
+#ifdef ZYM_HEAP_CENSUS
+    // Census builds only (never shipped): GC epoch at birth, for death-age
+    // histograms. See zymCensus* in memory.c.
+    uint32_t census_birth;
+#endif
 };
 
 typedef struct {
