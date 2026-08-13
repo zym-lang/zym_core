@@ -161,8 +161,13 @@ typedef struct ObjUpvalue {
 typedef struct {
     Obj obj;
     ObjFunction* function;
-    ObjUpvalue** upvalues;
     int upvalue_count;
+    // Single allocation: the upvalue pointer array lives on the tail of the
+    // closure itself (upvalue_count is fixed at creation, so nothing ever
+    // resizes it). One malloc instead of two per closure, one less pointer
+    // chase per upvalue access, and closure creation can no longer trigger
+    // GC between an array and an object that must stay consistent.
+    ObjUpvalue* upvalues[];
 } ObjClosure;
 
 typedef struct {

@@ -448,10 +448,10 @@ static void blackenObject(VM* vm, Obj* object) {
         case OBJ_CLOSURE: {
             ObjClosure* closure = (ObjClosure*)object;
             markObject(vm, (Obj*)closure->function);
-            if (closure->upvalues != NULL) {
-                for (int i = 0; i < closure->upvalue_count; i++) {
-                    markObject(vm, (Obj*)closure->upvalues[i]);
-                }
+            // upvalues is a flexible tail array now — never NULL; the
+            // count bounds the loop (0 for capture-free closures).
+            for (int i = 0; i < closure->upvalue_count; i++) {
+                markObject(vm, (Obj*)closure->upvalues[i]);
             }
             break;
         }
@@ -687,10 +687,11 @@ void freeObject(VM* vm, Obj* object) {
 
         case OBJ_CLOSURE: {
             ObjClosure* closure = (ObjClosure*)object;
-            if (closure->upvalues != NULL && closure->upvalue_count > 0) {
-                FREE_ARRAY(vm, ObjUpvalue*, closure->upvalues, closure->upvalue_count);
-            }
-            FREE(vm, ObjClosure, object);
+            // One block: header + tail array. Un-charge exactly what
+            // newClosure charged or bytes_allocated drifts.
+            reallocate(vm, object,
+                sizeof(ObjClosure) + sizeof(ObjUpvalue*) * (size_t)closure->upvalue_count,
+                0);
             break;
         }
 

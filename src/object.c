@@ -122,35 +122,30 @@ ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* fun
 
 
 ObjClosure* newClosure(VM* vm, ObjFunction* function) {
-    // GC SAFETY: `function` is reached from the caller's C stack only.
-    // The two allocations below (`ALLOCATE` for the upvalues array and
-    // `allocateObject` for the closure) can trigger GC. The upvalues
-    // array isn't a GC object so it's safe across the second allocation,
-    // but if the caller didn't pin `function`, the function itself could
-    // be swept. The compiler emits OP(CLOSURE) reading the function out
-    // of `chunk->constants`, which is marked via `markChunk`, so this
-    // is usually safe — but we root it here defensively to make the
-    // ownership model independent of every call site's discipline.
+    // GC SAFETY: `function` is reached from the caller's C stack only, and
+    // the allocation below can trigger GC before the closure exists. The
+    // compiler emits OP(CLOSURE) reading the function out of
+    // `chunk->constants`, which is marked via `markChunk`, so this is
+    // usually safe — but we root it here defensively to make the ownership
+    // model independent of every call site's discipline.
     pushTempRoot(vm, (Obj*)function);
 
-    ObjUpvalue** upvalues = NULL;
-    if (function->upvalue_count > 0) {
-        upvalues = ALLOCATE(vm, ObjUpvalue*, function->upvalue_count);
-        for (int i = 0; i < function->upvalue_count; i++) {
-            upvalues[i] = NULL;
-        }
-    }
-
-    ObjClosure* closure = (ObjClosure*)allocateObject(vm, sizeof(ObjClosure), OBJ_CLOSURE);
-    // CRITICAL: `closure->upvalues` and `closure->upvalue_count` must be
-    // set BEFORE any allocation that could trigger GC; otherwise the
-    // closure becomes reachable (via vm->objects list) with garbage
-    // in those fields and `blackenObject(OBJ_CLOSURE)` will deref them.
-    // Right now no allocation happens between these stores, but be
-    // explicit so any future edit can't accidentally introduce one.
+    // Single allocation: header + upvalue pointer array in one block (the
+    // array is a flexible member on the closure's tail). The free path in
+    // gc.c must mirror this size for the bytes_allocated accounting.
+    int count = function->upvalue_count;
+    ObjClosure* closure = (ObjClosure*)allocateObject(vm,
+        sizeof(ObjClosure) + sizeof(ObjUpvalue*) * (size_t)count, OBJ_CLOSURE);
+    // CRITICAL: `upvalue_count` must be set before any allocation that
+    // could trigger GC; otherwise the closure is reachable (via
+    // vm->objects) with garbage in the fields `blackenObject(OBJ_CLOSURE)`
+    // dereferences. No allocation happens between these stores today, but
+    // be explicit so a future edit can't accidentally introduce one.
     closure->function = function;
-    closure->upvalues = upvalues;
-    closure->upvalue_count = function->upvalue_count;
+    closure->upvalue_count = count;
+    for (int i = 0; i < count; i++) {
+        closure->upvalues[i] = NULL;
+    }
 
     popTempRoot(vm);
     return closure;
