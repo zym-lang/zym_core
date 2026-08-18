@@ -5464,6 +5464,23 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         }
     }
 
+    // Pass 1.5: Register struct and enum schemas BEFORE any nested function
+    // body compiles. Mirrors the top-level compiler's pre-pass: schemas are
+    // compile-time-only tables consulted at every `Name(...)` / `Name.Variant`
+    // site (walking enclosing compilers), and nested functions are compiled
+    // in Pass 2, ahead of the ordinary statements. Without this, a nested
+    // function referencing a struct or enum declared in its enclosing
+    // function found the parent's table still empty, fell through to the
+    // global path, and failed at runtime with "Undefined identifier" -- in
+    // any source order, since Pass 2 always precedes Pass 3. Declarations
+    // emit no bytecode, so hoisting their registration moves nothing else.
+    for (int i = 0; i < body->count; i++) {
+        if (body->statements[i]->type == STMT_STRUCT_DECLARATION ||
+            body->statements[i]->type == STMT_ENUM_DECLARATION) {
+            compile_statement(&fn_compiler, body->statements[i]);
+        }
+    }
+
     // Pass 2: Process directives and compile function declarations in source order.
     // This ensures directives affect functions that come after them (scope-aware hoisting).
     for (int i = 0; i < body->count; i++) {
@@ -5484,11 +5501,23 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         if (s->type == STMT_FUNC_DECLARATION) {
             continue;
         }
+        // Skip struct/enum declarations - registered in Pass 1.5. Compiling
+        // them again here would push a duplicate schema entry (harmless for
+        // lookup, which scans newest-first, but a leak of the table's
+        // MAX_LOCALS budget).
+        if (s->type == STMT_STRUCT_DECLARATION || s->type == STMT_ENUM_DECLARATION) {
+            continue;
+        }
 
-        // Mark the last non-function statement as being in tail position for TCO
+        // Mark the last non-function statement as being in tail position for TCO.
+        // Struct/enum declarations are transparent here too: they emit nothing
+        // (registered in Pass 1.5), so a `return f()` followed only by
+        // declarations is still the last executable statement.
         bool is_last_stmt = true;
         for (int j = i + 1; j < body->count; j++) {
-            if (body->statements[j]->type != STMT_FUNC_DECLARATION) {
+            if (body->statements[j]->type != STMT_FUNC_DECLARATION &&
+                body->statements[j]->type != STMT_STRUCT_DECLARATION &&
+                body->statements[j]->type != STMT_ENUM_DECLARATION) {
                 is_last_stmt = false;
                 break;
             }
