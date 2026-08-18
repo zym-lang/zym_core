@@ -231,6 +231,34 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
         }
     }
 
+    // Record every open upvalue pointing into the extent BEFORE closing
+    // them: closeUpvalues removes them from the open list and seals their
+    // locations, and the offsets have to be taken while the locations
+    // still point at stack slots. Same boundary condition as
+    // closeUpvalues, so the recorded set is exactly the closed set. See
+    // ObjContinuation.upvalues for why resume needs this.
+    int capture_upvalue_count = 0;
+    for (ObjUpvalue* uv = vm->open_upvalues;
+         uv != NULL && uv->location >= &vm->stack[capture_stack_base];
+         uv = uv->next) {
+        capture_upvalue_count++;
+    }
+    ContUpvalue* upvalues_buf = NULL;
+    if (capture_upvalue_count > 0) {
+        // The allocation can collect; the upvalue objects stay reachable
+        // through vm->open_upvalues (a GC root) and the closures on the
+        // still-intact stack, and a collection never mutates the list.
+        upvalues_buf = ALLOCATE(vm, ContUpvalue, capture_upvalue_count);
+        int ui = 0;
+        for (ObjUpvalue* uv = vm->open_upvalues;
+             uv != NULL && uv->location >= &vm->stack[capture_stack_base];
+             uv = uv->next) {
+            upvalues_buf[ui].upvalue = uv;
+            upvalues_buf[ui].slot = (int)(uv->location - &vm->stack[capture_stack_base]);
+            ui++;
+        }
+    }
+
     closeUpvalues(vm, &vm->stack[capture_stack_base]);
 
     ObjContinuation* cont = newContinuation(vm);
@@ -303,6 +331,9 @@ ObjContinuation* captureContinuation(VM* vm, ObjPromptTag* tag, int return_slot)
 
     cont->resumes = resumes_buf;
     cont->resume_count = capture_resume_count;
+
+    cont->upvalues = upvalues_buf;
+    cont->upvalue_count = capture_upvalue_count;
 
     cont->frame_base_offset = prompt_frame;
 
@@ -567,6 +598,37 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
         vm->active_boundaries++;
     }
 
+    // Restore the open-upvalue aliases (see ObjContinuation.upvalues).
+    // For each upvalue the capture sealed: the cell's current value is
+    // written into the restored slot FIRST -- a closure that ran while the
+    // continuation was parked wrote through the cell, and those writes
+    // must not be undone by the snapshot copy -- then the upvalue
+    // re-opens onto the slot and rejoins vm->open_upvalues, which both
+    // restores the alias and puts it back where stack relocation
+    // (updateStackReferences) can rebase it. Insertion keeps the list's
+    // descending-address order; the restored slots normally sit above
+    // every live open upvalue (the splice lands on top of the stack), but
+    // the walk assumes nothing.
+    for (int i = 0; i < cont->upvalue_count; i++) {
+        ObjUpvalue* uv = cont->upvalues[i].upvalue;
+        Value* slot = &vm->stack[restore_base + cont->upvalues[i].slot];
+
+        *slot = *uv->location;
+        uv->location = slot;
+
+        if (vm->open_upvalues == NULL || vm->open_upvalues->location < slot) {
+            uv->next = vm->open_upvalues;
+            vm->open_upvalues = uv;
+        } else {
+            ObjUpvalue* prev = vm->open_upvalues;
+            while (prev->next != NULL && prev->next->location > slot) {
+                prev = prev->next;
+            }
+            uv->next = prev->next;
+            prev->next = uv;
+        }
+    }
+
     vm->ip = cont->saved_ip;
     vm->chunk = cont->saved_chunk;
     // Added, not assigned. The field counts only what the captured frames
@@ -624,6 +686,12 @@ bool resumeContinuation(VM* vm, ObjContinuation* cont, Value resume_value) {
     }
     cont->resumes = NULL;
     cont->resume_count = 0;
+
+    if (cont->upvalues != NULL && cont->upvalue_count > 0) {
+        FREE_ARRAY(vm, ContUpvalue, cont->upvalues, cont->upvalue_count);
+    }
+    cont->upvalues = NULL;
+    cont->upvalue_count = 0;
 
     return true;
 }

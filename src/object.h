@@ -243,6 +243,14 @@ typedef enum {
     CONT_INVALID
 } ContinuationState;
 
+// One open upvalue captured with a continuation's extent: the upvalue
+// object and its slot offset within the captured stack slice. See the
+// field comment on ObjContinuation.upvalues.
+typedef struct {
+    ObjUpvalue* upvalue;
+    int slot;
+} ContUpvalue;
+
 typedef struct ObjContinuation {
     Obj obj;
     CallFrame* frames;
@@ -301,6 +309,25 @@ typedef struct ObjContinuation {
     // and Cont.resume pushes it for itself.
     ResumeContext* resumes;
     int resume_count;
+    // Open upvalues that pointed INTO the captured extent at capture time.
+    // closeUpvalues seals them at capture, which is right on its own: the
+    // frames unwind, and an escaped closure must keep working even if the
+    // continuation is never resumed. But the seal splits one binding into
+    // two homes, the restored frame's stack slot and the closure's cell,
+    // and nothing put the alias back. Recording (upvalue, slot) pairs lets
+    // resume do it: the cell's CURRENT value wins over the snapshot slot
+    // (a closure called while the continuation was parked wrote through
+    // the cell, and the binding is one location for its whole life), the
+    // upvalue re-opens onto the restored slot, and it rejoins
+    // vm->open_upvalues so stack relocation keeps rebasing it. One-shot
+    // resume is what makes this sound: there is never a second restored
+    // copy competing for the same cell.
+    //
+    // `slot` is relative to stack_base_offset, rebased on resume exactly
+    // as the stack is. Freed with the other buffers at resume and in
+    // freeObject; the upvalue objects are marked in blackenObject.
+    ContUpvalue* upvalues;
+    int upvalue_count;
     // Absolute frame index the captured frames started at (the delimiting
     // prompt's frame_index). The frame counterpart of stack_base_offset /
     // spill_base_offset: restored frame_index = vm->frame_count + (saved -

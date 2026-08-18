@@ -602,6 +602,14 @@ static void blackenObject(VM* vm, Obj* object) {
                     markObject(vm, (Obj*)cont->prompts[i].tag);
                 }
             }
+
+            // The recorded open upvalues are usually reachable through the
+            // captured stack's closures too, but that is incidental: this
+            // list is the invariant root, and an upvalue whose closure was
+            // dropped after capture must still survive for the relink.
+            for (int i = 0; i < cont->upvalue_count; i++) {
+                markObject(vm, (Obj*)cont->upvalues[i].upvalue);
+            }
             break;
         }
     }
@@ -783,6 +791,10 @@ void freeObject(VM* vm, Obj* object) {
             // nothing in here for the GC to reach. It still has to be freed.
             if (cont->resumes != NULL && cont->resume_count > 0) {
                 FREE_ARRAY(vm, ResumeContext, cont->resumes, cont->resume_count);
+            }
+
+            if (cont->upvalues != NULL && cont->upvalue_count > 0) {
+                FREE_ARRAY(vm, ContUpvalue, cont->upvalues, cont->upvalue_count);
             }
 
             FREE(vm, ObjContinuation, object);
