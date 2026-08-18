@@ -58,6 +58,33 @@ ObjString* tableFindString(Table* table, const char* chars, int length, uint32_t
     }
 }
 
+ObjString* tableFindStringParts(Table* table, ObjString** parts, int count,
+                                int total_len, uint32_t hash) {
+    if (table->count == 0) return NULL;
+
+    uint32_t index = hash & (table->capacity - 1);
+    for (;;) {
+        Entry* entry = &table->entries[index];
+        if (entry->key == NULL) {
+            if (IS_NULL(entry->value)) return NULL;
+        } else if (entry->key->byte_length == total_len &&
+                   entry->key->hash == hash) {
+            const char* p = entry->key->chars;
+            bool match = true;
+            for (int i = 0; i < count; i++) {
+                if (memcmp(p, parts[i]->chars, (size_t)parts[i]->byte_length) != 0) {
+                    match = false;
+                    break;
+                }
+                p += parts[i]->byte_length;
+            }
+            if (match) return entry->key;
+        }
+
+        index = (index + 1)  & (table->capacity - 1);
+    }
+}
+
 ObjString* tableFindStringPair(Table* table,
                                const char* a_chars, int a_len,
                                const char* b_chars, int b_len,

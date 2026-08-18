@@ -47,13 +47,108 @@ static ObjString* allocateString(VM* vm, const char* src, int byte_length, uint3
     return string;
 }
 
-static uint32_t hashString(const char* key, int length) {
+// ---- String hashing (see object.h) ----------------------------------------
+// Bulk path: wyhash-style 64x64->128 multiply-fold per 8-byte word, seeded
+// with the length. The tail (0..7 bytes) is folded through the same mixer.
+// A streaming caller feeds words in the same order the flat caller reads
+// them, so the two agree bit for bit; the tail is assembled identically.
+static inline uint64_t hash_mix64(uint64_t a, uint64_t b) {
+    unsigned __int128 r = (unsigned __int128)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+#define HASH_P0 0xa0761d6478bd642full
+#define HASH_P1 0xe7037ed1a0b428dbull
+#define HASH_SEED0 0x9e3779b97f4a7c15ull
+
+static inline uint32_t hash_fnv_flat(const char* key, int length) {
     uint32_t hash = 2166136261u;
     for (int i = 0; i < length; i++) {
         hash ^= (uint8_t)key[i];
         hash *= 16777619;
     }
     return hash;
+}
+
+// Tail word for the last `rem` (0..7) bytes, identical whether the bytes
+// arrive flat or staged: little-endian packing of the bytes in order.
+static inline uint64_t hash_tail_word(const uint8_t* p, int rem) {
+    uint64_t t = 0;
+    for (int i = 0; i < rem; i++) t |= (uint64_t)p[i] << (8 * i);
+    return t;
+}
+
+static inline uint32_t hash_bulk_finish(uint64_t seed, uint64_t tail_word, int rem) {
+    // Mix the tail (length of tail folded in so "abc"+"" and "ab"+"c"
+    // agree only through identical byte sequences, never through
+    // coincidental word equality).
+    seed = hash_mix64(tail_word ^ HASH_P0 ^ (uint64_t)rem, seed ^ HASH_P1);
+    return (uint32_t)hash_mix64(seed, HASH_P1);
+}
+
+uint32_t zymHashString(const char* key, int length) {
+    if (length < ZYM_HASH_BULK_MIN) return hash_fnv_flat(key, length);
+    uint64_t seed = HASH_SEED0 ^ (uint64_t)length;
+    const uint8_t* p = (const uint8_t*)key;
+    int rem = length;
+    while (rem >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        seed = hash_mix64(w ^ HASH_P0, seed ^ HASH_P1);
+        p += 8; rem -= 8;
+    }
+    return hash_bulk_finish(seed, hash_tail_word(p, rem), rem);
+}
+
+void zymHashInit(ZymHashStream* h, int total_length) {
+    h->expected = total_length;
+    h->total = 0;
+    h->staged = 0;
+    h->stage = 0;
+    h->fnv = 2166136261u;
+    h->seed = HASH_SEED0 ^ (uint64_t)total_length;
+}
+
+void zymHashFeed(ZymHashStream* h, const char* bytes, int length) {
+    const uint8_t* p = (const uint8_t*)bytes;
+    if (h->expected < ZYM_HASH_BULK_MIN) {
+        for (int i = 0; i < length; i++) { h->fnv ^= p[i]; h->fnv *= 16777619; }
+        h->total += length;
+        return;
+    }
+    int i = 0;
+    // Fill a partially staged word first.
+    while (h->staged > 0 && h->staged < 8 && i < length) {
+        h->stage |= (uint64_t)p[i] << (8 * h->staged);
+        h->staged++; i++;
+    }
+    if (h->staged == 8) {
+        h->seed = hash_mix64(h->stage ^ HASH_P0, h->seed ^ HASH_P1);
+        h->staged = 0; h->stage = 0;
+    }
+    // Whole words straight from the input.
+    while (length - i >= 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h->seed = hash_mix64(w ^ HASH_P0, h->seed ^ HASH_P1);
+        i += 8;
+    }
+    // Stage the remainder.
+    while (i < length) {
+        h->stage |= (uint64_t)p[i] << (8 * h->staged);
+        h->staged++; i++;
+    }
+    h->total += length;
+}
+
+uint32_t zymHashFinish(ZymHashStream* h) {
+    if (h->expected < ZYM_HASH_BULK_MIN) return h->fnv;
+    // Anything still staged is exactly the flat path's tail (< 8 bytes,
+    // because a full stage word was mixed the moment it filled).
+    return hash_bulk_finish(h->seed, h->stage, h->staged);
+}
+
+static uint32_t hashString(const char* key, int length) {
+    return zymHashString(key, length);
 }
 
 ObjString* takeString(VM* vm, char* chars, int length) {
@@ -84,6 +179,56 @@ ObjString* copyString(VM* vm, const char* chars, int length) {
     return allocateString(vm, chars, length, hash);
 }
 
+ObjString* concatStringsN(VM* vm, Value* parts, int count) {
+    // Bounded scratch: CONCAT_N's count is an 8-bit operand, so 255 is the
+    // hard ceiling and a stack array is fine (no allocation before we know
+    // the intern probe missed).
+    ObjString* strs[256];
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        ObjString* s = AS_STRING(parts[i]);
+        strs[i] = s;
+        total += (size_t)s->byte_length;
+    }
+    if (total > (size_t)INT32_MAX - 1) {
+        runtimeError(vm, "Concatenation result too large.");
+        return NULL;
+    }
+    int byte_length = (int)total;
+
+    // Stream the hash across the pieces: bit-identical to zymHashString
+    // over the joined bytes, so the intern probe below finds a string
+    // built any other way.
+    ZymHashStream hs;
+    zymHashInit(&hs, byte_length);
+    for (int i = 0; i < count; i++) {
+        zymHashFeed(&hs, strs[i]->chars, strs[i]->byte_length);
+    }
+    uint32_t hash = zymHashFinish(&hs);
+
+    ObjString* interned = tableFindStringParts(&vm->strings, strs, count, byte_length, hash);
+    if (interned != NULL) return interned;
+
+    // Parts are reachable from the caller's registers (they are the operand
+    // window), and strings never move, so the pointers survive the allocation.
+    ObjString* string = (ObjString*)allocateObject(vm,
+        sizeof(ObjString) + (size_t)byte_length + 1, OBJ_STRING);
+    string->byte_length = byte_length;
+    string->hash = hash;
+    char* p = string->chars;
+    for (int i = 0; i < count; i++) {
+        memcpy(p, strs[i]->chars, (size_t)strs[i]->byte_length);
+        p += strs[i]->byte_length;
+    }
+    *p = '\0';
+    string->length = utf8_strlen(string->chars, byte_length);
+
+    pushTempRoot(vm, (Obj*)string);
+    tableSet(vm, &vm->strings, string, NULL_VAL);
+    popTempRoot(vm);
+    return string;
+}
+
 ObjString* concatStrings(VM* vm, ObjString* a, ObjString* b) {
     // Buffer-free concat: stream the hash across both halves, probe the
     // intern table with a two-segment compare, and only on a miss write
@@ -91,15 +236,11 @@ ObjString* concatStrings(VM* vm, ObjString* a, ObjString* b) {
     // two memcpys, no temporary. GC safety: `a` and `b` are reachable
     // from the caller's stack slots and strings never move, so the
     // pointers stay valid across the allocation.
-    uint32_t hash = 2166136261u;
-    for (int i = 0; i < a->byte_length; i++) {
-        hash ^= (uint8_t)a->chars[i];
-        hash *= 16777619;
-    }
-    for (int i = 0; i < b->byte_length; i++) {
-        hash ^= (uint8_t)b->chars[i];
-        hash *= 16777619;
-    }
+    ZymHashStream hs;
+    zymHashInit(&hs, a->byte_length + b->byte_length);
+    zymHashFeed(&hs, a->chars, a->byte_length);
+    zymHashFeed(&hs, b->chars, b->byte_length);
+    uint32_t hash = zymHashFinish(&hs);
 
     ObjString* interned = tableFindStringPair(&vm->strings,
         a->chars, a->byte_length, b->chars, b->byte_length, hash);

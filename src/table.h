@@ -18,4 +18,8 @@ ObjString* tableFindStringPair(Table* table,
                                const char* a_chars, int a_len,
                                const char* b_chars, int b_len,
                                uint32_t hash);
+// N-segment variant for CONCAT_N interning: matches a key whose content is
+// the concatenation of the given string parts, in order.
+ObjString* tableFindStringParts(Table* table, ObjString** parts, int count,
+                                int total_len, uint32_t hash);
 void tableRemoveWhite(Table* table);

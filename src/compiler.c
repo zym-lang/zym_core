@@ -2418,6 +2418,87 @@ static void compile_expression(Compiler* compiler, Expr* expr, int target_reg) {
                 break;
             }
 
+            // Chained `+`: `a + b + c [+ ...]` parses left-associative as
+            // ((a + b) + c), which naively compiles to one ADD per `+` and,
+            // when the operands are strings, materializes an intermediate
+            // string per step (a copied N times, b N-1 times...). Fold the
+            // whole left spine into one CONCAT_N over consecutive registers;
+            // the runtime builds strings in a single allocation and falls
+            // back to exact pairwise semantics for anything else, so this
+            // is purely a codegen change. Only fires for 3+ operands -- the
+            // 2-operand case keeps the ADD family and its _I/_L fast paths.
+            if (expr->as.binary.operator.type == TOKEN_PLUS) {
+                int chain_len = 1;
+                Expr* spine = expr;
+                while (spine->type == EXPR_BINARY &&
+                       spine->as.binary.operator.type == TOKEN_PLUS) {
+                    chain_len++;
+                    spine = spine->as.binary.left;
+                }
+                if (chain_len >= 3 && chain_len <= 255) {
+                    // Collect operands left-to-right (spine is stored
+                    // right-nested from the left, so walk it into a
+                    // reversed array).
+                    Expr* operands[256];
+                    int n = chain_len;
+                    Expr* cur = expr;
+                    for (int i = n - 1; i >= 1; i--) {
+                        operands[i] = cur->as.binary.right;
+                        cur = cur->as.binary.left;
+                    }
+                    operands[0] = cur;
+
+                    // In-place fast path: if every operand is an unspilled
+                    // local already sitting in consecutive registers (the
+                    // common `a + b + c` over params or adjacent locals),
+                    // use them where they are -- no MOVEs, no window. Uses
+                    // resolve_local_index (not resolve_local, which emits a
+                    // spill load as a side effect); a spilled local simply
+                    // disqualifies the path.
+                    {
+                        int first_reg = -1;
+                        bool contiguous = true;
+                        for (int i = 0; i < n && contiguous; i++) {
+                            Expr* o = operands[i];
+                            if (o->type != EXPR_VARIABLE) { contiguous = false; break; }
+                            int idx = resolve_local_index(compiler, &o->as.variable.name);
+                            if (idx == -1 || compiler->locals[idx].is_spilled) { contiguous = false; break; }
+                            int r = compiler->locals[idx].reg;
+                            if (i == 0) first_reg = r;
+                            else if (r != first_reg + i) contiguous = false;
+                        }
+                        if (contiguous) {
+                            emit_instruction(compiler,
+                                PACK_ABC(CONCAT_N, target_reg, first_reg, n), expr->line);
+                            restore_temp_top_preserve(compiler, saved_top, target_reg);
+                            break;
+                        }
+                    }
+
+                    // Reserve the operand window up front (same discipline
+                    // as call argument layout) so each operand's own temps
+                    // land above the whole window, never on a later slot.
+                    int base = compiler->next_register;
+                    compiler->next_register += n;
+                    if (compiler->next_register > compiler->temp_alloc_cap) {
+                        compiler_error(compiler, expr->line,
+                            "Out of registers (%d needed, %d available): concatenation too long.",
+                            compiler->next_register, compiler->temp_alloc_cap);
+                        break;
+                    }
+                    if (compiler->next_register > compiler->max_register_seen) {
+                        compiler->max_register_seen = compiler->next_register;
+                    }
+                    for (int i = 0; i < n; i++) {
+                        COMPILE_REQUIRED(compiler, operands[i], base + i);
+                    }
+                    emit_instruction(compiler,
+                        PACK_ABC(CONCAT_N, target_reg, base, n), expr->line);
+                    restore_temp_top_preserve(compiler, saved_top, target_reg);
+                    break;
+                }
+            }
+
             // Check if right operand is a constant number literal
             bool right_is_const = (expr->as.binary.right->type == EXPR_LITERAL &&
                                    expr->as.binary.right->as.literal.literal.type == TOKEN_NUMBER);

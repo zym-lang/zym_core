@@ -394,6 +394,11 @@ int disassembleInstructionToFile(Chunk* chunk, int offset, FILE* f) {
         case POST_DEC: return reg_instruction_ab(f, "POST_DEC", instruction, offset);
         case SPILL_LOAD:  return reg_instruction_abx(f, "SPILL_LOAD",  instruction, offset);
         case SPILL_STORE: return reg_instruction_abx(f, "SPILL_STORE", instruction, offset);
+        case CONCAT_N: {
+            uint8_t a = REG_A(instruction), b = REG_B(instruction), c = REG_C(instruction);
+            fprintf(f, "%-16s R%-3d, R%d..R%d (%d)\n", "CONCAT_N", a, b, b + c - 1, c);
+            return offset + 1;
+        }
         case RET: {
             uint32_t instr = instruction;
             uint8_t  a  = REG_A(instr);

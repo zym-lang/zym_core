@@ -352,12 +352,48 @@ ObjFunction* newFunction(VM* vm);
 ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher);
 ObjNativeContext* newNativeContext(VM* vm, void* native_data, NativeFinalizerFunc finalizer);
 ObjNativeClosure* newNativeClosure(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher, Value context);
+// ---- String hashing ------------------------------------------------------
+// ONE hash function per content, everywhere a string enters or probes the
+// intern table (copy/take/concat/concatN, and zym_mapHas from the C API).
+// Length-dispatched: FNV-1a for short keys (< ZYM_HASH_BULK_MIN bytes),
+// where its two-instruction step beats any wide mixer's setup cost and it
+// spreads 1-3 byte keys slightly better; an 8-bytes-per-step multiplicative
+// mixer above that, where FNV's byte-serial dependent multiply chain is the
+// bottleneck (measured 6x on 80-byte concat results, equal collision
+// behavior at the birthday floor). Length is part of the content, so equal
+// strings always take the same branch -- deterministic, no dual-hash risk.
+//
+// The streaming form exists so concatenation can hash across segment
+// boundaries without materializing the joined bytes: it stages bytes into
+// an 8-byte word and mixes each full word, and its result is bit-identical
+// to zymHashString over the joined content (the invariant interning needs).
+#define ZYM_HASH_BULK_MIN 8
+
+typedef struct {
+    uint64_t seed;      // running mixer state (bulk path)
+    uint64_t stage;     // partial word being filled
+    int      staged;    // bytes currently in `stage` (0..7)
+    uint32_t fnv;       // running FNV state (short path)
+    int      total;     // total length, decides the path at finish
+    int      expected;  // declared total length (fixed at init)
+} ZymHashStream;
+
+uint32_t zymHashString(const char* key, int length);
+void     zymHashInit(ZymHashStream* h, int total_length);
+void     zymHashFeed(ZymHashStream* h, const char* bytes, int length);
+uint32_t zymHashFinish(ZymHashStream* h);
+
 ObjString* takeString(VM* vm, char* chars, int length);
 ObjString* copyString(VM* vm, const char* chars, int length);
 // Concatenation without a temporary buffer: hash streams across both
 // halves, the intern probe compares in two segments, and on a miss the
 // content is written directly into the new string's tail.
 ObjString* concatStrings(VM* vm, ObjString* a, ObjString* b);
+// N-ary form for CONCAT_N: `parts[0..count)` are all strings (the caller
+// checked). One sized allocation, hash streamed across every piece, and an
+// n-segment intern probe -- no intermediates. Sizes are summed in size_t and
+// bounded to the int byte_length range before allocating.
+ObjString* concatStringsN(VM* vm, Value* parts, int count);
 void printObject(Value value);
 Obj* allocateObject(VM* vm, size_t size, ObjType type);
 ObjClosure* newClosure(VM* vm, ObjFunction* function);

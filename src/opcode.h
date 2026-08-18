@@ -210,4 +210,14 @@ typedef enum {
     SPILL_LOAD,    // Ra = spill[Bx]   (load a spilled value back into a register)
     SPILL_STORE,   // spill[Bx] = Ra   (evict a register value to the spill area)
 
+    // Chained `+` over N >= 3 consecutive registers: Ra = Rb + Rb+1 + ... + Rb+C-1
+    // (A:8 dest, B:8 first operand, C:8 count). Emitted by the compiler for
+    // left-associative `+` chains so `a + b + c + d` becomes one instruction.
+    // Runtime: when every operand is a string, one sized allocation with the
+    // hash streamed across all pieces and an n-segment intern probe -- no
+    // intermediate strings exist. Otherwise it evaluates strictly left to
+    // right with exactly the pairwise `+` semantics (numbers add, mixed is
+    // the same runtime error), so folding never changes a program's meaning.
+    CONCAT_N,
+
 } OpCode;

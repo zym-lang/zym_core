@@ -1112,6 +1112,7 @@ static InterpretResult run(VM* vm) {
         JUMP_ENTRY(POST_DEC),
         JUMP_ENTRY(SPILL_LOAD),
         JUMP_ENTRY(SPILL_STORE),
+        JUMP_ENTRY(CONCAT_N),
     };
 #undef JUMP_ENTRY
 
@@ -4094,6 +4095,54 @@ static InterpretResult run(VM* vm) {
     // Register spill: evict register A to spill slot Bx.
     OP(SPILL_STORE) {
         sp[REG_Bx(instr)] = bp[REG_A(instr)];
+        DISPATCH();
+    }
+    // Ra = Rb + Rb+1 + ... + Rb+C-1 (see opcode.h). All-strings fast path
+    // builds the result in one allocation; anything else falls back to the
+    // exact pairwise `+` semantics, left to right, so numeric and mixed
+    // chains behave precisely as the unfused ADD sequence did -- including
+    // erroring at the same operand.
+    OP(CONCAT_N) {
+        int first = REG_B(instr);
+        int count = REG_C(instr);
+        Value* parts = &bp[first];
+
+        bool all_strings = true;
+        for (int i = 0; i < count; i++) {
+            if (!IS_STRING(parts[i])) { all_strings = false; break; }
+        }
+
+        if (all_strings) {
+            STORE_IP();
+            ObjString* result = concatStringsN(vm, parts, count);
+            if (result == NULL) { STORE_STATE(); return INTERPRET_RUNTIME_ERROR; }
+            RELOAD_STACK(); // GC may have reallocated stack
+            bp[REG_A(instr)] = OBJ_VAL(result);
+            DISPATCH();
+        }
+
+        // Pairwise fallback. `acc` is kept in a C local between steps; a
+        // string step can allocate, so the operand window is re-read
+        // through bp after every RELOAD_STACK.
+        Value acc = parts[0];
+        for (int i = 1; i < count; i++) {
+            Value rhs = bp[first + i];
+            if (IS_DOUBLE(acc) && IS_DOUBLE(rhs)) {
+                acc = DOUBLE_VAL(AS_DOUBLE(acc) + AS_DOUBLE(rhs));
+            } else if (IS_STRING(acc) && IS_STRING(rhs)) {
+                // Root the accumulator across the allocation: unlike the
+                // window operands it lives only in this C local.
+                pushTempRoot(vm, AS_OBJ(acc));
+                ObjString* s = concatStrings(vm, AS_STRING(acc), AS_STRING(rhs));
+                popTempRoot(vm);
+                RELOAD_STACK();
+                acc = OBJ_VAL(s);
+            } else {
+                STORE_IP(); runtimeError(vm, "Operands for '+' must be two numbers or two strings.");
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            }
+        }
+        bp[REG_A(instr)] = acc;
         DISPATCH();
     }
 #undef OP
