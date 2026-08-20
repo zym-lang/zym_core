@@ -17,6 +17,19 @@
 #include "./parse_tree.h"
 #include "zym/config.h"
 
+// Grow-on-demand for the Compiler's heap-backed bookkeeping tables
+// (hoisted, labels, schemas, global_decls). Entries are appended rarely,
+// so they start NULL and grow geometrically like `locals`/`upvalues`;
+// the MAX_* ceilings are still enforced by the append sites.
+#define ENSURE_BOOKKEEPING_CAP(c, type, arr, count, cap)                       \
+    do {                                                                       \
+        if ((c)->count >= (c)->cap) {                                          \
+            int _old_cap = (c)->cap;                                           \
+            (c)->cap = GROW_CAPACITY(_old_cap);                                \
+            (c)->arr = GROW_ARRAY((c)->vm, type, (c)->arr, _old_cap, (c)->cap);\
+        }                                                                      \
+    } while (0)
+
 /* Phase 4.5 compiler resolution-trace hook — test-only. When
  * ZYM_HAS_BUILD_TESTING=1, each classified identifier emits one trace
  * record; otherwise the macro expands to nothing so shipping builds pay
@@ -3894,6 +3907,8 @@ static void record_global_decl(Compiler* compiler, Token name, int bytecode_pos)
     if (compiler->global_decl_count >= MAX_GLOBAL_DECLS) {
         return; // Silently ignore if too many globals (unlikely)
     }
+    ENSURE_BOOKKEEPING_CAP(compiler, GlobalDecl, global_decls,
+                           global_decl_count, global_decl_capacity);
     compiler->global_decls[compiler->global_decl_count++] = (GlobalDecl){
         .bytecode_pos = bytecode_pos,
         .name = name
@@ -4006,6 +4021,14 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         case STMT_STRUCT_DECLARATION: {
             StructDeclStmt* struct_stmt = &stmt->as.struct_declaration;
 
+            // Grow the schema table BEFORE creating any objects: the grow
+            // may trigger a collection, and the schema built below is only
+            // GC-reachable once it lands in this table.
+            if (compiler->struct_schema_count < MAX_LOCALS) {
+                ENSURE_BOOKKEEPING_CAP(compiler, StructSchema, struct_schemas,
+                                       struct_schema_count, struct_schema_capacity);
+            }
+
             // Create interned field names
             ObjString** field_names = ALLOCATE(compiler->vm, ObjString*, struct_stmt->field_count);
             for (int i = 0; i < struct_stmt->field_count; i++) {
@@ -4043,6 +4066,14 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
         }
         case STMT_ENUM_DECLARATION: {
             EnumDeclStmt* enum_stmt = &stmt->as.enum_declaration;
+
+            // Grow the schema table BEFORE creating any objects: the grow
+            // may trigger a collection, and the schema built below is only
+            // GC-reachable once it lands in this table.
+            if (compiler->enum_schema_count < MAX_LOCALS) {
+                ENSURE_BOOKKEEPING_CAP(compiler, EnumSchema, enum_schemas,
+                                       enum_schema_count, enum_schema_capacity);
+            }
 
             // Create interned variant names
             ObjString** variant_names = ALLOCATE(compiler->vm, ObjString*, enum_stmt->variant_count);
@@ -4739,6 +4770,8 @@ static bool compile_statement(Compiler* compiler, Stmt* stmt) {
 
             // Register label at current instruction address
             int addr = compiler->compiling_chunk->count;
+            ENSURE_BOOKKEEPING_CAP(compiler, Label, labels,
+                                   label_count, label_capacity);
             compiler->labels[compiler->label_count++] = (Label){
                 .name = *label_name,
                 .instruction_address = addr,
@@ -4955,23 +4988,27 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->local_count = 0;
     compiler->local_capacity = 0;
 
-    memset(compiler->hoisted, 0, sizeof(compiler->hoisted));
+    compiler->hoisted = NULL;
     compiler->hoisted_count = 0;
+    compiler->hoisted_capacity = 0;
 
-    memset(compiler->local_hoisted, 0, sizeof(compiler->local_hoisted));
+    compiler->local_hoisted = NULL;
     compiler->local_hoisted_count = 0;
+    compiler->local_hoisted_capacity = 0;
 
     compiler->owned_names = NULL;
     compiler->owned_names_count = 0;
     compiler->owned_names_cap = 0;
 
     // Initialize struct schema tracking
-    memset(compiler->struct_schemas, 0, sizeof(compiler->struct_schemas));
+    compiler->struct_schemas = NULL;
     compiler->struct_schema_count = 0;
+    compiler->struct_schema_capacity = 0;
 
     // Initialize enum schema tracking
-    memset(compiler->enum_schemas, 0, sizeof(compiler->enum_schemas));
+    compiler->enum_schemas = NULL;
     compiler->enum_schema_count = 0;
+    compiler->enum_schema_capacity = 0;
 
     // Initialize global type tracking
     compiler->global_types = NULL;
@@ -4988,15 +5025,17 @@ static void init_compiler(Compiler* compiler, VM* vm, Compiler* enclosing) {
     compiler->result_needed = true;
 
     // Initialize label and goto tracking
-    memset(compiler->labels, 0, sizeof(compiler->labels));
+    compiler->labels = NULL;
     compiler->label_count = 0;
+    compiler->label_capacity = 0;
     compiler->pending_gotos = NULL;
     compiler->pending_goto_count = 0;
     compiler->pending_goto_capacity = 0;
 
     // Initialize global declaration tracking
-    memset(compiler->global_decls, 0, sizeof(compiler->global_decls));
+    compiler->global_decls = NULL;
     compiler->global_decl_count = 0;
+    compiler->global_decl_capacity = 0;
 
     // Symbol stripping state (populated on the root compiler only).
     compiler->strip_names = NULL;
@@ -5130,6 +5169,8 @@ static void declare_function(Compiler* compiler, Stmt* stmt) {
 
     // Record this function as hoisted so we know its base name + arity later.
     if (compiler->hoisted_count < MAX_HOISTED) {
+        ENSURE_BOOKKEEPING_CAP(compiler, HoistedFn, hoisted,
+                               hoisted_count, hoisted_capacity);
         compiler->hoisted[compiler->hoisted_count].name = func_stmt->name;
         compiler->hoisted[compiler->hoisted_count].arity = func_stmt->param_count;
         compiler->hoisted[compiler->hoisted_count].is_variadic = is_variadic;
@@ -5168,6 +5209,8 @@ static void collect_local_hoisted_in_stmt(Compiler* c, Stmt* s) {
                 }
 
                 if (c->local_hoisted_count < MAX_LOCALS) {
+                    ENSURE_BOOKKEEPING_CAP(c, HoistedFn, local_hoisted,
+                                           local_hoisted_count, local_hoisted_capacity);
                     c->local_hoisted[c->local_hoisted_count].name  = fd->name;
                     c->local_hoisted[c->local_hoisted_count].arity = fd->param_count;
                     c->local_hoisted[c->local_hoisted_count].is_variadic = is_variadic;
@@ -5686,6 +5729,26 @@ static ObjFunction* compile_function_body(Compiler* current_compiler, FuncDeclSt
         FREE_ARRAY(fn_compiler.vm, PendingGoto, fn_compiler.pending_gotos, fn_compiler.pending_goto_capacity);
     }
 
+    // Clean up the heap-backed bookkeeping tables
+    if (fn_compiler.hoisted) {
+        FREE_ARRAY(fn_compiler.vm, HoistedFn, fn_compiler.hoisted, fn_compiler.hoisted_capacity);
+    }
+    if (fn_compiler.local_hoisted) {
+        FREE_ARRAY(fn_compiler.vm, HoistedFn, fn_compiler.local_hoisted, fn_compiler.local_hoisted_capacity);
+    }
+    if (fn_compiler.struct_schemas) {
+        FREE_ARRAY(fn_compiler.vm, StructSchema, fn_compiler.struct_schemas, fn_compiler.struct_schema_capacity);
+    }
+    if (fn_compiler.enum_schemas) {
+        FREE_ARRAY(fn_compiler.vm, EnumSchema, fn_compiler.enum_schemas, fn_compiler.enum_schema_capacity);
+    }
+    if (fn_compiler.labels) {
+        FREE_ARRAY(fn_compiler.vm, Label, fn_compiler.labels, fn_compiler.label_capacity);
+    }
+    if (fn_compiler.global_decls) {
+        FREE_ARRAY(fn_compiler.vm, GlobalDecl, fn_compiler.global_decls, fn_compiler.global_decl_capacity);
+    }
+
     // Protect the function with temp_roots before restoring parent compiler
     // The function is no longer reachable via compiler chain after we restore vm->compiler
     // The caller must pop this after adding the function to constants
@@ -6128,6 +6191,26 @@ cleanup_on_error:
     // Clean up pending gotos array
     if (compiler.pending_gotos) {
         FREE_ARRAY(vm, PendingGoto, compiler.pending_gotos, compiler.pending_goto_capacity);
+    }
+
+    // Clean up the heap-backed bookkeeping tables
+    if (compiler.hoisted) {
+        FREE_ARRAY(vm, HoistedFn, compiler.hoisted, compiler.hoisted_capacity);
+    }
+    if (compiler.local_hoisted) {
+        FREE_ARRAY(vm, HoistedFn, compiler.local_hoisted, compiler.local_hoisted_capacity);
+    }
+    if (compiler.struct_schemas) {
+        FREE_ARRAY(vm, StructSchema, compiler.struct_schemas, compiler.struct_schema_capacity);
+    }
+    if (compiler.enum_schemas) {
+        FREE_ARRAY(vm, EnumSchema, compiler.enum_schemas, compiler.enum_schema_capacity);
+    }
+    if (compiler.labels) {
+        FREE_ARRAY(vm, Label, compiler.labels, compiler.label_capacity);
+    }
+    if (compiler.global_decls) {
+        FREE_ARRAY(vm, GlobalDecl, compiler.global_decls, compiler.global_decl_capacity);
     }
 
     // Check if any errors occurred during compilation.

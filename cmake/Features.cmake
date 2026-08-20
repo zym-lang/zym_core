@@ -33,8 +33,17 @@ set(_ZYM_CORE_FEATURES_DIR "${CMAKE_CURRENT_LIST_DIR}")
 # Must be called before `zym_core_apply_features`.
 # ---------------------------------------------------------------------------
 function(zym_core_declare_features)
+    # On-device (ESP-IDF) builds default the tooling surface OFF: the MCU
+    # pays nothing for the LSP machinery. Desktop builds keep it ON.
+    if(DEFINED ESP_PLATFORM)
+        set(_zym_lsp_default OFF)
+    else()
+        set(_zym_lsp_default ON)
+    endif()
+
     option(ZYM_ENABLE_LSP_SURFACE
-        "Umbrella: parse tree + symbols + native metadata + diag codes" ON)
+        "Umbrella: parse tree + symbols + native metadata + diag codes"
+        ${_zym_lsp_default})
 
     option(ZYM_ENABLE_PARSE_TREE_RETENTION
         "Retain AST past codegen (required for LSP queries)"

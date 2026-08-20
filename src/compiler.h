@@ -194,21 +194,29 @@ typedef struct Compiler {
     int upvalue_count;
     int upvalue_capacity;
 
-    HoistedFn hoisted[MAX_HOISTED];
+    // Heap-backed, grow-on-demand (same idiom as `locals`/`upvalues`): as
+    // inline arrays, these six bookkeeping tables put ~150KB on the C stack
+    // per function-nesting level (one Compiler each), which no MCU-sized
+    // task stack survives. The MAX_* ceilings still apply at append sites.
+    HoistedFn* hoisted;
     int hoisted_count;
+    int hoisted_capacity;
 
-    HoistedFn local_hoisted[MAX_LOCALS];
+    HoistedFn* local_hoisted;
     int local_hoisted_count;
+    int local_hoisted_capacity;
 
     char** owned_names;
     int    owned_names_count;
     int    owned_names_cap;
 
-    StructSchema struct_schemas[MAX_LOCALS];
+    StructSchema* struct_schemas;
     int struct_schema_count;
+    int struct_schema_capacity;
 
-    EnumSchema enum_schemas[MAX_LOCALS];
+    EnumSchema* enum_schemas;
     int enum_schema_count;
+    int enum_schema_capacity;
 
     GlobalType* global_types;
     int global_type_count;
@@ -218,15 +226,17 @@ typedef struct Compiler {
     bool in_tail_position;
     bool result_needed;
 
-    Label labels[MAX_LABELS];
+    Label* labels;
     int label_count;
+    int label_capacity;
 
     PendingGoto* pending_gotos;
     int pending_goto_count;
     int pending_goto_capacity;
 
-    GlobalDecl global_decls[MAX_GLOBAL_DECLS];
+    GlobalDecl* global_decls;
     int global_decl_count;
+    int global_decl_capacity;
 
     ObjString* current_module_name;
 
