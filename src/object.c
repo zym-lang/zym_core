@@ -52,10 +52,28 @@ static ObjString* allocateString(VM* vm, const char* src, int byte_length, uint3
 // with the length. The tail (0..7 bytes) is folded through the same mixer.
 // A streaming caller feeds words in the same order the flat caller reads
 // them, so the two agree bit for bit; the tail is assembled identically.
+#ifdef __SIZEOF_INT128__
 static inline uint64_t hash_mix64(uint64_t a, uint64_t b) {
     unsigned __int128 r = (unsigned __int128)a * b;
     return (uint64_t)r ^ (uint64_t)(r >> 64);
 }
+#else
+// No __int128 on 32-bit targets (RV32/Xtensa MCUs). Schoolbook 64x64->128
+// from 32x32->64 halves; must stay bit-identical to the wide path, since
+// interned hashes travel across platforms inside serialized chunks.
+static inline uint64_t hash_mix64(uint64_t a, uint64_t b) {
+    uint32_t a_lo = (uint32_t)a, a_hi = (uint32_t)(a >> 32);
+    uint32_t b_lo = (uint32_t)b, b_hi = (uint32_t)(b >> 32);
+    uint64_t ll = (uint64_t)a_lo * b_lo;
+    uint64_t lh = (uint64_t)a_lo * b_hi;
+    uint64_t hl = (uint64_t)a_hi * b_lo;
+    uint64_t hh = (uint64_t)a_hi * b_hi;
+    uint64_t mid = (ll >> 32) + (uint32_t)lh + (uint32_t)hl;
+    uint64_t lo = (mid << 32) | (uint32_t)ll;
+    uint64_t hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+    return lo ^ hi;
+}
+#endif
 #define HASH_P0 0xa0761d6478bd642full
 #define HASH_P1 0xe7037ed1a0b428dbull
 #define HASH_SEED0 0x9e3779b97f4a7c15ull

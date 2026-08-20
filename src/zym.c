@@ -2599,9 +2599,13 @@ ZymStatus zym_callv(ZymVM* vm, const char* funcName, int argc, ZymValue* argv) {
     return report_settle(vm, result, prior);
 }
 
-ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc, ZymValue* argv) {
+ZymStatus zym_callClosurev(ZymVM* vm, ZymValue closure, int argc_in, ZymValue* argv) {
     if (!vm) return ZYM_STATUS_RUNTIME_ERROR;
-    if (argc < 0) argc = 0;
+    // volatile: live across the OOM guard's setjmp below, and written on
+    // entry -- gcc's -Wclobbered (an error under ESP-IDF) rejects a plain
+    // parameter for that. Read once into a register-friendly local is not
+    // enough; the clamp is the write that trips the analysis.
+    volatile int argc = (argc_in < 0) ? 0 : argc_in;
 
     // Re-entrancy safety: the parent VM may be mid-evaluation when this is
     // called (e.g., a child VM running a parent native trampoline that
