@@ -27,8 +27,6 @@ ZymValue nativeTypeof(ZymVM* vm, ZymValue value) {
             case OBJ_STRUCT_SCHEMA:   return zym_newString(vm, "struct_schema");
             case OBJ_STRUCT_INSTANCE: return zym_newString(vm, "struct");
             case OBJ_ENUM_SCHEMA:     return zym_newString(vm, "enum_schema");
-            case OBJ_PROMPT_TAG:      return zym_newString(vm, "prompt_tag");
-            case OBJ_CONTINUATION:    return zym_newString(vm, "continuation");
             default:                  return zym_newString(vm, "unknown");
         }
     }

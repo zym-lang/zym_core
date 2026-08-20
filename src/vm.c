@@ -15,7 +15,6 @@
 #include "./native.h"
 #include "zym/zym.h"
 #include "./modules/preemption.h"
-#include "./modules/continuation.h"
 #include "./modules/core_modules.h"
 
 static const char* ERR_MAP_KEYS_TYPE = "Map keys must be strings or numbers.";
@@ -45,11 +44,7 @@ void initVM(VM* vm) {
     vm->ip = NULL;
     vm->frame_count = 0;
     vm->cur_base = 0;
-    vm->active_boundaries = 0;
     vm->current_frame = NULL;
-
-    vm->host_preempt_reserve = 0;
-    vm->has_executed = false;
 
     vm->oom_jmp_armed = false;
 
@@ -96,12 +91,9 @@ void initVM(VM* vm) {
     uint32_t halt = (uint32_t)RET | (0u << 8) | (1u << 16);
     writeInstruction(vm, &vm->api_trampoline, halt, 0);
 
-    vm->prompt_count = 0;
-    vm->next_prompt_tag_id = 1;
 
     vm->preempt_counter = INT32_MAX;
     vm->preempt_armed = INT32_MAX;
-    vm->default_timeslice = DEFAULT_TIMESLICE;
     vm->stop_requested = 0;
     vm->execution_suspended = false;
     memset(vm->preempt_table, 0, sizeof(vm->preempt_table));
@@ -110,11 +102,7 @@ void initVM(VM* vm) {
     }
     vm->preempt_next_id = 0;
     vm->preempt_live_count = 0;
-    vm->preempt_shield_depth = 0;
-    vm->on_preempt_callback = NULL_VAL;
 
-    vm->resume_depth = 0;
-    vm->with_prompt_depth = 0;
 
     vm->error_callback = NULL;
     vm->error_user_data = NULL;
@@ -152,7 +140,7 @@ void freeVM(VM* vm) {
     while (object != NULL) {
         Obj* next = object->next;
 
-        if (object->type < 0 || object->type > OBJ_CONTINUATION) {
+        if (object->type < 0 || object->type > OBJ_ENUM_SCHEMA) {
             fprintf(stderr, "ERROR: Corrupted object detected at %p with invalid type %d during VM cleanup\n",
                     (void*)object, object->type);
             fprintf(stderr, "Stopping cleanup to prevent cascading corruption. This indicates a memory management bug.\n");
@@ -459,22 +447,19 @@ void closeUpvalues(VM* vm, Value* last) {
     #undef MAX_CLOSING_UPVALUES
 }
 
-// --- Preempt/shield bookkeeping owned by a CallFrame ------------------------
+// --- Preempt bookkeeping owned by a CallFrame --------------------------------
 //
-// Two frame flags mean "this frame is holding a mask open":
+// One frame flag means "this frame is holding a mask open":
 //
 //   FRAME_FLAG_PREEMPT          the frame IS a preempt callback; its entry is
 //                               marked in_flight so it cannot re-enter itself.
-//   FRAME_FLAG_DISABLE_PREEMPT  the frame is a Preempt.shield(...) body; it
-//                               owns one level of vm->preempt_shield_depth.
 //
 // EVERY path that pops such a frame must release what it holds and then
-// re-arm, because preemptArm() skips masked entries: while the mask was up the
-// shared countdown was computed from whatever remained (INT32_MAX when nothing
-// else was live), so clearing the guard without recomputing leaves that value
-// in place forever. The entry then never fires again even though its own
-// `remaining` still looks healthy, and a shield permanently retires every
-// maskable entry it suppressed.
+// re-arm, because preemptArm() skips in-flight entries: while the mask was up
+// the shared countdown was computed from whatever remained (INT32_MAX when
+// nothing else was live), so clearing the guard without recomputing leaves
+// that value in place forever. The entry then never fires again even though
+// its own `remaining` still looks healthy.
 //
 // This used to be open-coded at each pop site, and the two native tail-return
 // fast paths in OP(TAIL_CALL) silently omitted it. Route every pop through
@@ -484,10 +469,10 @@ void closeUpvalues(VM* vm, Value* last) {
 // release these -- it reuses the frame and keeps its flags/preempt_id so the
 // eventual RET performs one release for the whole tail chain. Only paths that
 // actually pop belong here.
-#define FRAME_PREEMPT_GUARD_FLAGS (FRAME_FLAG_PREEMPT | FRAME_FLAG_DISABLE_PREEMPT)
+#define FRAME_PREEMPT_GUARD_FLAGS (FRAME_FLAG_PREEMPT)
 
 // True when `frame` holds a mask. Callers gate on this so the overwhelmingly
-// common frame (neither flag) pays one AND + predicted-not-taken branch and
+// common frame (no flag) pays one AND + predicted-not-taken branch and
 // never leaves the caller's straight-line code.
 static inline bool frameHoldsPreemptGuard(const CallFrame* frame) {
     return (frame->flags & FRAME_PREEMPT_GUARD_FLAGS) != 0;
@@ -505,9 +490,6 @@ static void frameClearPreemptGuards(VM* vm, const CallFrame* frame) {
                 break;
             }
         }
-    }
-    if (frame->flags & FRAME_FLAG_DISABLE_PREEMPT) {
-        if (vm->preempt_shield_depth > 0) vm->preempt_shield_depth--;
     }
 }
 
@@ -572,17 +554,6 @@ void lowerStackTop(VM* vm, int new_top) {
     vm->stack_top = new_top;
 }
 
-static inline void restoreResumeMark(VM* vm, const ResumeContext* ctx) {
-    int floor = 0;
-    if (vm->frame_count > 0) {
-        const CallFrame* into = &vm->frames[vm->frame_count - 1];
-        if (into->closure != NULL && into->closure->function != NULL) {
-            floor = into->stack_base + into->closure->function->max_regs;
-        }
-    }
-    lowerStackTop(vm, ctx->saved_stack_top > floor ? ctx->saved_stack_top : floor);
-}
-
 // Pop-site one-liner. `vm` is in scope at every call site.
 #define RELEASE_FRAME_PREEMPT_GUARDS(frame)                       \
     do {                                                          \
@@ -615,11 +586,6 @@ void unwindFrames(VM* vm, int new_frame_count) {
     vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
     vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
 
-    while (vm->with_prompt_depth > 0 &&
-           vm->with_prompt_stack[vm->with_prompt_depth - 1].frame_boundary >= vm->frame_count) {
-        vm->with_prompt_depth--;
-        vm->active_boundaries--;
-    }
 }
 
 static bool validateUpvalue(VM* vm, ObjUpvalue* upvalue, const char* context) {
@@ -883,9 +849,6 @@ static InterpretResult handlePreemption(VM* vm) {
         PreemptEntry* e = &vm->preempt_table[i];
         if (e->slice == 0) continue;
         if (e->in_flight) continue;
-        if ((e->flags & ZYM_PREEMPT_F_MASKABLE) && vm->preempt_shield_depth > 0) {
-            continue;
-        }
         e->remaining -= elapsed;
         if (e->remaining <= 0) fired[fired_count++] = e;
     }
@@ -1150,6 +1113,11 @@ static InterpretResult run(VM* vm) {
 #define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; RELOAD_SP(); } while(0)
 
 #define OP(c) CASE_##c:
+#if ZYM_HAS_HOST_GUARD
+// The host guard's whole dispatch-loop cost lives here: one decrement and one
+// predicted-not-taken branch per instruction (measured ~21% on dispatch-heavy
+// code). Guard-off builds compile the check out entirely; with it goes every
+// mid-run interruption channel (watchdogs, hard stop, memory ceiling).
 #define DISPATCH() do { \
     if (__builtin_expect(--vm->preempt_counter <= 0, 0)) { \
         STORE_STATE(); \
@@ -1166,6 +1134,12 @@ static InterpretResult run(VM* vm) {
     instr = *ip++; \
     goto *dispatch_table[OPCODE(instr)]; \
 } while(0)
+#else
+#define DISPATCH() do { \
+    instr = *ip++; \
+    goto *dispatch_table[OPCODE(instr)]; \
+} while(0)
+#endif
 #define CUR_BASE() (base)
     // GC may relocate the value stack; bp and sp both shift by the same
     // delta (the current frame's function hasn't changed, so max_regs is
@@ -2694,12 +2668,6 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
-            // Check for control transfer (capture/abort)
-            // The native has already modified VM state; just continue execution
-            if (result == ZYM_CONTROL_TRANSFER) {
-                LOAD_STATE(); DISPATCH();
-            }
-
             // Place result in callee slot
             stack[callee_slot] = result;
 
@@ -2754,12 +2722,6 @@ static InterpretResult run(VM* vm) {
             if (result == ZYM_ERROR) {
                 // Native closure reported error via zym_runtimeError
                 return INTERPRET_RUNTIME_ERROR;
-            }
-
-            // Check for control transfer (capture/abort)
-            // The native has already modified VM state; just continue execution
-            if (result == ZYM_CONTROL_TRANSFER) {
-                LOAD_STATE(); DISPATCH();
             }
 
             // Place result in callee slot
@@ -3014,10 +2976,6 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
-            if (result == ZYM_CONTROL_TRANSFER) {
-                LOAD_STATE(); DISPATCH();
-            }
-
             // Tail position: return the native's result from the current frame.
             // Note: close upvalues only for the callee's own locals (stack_base + 1
             // upward). `stack_base` itself is the caller's slot that will receive
@@ -3041,36 +2999,6 @@ static InterpretResult run(VM* vm) {
             // reuses the frame and keeps its flags for the eventual RET.)
             RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
-            if (__builtin_expect(vm->active_boundaries > 0, 0)) {
-                if (vm->with_prompt_depth > 0) {
-                    WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
-                    if (vm->frame_count == wpc->frame_boundary) {
-                        popPrompt(vm);
-                        vm->with_prompt_depth--;
-                        vm->active_boundaries--;
-                    }
-                }
-
-                if (vm->resume_depth > 0) {
-                    ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
-                    if (vm->frame_count == ctx->frame_boundary) {
-                        stack[ctx->result_slot] = result;
-                        // The splice this boundary owns is finished, so put
-                        // the high-water mark back where it stood before it.
-                        // Only this path does so: the capture and abort paths
-                        // also pop resume contexts, but they have already
-                        // unwound stack_top to the prompt's base, which is
-                        // lower -- restoring there would raise it again.
-                        restoreResumeMark(vm, ctx);
-                        vm->resume_depth--;
-                        vm->active_boundaries--;
-                        ip    = frame->ip;
-                        vm->chunk = frame->caller_chunk;
-                        constants = vm->chunk->constants.values;
-                        DISPATCH();
-                    }
-                }
-            }
 
             ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
@@ -3118,10 +3046,6 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
-            if (result == ZYM_CONTROL_TRANSFER) {
-                LOAD_STATE(); DISPATCH();
-            }
-
             // Tail position: return the native closure's result from the current frame.
             // See OP(RET) / native tail-return note: `stack_base` is the caller's
             // result slot; only close upvalues at `stack_base + 1` and above so
@@ -3142,36 +3066,6 @@ static InterpretResult run(VM* vm) {
             // Same obligation as the native tail-return path above.
             RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
-            if (__builtin_expect(vm->active_boundaries > 0, 0)) {
-                if (vm->with_prompt_depth > 0) {
-                    WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
-                    if (vm->frame_count == wpc->frame_boundary) {
-                        popPrompt(vm);
-                        vm->with_prompt_depth--;
-                        vm->active_boundaries--;
-                    }
-                }
-
-                if (vm->resume_depth > 0) {
-                    ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
-                    if (vm->frame_count == ctx->frame_boundary) {
-                        stack[ctx->result_slot] = result;
-                        // The splice this boundary owns is finished, so put
-                        // the high-water mark back where it stood before it.
-                        // Only this path does so: the capture and abort paths
-                        // also pop resume contexts, but they have already
-                        // unwound stack_top to the prompt's base, which is
-                        // lower -- restoring there would raise it again.
-                        restoreResumeMark(vm, ctx);
-                        vm->resume_depth--;
-                        vm->active_boundaries--;
-                        ip    = frame->ip;
-                        vm->chunk = frame->caller_chunk;
-                        constants = vm->chunk->constants.values;
-                        DISPATCH();
-                    }
-                }
-            }
 
             ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
@@ -3280,40 +3174,6 @@ static InterpretResult run(VM* vm) {
         RELOAD_SP();  // returning to caller frame: recompute spill base
 
         RELEASE_FRAME_PREEMPT_GUARDS(frame);
-
-        // Single check for any active boundary (withPrompt or resume)
-        if (__builtin_expect(vm->active_boundaries > 0, 0)) {
-            // Check if we're returning from a withPrompt boundary frame
-            if (vm->with_prompt_depth > 0) {
-                WithPromptContext* wpc = &vm->with_prompt_stack[vm->with_prompt_depth - 1];
-                if (vm->frame_count == wpc->frame_boundary) {
-                    popPrompt(vm);
-                    vm->with_prompt_depth--;
-                    vm->active_boundaries--;
-                }
-            }
-
-            // Check if we're returning from a resumed continuation's boundary frame
-            if (vm->resume_depth > 0) {
-                ResumeContext* ctx = &vm->resume_stack[vm->resume_depth - 1];
-                if (vm->frame_count == ctx->frame_boundary) {
-                    stack[ctx->result_slot] = return_value;
-                    // The splice this boundary owns is finished, so put
-                    // the high-water mark back where it stood before it.
-                    // Only this path does so: the capture and abort paths
-                    // also pop resume contexts, but they have already
-                    // unwound stack_top to the prompt's base, which is
-                    // lower -- restoring there would raise it again.
-                    restoreResumeMark(vm, ctx);
-                    vm->resume_depth--;
-                    vm->active_boundaries--;
-                    ip    = frame->ip;
-                    vm->chunk = frame->caller_chunk;
-                    constants = vm->chunk->constants.values;
-                    DISPATCH();
-                }
-            }
-        }
 
         // Normal return: restore caller context
         ip    = frame->ip;

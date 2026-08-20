@@ -180,35 +180,6 @@ void zym_freeChunk(ZymVM* vm, ZymChunk* chunk)
         }
     }
 
-    // Continuations hold a resume target of their own (saved_ip/saved_chunk) that
-    // no frame covers. The rule is simply that a freed chunk is gone: nothing
-    // aiming into it is resumable, so retire every such continuation here. This
-    // is what CONT_INVALID is for.
-    //
-    // For a host-owned target that is also a hard memory requirement -- the
-    // bytecode is released on the next line and no marking can protect it. For a
-    // target inside an ObjFunction the storage would in fact survive, because
-    // saved_owner keeps it marked; retiring those is a deliberate choice to keep
-    // one rule rather than two, since the host has declared that chunk dead.
-    for (Obj* o = vm->objects; o != NULL; o = o->next) {
-        if (o->type != OBJ_CONTINUATION) continue;
-        ObjContinuation* k = (ObjContinuation*)o;
-
-        if (k->saved_chunk == chunk || chunkOwnsFunction(chunk, k->saved_owner)) {
-            k->state       = CONT_INVALID;
-            k->saved_chunk = NULL;
-            k->saved_ip    = NULL;
-            k->saved_owner = NULL;
-        }
-
-        // Captured frames carry caller_chunk pointers the GC dereferences too.
-        for (int i = 0; i < k->frame_count; i++) {
-            if (k->frames[i].caller_chunk == chunk) {
-                k->frames[i].caller_chunk = NULL;
-            }
-        }
-    }
-
     freeChunk(vm, chunk);
     ZYM_FREE(&vm->allocator, chunk, sizeof(ZymChunk));
 }
@@ -1206,7 +1177,6 @@ ZymSourceMap* zym_cloneSourceMap(ZymVM* dstVm, const ZymSourceMap* src) { (void)
 
 static void begin_run(ZymVM* vm)
 {
-    vm->has_executed       = true;   // locks the preemption reserve
     vm->vm_state           = ZYM_STATE_RUNNING;
     vm->vm_cause           = ZYM_CAUSE_NONE;
     vm->cause_preempt_id   = 0;
@@ -1365,75 +1335,42 @@ ZymStatus zym_resume(ZymVM* vm)
     return settle_result(vm, result);
 }
 
+#if ZYM_HAS_HOST_GUARD
+
 ZymPreemptId zym_preemptRegister(ZymVM* vm, int slice,
                                  ZymValue callback, uint32_t flags) {
     if (vm == NULL) return 0;
     uint8_t f = 0;
-    if (flags & ZYM_PREEMPT_MASKABLE) f |= ZYM_PREEMPT_F_MASKABLE;
-    if (flags & ZYM_PREEMPT_ONESHOT)  f |= ZYM_PREEMPT_F_ONESHOT;
-    return preemptRegister(vm, slice, callback, f, /*owner_script=*/false);
+    if (flags & ZYM_PREEMPT_ONESHOT) f |= ZYM_PREEMPT_F_ONESHOT;
+    return preemptRegister(vm, slice, callback, f);
 }
 
 bool zym_preemptUnregister(ZymVM* vm, ZymPreemptId id) {
-    return vm ? preemptUnregister(vm, id, /*owner_script=*/false) : false;
+    return vm ? preemptUnregister(vm, id) : false;
 }
 
 bool zym_preemptSetSlice(ZymVM* vm, ZymPreemptId id, int slice) {
-    return vm ? preemptSetSlice(vm, id, slice, /*owner_script=*/false) : false;
+    return vm ? preemptSetSlice(vm, id, slice) : false;
 }
 
 int zym_preemptRemaining(ZymVM* vm, ZymPreemptId id) {
-    return vm ? preemptEntryRemaining(vm, id, /*owner_script=*/false) : -1;
+    return vm ? preemptEntryRemaining(vm, id) : -1;
 }
 
 bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id) {
-    return vm ? preemptTrigger(vm, id, /*owner_script=*/false) : false;
+    return vm ? preemptTrigger(vm, id) : false;
 }
 
 int zym_preemptCapacity(void) { return ZYM_PREEMPT_MAX_ENTRIES; }
 
-// ---- Host reserve --------------------------------------------------------
-// Slots held back from script so the host can still arm a watchdog or a
-// deadline after script has been running. Expressed as a reserve rather than a
-// script quota so it stays correct when ZYM_PREEMPT_MAX_ENTRIES changes with
-// the build target.
-
-bool zym_setHostPreemptReserve(ZymVM* vm, int slots)
+int zym_preemptCount(const ZymVM* vm)
 {
-    if (vm == NULL) return false;
-    // Bring-up only. Allowing this mid-run would let script's budget shrink
-    // underneath it for reasons it cannot see, so a capacity read at the start
-    // of a run would stop meaning anything. A host that needs slots knows so
-    // before it runs anything.
-    if (vm->has_executed) return false;
-    if (slots < 0 || slots > ZYM_PREEMPT_MAX_ENTRIES) return false;
-    vm->host_preempt_reserve = slots;
-    return true;
-}
-
-int zym_getHostPreemptReserve(const ZymVM* vm)
-{
-    return vm ? vm->host_preempt_reserve : 0;
-}
-
-int zym_preemptCount(const ZymVM* vm, bool script_owned_only)
-{
-    return vm ? preemptCount(vm, script_owned_only) : 0;
-}
-
-int zym_preemptScriptCapacity(const ZymVM* vm)
-{
-    return vm ? preemptScriptCapacity(vm) : 0;
-}
-
-int zym_preemptScriptAvailable(const ZymVM* vm)
-{
-    return vm ? preemptScriptAvailable(vm) : 0;
+    return vm ? preemptCount(vm) : 0;
 }
 
 int zym_preemptIds(const ZymVM* vm, ZymPreemptId* out, int max)
 {
-    return vm ? preemptIds(vm, out, max, /*script_owned_only=*/false) : 0;
+    return vm ? preemptIds(vm, out, max) : 0;
 }
 
 void zym_requestStop(ZymVM* vm) { if (vm) preemptRequestStop(vm); }
@@ -1441,10 +1378,15 @@ void zym_clearStop(ZymVM* vm)   { if (vm) preemptClearStop(vm); }
 bool zym_stopRequested(const ZymVM* vm) { return vm ? preemptStopRequested(vm) : false; }
 bool zym_isAborting(const ZymVM* vm)    { return vm ? preemptStopRequested(vm) : false; }
 
+#endif // ZYM_HAS_HOST_GUARD
+
 // ---- Memory ceiling ------------------------------------------------------
 // Crossing the limit suspends the VM (ZYM_STATUS_SUSPENDED) rather than failing
 // the allocation, so the host chooses what happens next. Sticky like the hard
-// stop: clear it, or raise the limit, before resuming.
+// stop: clear it, or raise the limit, before resuming. Rides the host guard's
+// counter channel, so it does not exist in guard-off builds.
+
+#if ZYM_HAS_HOST_GUARD
 
 void zym_setMemoryLimit(ZymVM* vm, size_t bytes)
 {
@@ -1459,13 +1401,16 @@ void zym_setMemoryLimit(ZymVM* vm, size_t bytes)
 }
 
 size_t zym_getMemoryLimit(const ZymVM* vm) { return vm ? vm->memory_limit : 0; }
-size_t zym_memoryUsed(const ZymVM* vm)     { return vm ? vm->bytes_allocated : 0; }
 bool   zym_oomPending(const ZymVM* vm)     { return vm ? vm->oom_pending : false; }
 
 void zym_clearOom(ZymVM* vm)
 {
     if (vm) vm->oom_pending = false;
 }
+
+#endif // ZYM_HAS_HOST_GUARD
+
+size_t zym_memoryUsed(const ZymVM* vm)     { return vm ? vm->bytes_allocated : 0; }
 
 // ---- State and cause reporting -------------------------------------------
 
@@ -1504,12 +1449,6 @@ void zym_vmInfo(const ZymVM* vm, ZymVmInfo* out)
     out->resumable = vm->execution_suspended &&
                      !vm->stop_requested &&
                      !vm->oom_pending;
-}
-
-void zym_setPreemptCallback(ZymVM* vm, ZymValue callback)
-{
-    if (vm == NULL) return;
-    vm->on_preempt_callback = callback;
 }
 
 #ifndef ZYM_RUNTIME_ONLY
@@ -1806,8 +1745,6 @@ bool zym_isFunction(ZymValue value) {
     return IS_FUNCTION(value) || IS_CLOSURE(value) || IS_NATIVE_FUNCTION(value) || IS_NATIVE_CLOSURE(value);
 }
 bool zym_isClosure(ZymValue value) { return IS_CLOSURE(value); }
-bool zym_isPromptTag(ZymValue value) { return IS_OBJ(value) && IS_PROMPT_TAG(value); }
-bool zym_isContinuation(ZymValue value) { return IS_OBJ(value) && IS_CONTINUATION(value); }
 
 // =============================================================================
 // VALUE EXTRACTION (SAFE)
@@ -1869,8 +1806,6 @@ const char* zym_typeName(ZymValue value) {
             case OBJ_NATIVE_FUNCTION: return "native_function";
             case OBJ_NATIVE_CLOSURE: return "native_closure";
             case OBJ_NATIVE_CONTEXT: return "native_context";
-            case OBJ_PROMPT_TAG: return "prompt_tag";
-            case OBJ_CONTINUATION: return "continuation";
             case OBJ_STRUCT_SCHEMA: return "struct_schema";
             case OBJ_STRUCT_INSTANCE: return "struct";
             case OBJ_ENUM_SCHEMA: return "enum_schema";
@@ -2049,23 +1984,6 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
                     if (!valueToStringHelper(vm, inst->fields[i], buffer, buf_size, pos, visited, depth + 1)) return false;
                 }
                 APPEND(" }", 2);
-                break;
-            }
-            case OBJ_PROMPT_TAG: {
-                ObjPromptTag* tag = AS_PROMPT_TAG(value);
-                int len;
-                if (tag->name != NULL) len = snprintf(temp, sizeof(temp), "<prompt_tag: %.*s>", tag->name->length, tag->name->chars);
-                else len = snprintf(temp, sizeof(temp), "<prompt_tag #%" PRIu32 ">", tag->id);
-                APPEND(temp, len);
-                break;
-            }
-            case OBJ_CONTINUATION: {
-                ObjContinuation* cont = AS_CONTINUATION(value);
-                const char* state_str = "valid";
-                if (cont->state == CONT_CONSUMED) state_str = "consumed";
-                else if (cont->state == CONT_INVALID) state_str = "invalid";
-                int len = snprintf(temp, sizeof(temp), "<continuation: %s>", state_str);
-                APPEND(temp, len);
                 break;
             }
             case OBJ_DISPATCHER: {

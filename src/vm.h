@@ -18,24 +18,17 @@
  * These arrays are pre-allocated in the VM struct. Memory usage on 64-bit:
  *
  *   CallFrame:    32 bytes each (closure, ip, stack_base, caller_chunk + padding)
- *   PromptEntry:  24 bytes each (tag, frame_index, stack_base, from_with_prompt + padding)
- *   ResumeContext: 8 bytes each (frame_boundary, result_slot)
  *   PreemptEntry: 24 bytes each (slice, remaining, callback, id, flags + padding)
  *
  * ┌─────────────┬─────────────────────────────────────────────────┐
  * │   Count     │  8       16      32      64      256            │
  * ├─────────────┼─────────────────────────────────────────────────┤
  * │ FRAMES_MAX  │  384 B   768 B   1.5 KB  3 KB    12 KB          │
- * │ MAX_PROMPTS │  192 B   384 B   768 B   1.5 KB  6 KB           │
- * │ RESUME_DEPTH│  96 B    192 B   384 B   768 B   3 KB           │  (= FRAMES_MAX)
  * │ PREEMPT_MAX │  192 B   384 B   768 B   1.5 KB  6 KB           │
- * │ WITH_PROMPT │  32 B    64 B    128 B   256 B   1 KB           │
  * └─────────────┴─────────────────────────────────────────────────┘
  *
  * Notes:
- *   - FRAMES_MAX limits active call depth (recursion, and resuming continuations)
- *   - MAX_PROMPTS limits concurrent prompt boundaries (bookmarks for continuations)
- *   - Captured continuations are heap-allocated, not limited by these values
+ *   - FRAMES_MAX limits active call depth
  *   - Value stack is dynamic (STACK_INITIAL to STACK_MAX), 8 bytes per Value
  *   - This table covers only these five arrays. It is NOT the size of a VM:
  *     at the default counts they come to ~12 KB of a sizeof(VM) that measures
@@ -55,20 +48,6 @@
 #define STACK_MAX 65536
 #endif
 #define STACK_INITIAL 256
-#define MAX_PROMPTS 64
-#define DEFAULT_TIMESLICE 10000
-// Every live resume boundary names a distinct frame, so the frame limit already
-// bounds this one: a separate, smaller ceiling can only fail a program the call
-// stack would have carried. That mattered once a continuation started carrying
-// the boundaries inside its extent -- the trampoline idiom
-// `withPrompt(P, func() { return Cont.resume(k, v) })` grows the delimited
-// extent by one frame and one boundary per round trip, so a 64-entry stack
-// stopped a scheduler at 64 slices that FRAMES_MAX would have run to 256. Tied
-// to FRAMES_MAX so there is one ceiling to explain and one to raise; the check
-// in resumeContinuation stays, as the two are not provably equal in the
-// degenerate case of resuming a zero-frame continuation.
-#define MAX_RESUME_DEPTH FRAMES_MAX
-#define MAX_WITH_PROMPT_DEPTH 64
 // ---- Preemption entry table ---------------------------------------------
 // Fixed size, no allocation: registration fails when full. Keeps the MCU
 // profile honest.
@@ -82,7 +61,6 @@
 #define ZYM_PREEMPT_MAX_ENTRIES 8
 #endif
 
-#define ZYM_PREEMPT_F_MASKABLE  (1u << 0)  // suppressed by a script shield
 #define ZYM_PREEMPT_F_ONESHOT   (1u << 1)  // do not rearm after firing
 
 typedef struct {
@@ -91,12 +69,10 @@ typedef struct {
     Value    callback;     // NULL_VAL => abort execution instead of calling
     uint32_t id;           // 0 is never a valid id
     uint8_t  flags;
-    bool     owner_script; // false => host-owned
     bool     in_flight;    // this entry's callback is executing
 } PreemptEntry;
 
 #define FRAME_FLAG_PREEMPT 0x01
-#define FRAME_FLAG_DISABLE_PREEMPT 0x02
 // Re-entrant API boundary: this frame was pushed by a public API call
 // (`zym_call`/`zym_callClosurev` -> `zym_call_execute`) into a VM that
 // may already be mid-bytecode execution. When OP(RET) pops a frame
@@ -105,8 +81,6 @@ typedef struct {
 // api_trampoline's RET (which would cascade-pop every suspended caller
 // frame, NULL-ing their stack_base slots and corrupting their locals).
 #define FRAME_FLAG_API_BOUNDARY 0x04
-
-typedef struct ObjPromptTag ObjPromptTag;
 
 struct CallFrame {
     ObjClosure* closure;
@@ -125,55 +99,6 @@ struct CallFrame {
     int spill_base;
 };
 typedef struct CallFrame CallFrame;
-
-typedef struct PromptEntry {
-    ObjPromptTag* tag;
-    int frame_index;
-    int stack_base;
-    // True when Cont.withPrompt pushed this entry, which means it also pushed a
-    // paired with_prompt_stack boundary at the SAME frame index (both are taken
-    // from vm->frame_count before the callee frame goes on). That pairing is
-    // what the RET path relies on to pop the prompt again, and it is the one
-    // thing a raw Cont.pushPrompt does NOT establish.
-    //
-    // Recorded because a continuation snapshots this slice: putting a prompt
-    // back on resume without its boundary would leak the entry (nothing pops
-    // it), and manufacturing a boundary for a manually pushed prompt would pop
-    // one the script still owns. The flag is only ever read on the
-    // capture/resume cold path.
-    bool from_with_prompt;
-} PromptEntry;
-
-// Where a resumed computation's final value goes. Cont.resume splices the
-// captured frames on top of the resumer's, and the bottom of that splice has no
-// ordinary caller/callee relationship with the frame below it -- its stack_base
-// was chosen by the restore, not by a CALL -- so RET cannot derive the
-// destination the usual way. This records it: when frame_count falls back to
-// frame_boundary, the returning frame's value is written to result_slot.
-//
-// Tagged (rather than an anonymous typedef) so object.h can forward-declare it:
-// a continuation snapshots the entries that live inside its extent, exactly as
-// it snapshots prompts. See ObjContinuation.resumes.
-typedef struct ResumeContext {
-    int frame_boundary;
-    int result_slot;
-    // vm->stack_top from just before the splice, and the slot the splice was
-    // laid down at. stack_top is a high-water mark: the CALL opcodes only ever
-    // raise it and RET does not lower it, which costs nothing for ordinary
-    // calls because a given call depth always needs the same top. A resume is
-    // the exception -- it bases its slice AT the mark and then raises it, so
-    // without an owner to put the mark back, every resumed extent that returns
-    // rather than re-suspending leaves its slice behind forever. Worse than
-    // linear, too: the next capture measures its own slice up to the drifted
-    // mark, so each leak enlarges the next one. A capture already reclaims
-    // (unwinding sets stack_top back to the prompt's base); this is the same
-    // reclaim for the path that returns.
-    int saved_stack_top;
-} ResumeContext;
-
-typedef struct {
-    int frame_boundary;
-} WithPromptContext;
 
 // Error callback: if set, error messages are routed here instead of stderr.
 // type: ZYM_STATUS_COMPILE_ERROR or ZYM_STATUS_RUNTIME_ERROR
@@ -208,7 +133,6 @@ typedef struct VM {
     CallFrame frames[FRAMES_MAX];
     int frame_count;
     int cur_base;
-    int active_boundaries;
     CallFrame* current_frame;
 
     Obj* objects;
@@ -244,10 +168,6 @@ typedef struct VM {
     Obj** temp_roots;
     int temp_root_count;
     int temp_root_capacity;
-
-    PromptEntry prompt_stack[MAX_PROMPTS];
-    int prompt_count;
-    uint32_t next_prompt_tag_id;
 
     // ---- Preemption -------------------------------------------------
     // One countdown drives an entry table. The dispatch loop only ever
@@ -287,31 +207,8 @@ typedef struct VM {
     ZymPreemptId cause_preempt_id;   // entry that fired, for the preempt causes
     size_t cause_bytes_wanted;       // request that crossed the ceiling
     PreemptEntry preempt_table[ZYM_PREEMPT_MAX_ENTRIES];
-    // Slots the host keeps for itself. Script's ceiling is
-    // ZYM_PREEMPT_MAX_ENTRIES - host_preempt_reserve; the host itself may still
-    // use any free slot. Settable only before the VM has ever executed, so a
-    // script's budget cannot shrink under it mid-run: whatever capacity it sees
-    // at the start is still bindable at the end.
-    int host_preempt_reserve;
-    // Latched on the first run/resume/call. Gates the reserve, which must be a
-    // bring-up decision -- a host that discovers mid-run that it needs slots has
-    // already lost the argument.
-    bool has_executed;
     uint32_t preempt_next_id;
     int preempt_live_count;
-    int preempt_shield_depth;       // script critical sections; masks
-                                    // script-owned MASKABLE entries only
-    Value on_preempt_callback;      // legacy single-callback shim
-    int default_timeslice;
-
-    ResumeContext resume_stack[MAX_RESUME_DEPTH];
-    int resume_depth;
-
-    WithPromptContext with_prompt_stack[MAX_WITH_PROMPT_DEPTH];
-    int with_prompt_depth;
-
-    // Cached: active_boundaries = with_prompt_depth + resume_depth
-    // Used for a single fast check in RET/TAIL_CALL instead of two separate checks
 
     // Error callback (NULL = default fprintf to stderr)
     ErrorCallback error_callback;

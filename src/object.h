@@ -16,8 +16,6 @@ typedef struct Table {
     int capacity;
     Entry* entries;
 } Table;
-typedef struct ObjPromptTag ObjPromptTag;
-typedef struct ObjContinuation ObjContinuation;
 typedef struct CallFrame CallFrame;
 typedef struct PromptEntry PromptEntry;
 typedef struct ResumeContext ResumeContext;
@@ -38,8 +36,6 @@ typedef struct ResumeContext ResumeContext;
 #define IS_STRUCT_SCHEMA(value) isObjType(value, OBJ_STRUCT_SCHEMA)
 #define IS_STRUCT_INSTANCE(value) isObjType(value, OBJ_STRUCT_INSTANCE)
 #define IS_ENUM_SCHEMA(value) isObjType(value, OBJ_ENUM_SCHEMA)
-#define IS_PROMPT_TAG(value)  isObjType(value, OBJ_PROMPT_TAG)
-#define IS_CONTINUATION(value) isObjType(value, OBJ_CONTINUATION)
 
 #define AS_STRING(value)      ((ObjString*)AS_OBJ(value))
 #define AS_FUNCTION(value)    ((ObjFunction*)AS_OBJ(value))
@@ -55,8 +51,6 @@ typedef struct ResumeContext ResumeContext;
 #define AS_STRUCT_SCHEMA(value) ((ObjStructSchema*)AS_OBJ(value))
 #define AS_STRUCT_INSTANCE(value) ((ObjStructInstance*)AS_OBJ(value))
 #define AS_ENUM_SCHEMA(value) ((ObjEnumSchema*)AS_OBJ(value))
-#define AS_PROMPT_TAG(value)  ((ObjPromptTag*)AS_OBJ(value))
-#define AS_CONTINUATION(value) ((ObjContinuation*)AS_OBJ(value))
 
 typedef enum {
     OBJ_CLOSURE,
@@ -73,8 +67,6 @@ typedef enum {
     OBJ_STRUCT_SCHEMA,
     OBJ_STRUCT_INSTANCE,
     OBJ_ENUM_SCHEMA,
-    OBJ_PROMPT_TAG,
-    OBJ_CONTINUATION,
 } ObjType;
 
 struct Obj {
@@ -231,123 +223,6 @@ typedef struct ObjEnumSchema {
     ObjString** variant_names;
 } ObjEnumSchema;
 
-typedef struct ObjPromptTag {
-    Obj obj;
-    uint32_t id;
-    ObjString* name;
-} ObjPromptTag;
-
-typedef enum {
-    CONT_VALID,
-    CONT_CONSUMED,
-    CONT_INVALID
-} ContinuationState;
-
-// One open upvalue captured with a continuation's extent: the upvalue
-// object and its slot offset within the captured stack slice. See the
-// field comment on ObjContinuation.upvalues.
-typedef struct {
-    ObjUpvalue* upvalue;
-    int slot;
-} ContUpvalue;
-
-typedef struct ObjContinuation {
-    Obj obj;
-    CallFrame* frames;
-    int frame_count;
-    Value* stack;
-    int stack_size;
-    int stack_base_offset;
-    // Snapshot of the captured frames' spilled locals, and the vm->spill_stack
-    // offset it was taken from. Spilled locals do not live in the value stack
-    // (see CallFrame.spill_base), so copying `stack` does not carry them: the
-    // frames memcpy above brings each frame's spill_base along as a raw
-    // integer, which means nothing once vm->spill_top has moved on. Without
-    // this the resumed frame and the next callee pushed above it are handed the
-    // same spill offsets, and nothing roots the values in the meantime.
-    //
-    // The extent is [frames[prompt_frame].spill_base, top-of-captured-range),
-    // rebased on resume exactly as `stack` is rebased through
-    // stack_base_offset. Freed with the other two buffers at resume and in
-    // freeObject; marked alongside `stack` in blackenObject.
-    Value* spill;
-    int spill_size;
-    int spill_base_offset;
-    // Prompts that were live INSIDE the captured extent, i.e. everything the
-    // capture's own prompt entry delimits from below. They are as much a part
-    // of the extent as its frames: resuming puts the body back dynamically
-    // inside `withPrompt(INNER, ...)`, so the INNER bookmark has to come back
-    // with it or the resumed code cannot name a prompt it is demonstrably
-    // standing in.
-    //
-    // Entries hold absolute frame/stack indices, meaningless once the VM has
-    // moved on, so they are rebased on restore exactly as the frames are --
-    // frame_index through `frame_base_offset`, stack_base through
-    // `stack_base_offset`. The delimiting prompt itself is NOT in here: a
-    // captured continuation is undelimited until somebody wraps it again.
-    PromptEntry* prompts;
-    int prompt_count;
-    // Resume boundaries that were live INSIDE the captured extent. A boundary
-    // is the only thing that tells RET where a restored frame's return value
-    // goes: the bottom frame of a splice sits at a stack_base the restore
-    // picked, not at its caller's result register, so the callee-writes-to-its-
-    // own-stack_base convention RET otherwise uses lands the value in a dead
-    // slot. vm->resume_stack carries that mapping while the computation runs.
-    //
-    // A continuation captured across a previous resume contains such a splice
-    // point, and it is as much part of the extent as the frames on either side
-    // of it. Dropping it made the defect invisible until the computation
-    // actually ran to completion -- every re-suspension unwinds through capture
-    // instead of returning, so only the final step exercises the linkage, and
-    // it delivered whatever stale value the result register happened to hold
-    // (in practice the callee: `Cont.resume` itself).
-    //
-    // Entries hold absolute indices and are rebased on restore exactly as the
-    // prompts are: frame_boundary through `frame_base_offset`, result_slot
-    // through `stack_base_offset`. The boundary belonging to the resume that is
-    // splicing this extent back in is NOT in here -- that one exits the extent,
-    // and Cont.resume pushes it for itself.
-    ResumeContext* resumes;
-    int resume_count;
-    // Open upvalues that pointed INTO the captured extent at capture time.
-    // closeUpvalues seals them at capture, which is right on its own: the
-    // frames unwind, and an escaped closure must keep working even if the
-    // continuation is never resumed. But the seal splits one binding into
-    // two homes, the restored frame's stack slot and the closure's cell,
-    // and nothing put the alias back. Recording (upvalue, slot) pairs lets
-    // resume do it: the cell's CURRENT value wins over the snapshot slot
-    // (a closure called while the continuation was parked wrote through
-    // the cell, and the binding is one location for its whole life), the
-    // upvalue re-opens onto the restored slot, and it rejoins
-    // vm->open_upvalues so stack relocation keeps rebasing it. One-shot
-    // resume is what makes this sound: there is never a second restored
-    // copy competing for the same cell.
-    //
-    // `slot` is relative to stack_base_offset, rebased on resume exactly
-    // as the stack is. Freed with the other buffers at resume and in
-    // freeObject; the upvalue objects are marked in blackenObject.
-    ContUpvalue* upvalues;
-    int upvalue_count;
-    // Absolute frame index the captured frames started at (the delimiting
-    // prompt's frame_index). The frame counterpart of stack_base_offset /
-    // spill_base_offset: restored frame_index = vm->frame_count + (saved -
-    // this). Needed even when frame_count is 0, so it is stored rather than
-    // derived from frames[0].
-    int frame_base_offset;
-    uint32_t* saved_ip;
-    Chunk* saved_chunk;
-    // The ObjFunction whose embedded chunk `saved_chunk` is, or NULL when the
-    // resume target lives in a host-owned chunk. A Chunk is not a GC object and
-    // carries no back-pointer, so marking `saved_chunk` cannot keep its storage
-    // alive -- only marking this owner can. NULL means no owner can be marked,
-    // and the chunk is invalidated by zym_freeChunk instead.
-    ObjFunction* saved_owner;
-    ObjPromptTag* prompt_tag;
-    ContinuationState state;
-    int return_slot;
-    int preempt_shield_depth;   // script critical-section depth at capture
-} ObjContinuation;
-
 ObjFunction* newFunction(VM* vm);
 ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher);
 ObjNativeContext* newNativeContext(VM* vm, void* native_data, NativeFinalizerFunc finalizer);
@@ -403,5 +278,3 @@ ObjDispatcher* newDispatcher(VM* vm);
 ObjStructSchema* newStructSchema(VM* vm, ObjString* name, ObjString** field_names, int field_count);
 ObjStructInstance* newStructInstance(VM* vm, ObjStructSchema* schema);
 ObjEnumSchema* newEnumSchema(VM* vm, ObjString* name, ObjString** variant_names, int variant_count);
-ObjPromptTag* newPromptTag(VM* vm, ObjString* name);
-ObjContinuation* newContinuation(VM* vm);

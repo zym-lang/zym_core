@@ -180,22 +180,6 @@ static void printValueHelper(VM* vm, FILE* f, Value value, Obj** visited, int de
             case OBJ_DISPATCHER:
                 fprintf(f, "<overloaded function>");
                 break;
-            case OBJ_PROMPT_TAG: {
-                ObjPromptTag* tag = AS_PROMPT_TAG(value);
-                if (tag->name != NULL) {
-                    fprintf(f, "<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
-                } else {
-                    fprintf(f, "<prompt-tag #%" PRIu32 ">", tag->id);
-                }
-                break;
-            }
-            case OBJ_CONTINUATION: {
-                ObjContinuation* cont = AS_CONTINUATION(value);
-                const char* state_str = cont->state == CONT_VALID ? "valid" :
-                                        cont->state == CONT_CONSUMED ? "consumed" : "invalid";
-                fprintf(f, "<continuation %s, %d frames>", state_str, cont->frame_count);
-                break;
-            }
             case OBJ_MAP: {
                     ObjMap* map = AS_MAP(value);
                     fprintf(f, "{");

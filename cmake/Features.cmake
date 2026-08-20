@@ -70,6 +70,17 @@ function(zym_core_declare_features)
         "Expose compiler resolution-trace hook for resolver parity tests (test-only, default OFF)"
         OFF)
 
+    # Host-armed instruction-count guard: the per-dispatch countdown that
+    # drives the host watchdog/deadline table, the hard stop, and the
+    # memory ceiling. ON is the sandbox-by-default profile. OFF removes
+    # the per-instruction check entirely for fully trusted builds — and
+    # with it every mid-run interruption channel: no watchdogs, no
+    # zym_requestStop, no memory ceiling (their APIs become compile
+    # errors, matching the other flag-gated surfaces).
+    option(ZYM_ENABLE_HOST_GUARD
+        "Host-armed instruction guard (watchdog table, hard stop, memory ceiling)"
+        ON)
+
     # Enforce: SYMBOL_TABLE on => PARSE_TREE_RETENTION on.
     # The resolver walks a retained parse tree; it cannot run without one.
     if(ZYM_ENABLE_SYMBOL_TABLE AND NOT ZYM_ENABLE_PARSE_TREE_RETENTION)
@@ -86,6 +97,7 @@ function(zym_core_declare_features)
     set(ZYM_ENABLE_NATIVE_METADATA     ${ZYM_ENABLE_NATIVE_METADATA}     PARENT_SCOPE)
     set(ZYM_ENABLE_DIAGNOSTIC_CODES    ${ZYM_ENABLE_DIAGNOSTIC_CODES}    PARENT_SCOPE)
     set(ZYM_ENABLE_BUILD_TESTING       ${ZYM_ENABLE_BUILD_TESTING}       PARENT_SCOPE)
+    set(ZYM_ENABLE_HOST_GUARD          ${ZYM_ENABLE_HOST_GUARD}          PARENT_SCOPE)
 
     message(STATUS "zym_core features:")
     message(STATUS "  ZYM_ENABLE_LSP_SURFACE          = ${ZYM_ENABLE_LSP_SURFACE}")
@@ -94,6 +106,7 @@ function(zym_core_declare_features)
     message(STATUS "  ZYM_ENABLE_NATIVE_METADATA      = ${ZYM_ENABLE_NATIVE_METADATA}")
     message(STATUS "  ZYM_ENABLE_DIAGNOSTIC_CODES     = ${ZYM_ENABLE_DIAGNOSTIC_CODES}")
     message(STATUS "  ZYM_ENABLE_BUILD_TESTING        = ${ZYM_ENABLE_BUILD_TESTING}")
+    message(STATUS "  ZYM_ENABLE_HOST_GUARD           = ${ZYM_ENABLE_HOST_GUARD}")
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -114,7 +127,8 @@ function(zym_core_configure_feature_header out_include_dir_var)
             ZYM_ENABLE_SYMBOL_TABLE
             ZYM_ENABLE_NATIVE_METADATA
             ZYM_ENABLE_DIAGNOSTIC_CODES
-            ZYM_ENABLE_BUILD_TESTING)
+            ZYM_ENABLE_BUILD_TESTING
+            ZYM_ENABLE_HOST_GUARD)
         if(${_flag})
             set(_${_flag}_01 1)
         else()
@@ -145,7 +159,8 @@ function(zym_core_apply_features tgt)
             "ZYM_HAS_SYMBOL_TABLE=$<BOOL:${ZYM_ENABLE_SYMBOL_TABLE}>"
             "ZYM_HAS_NATIVE_METADATA=$<BOOL:${ZYM_ENABLE_NATIVE_METADATA}>"
             "ZYM_HAS_DIAGNOSTIC_CODES=$<BOOL:${ZYM_ENABLE_DIAGNOSTIC_CODES}>"
-            "ZYM_HAS_BUILD_TESTING=$<BOOL:${ZYM_ENABLE_BUILD_TESTING}>")
+            "ZYM_HAS_BUILD_TESTING=$<BOOL:${ZYM_ENABLE_BUILD_TESTING}>"
+            "ZYM_HAS_HOST_GUARD=$<BOOL:${ZYM_ENABLE_HOST_GUARD}>")
         target_compile_definitions(${tgt} PUBLIC ${_pair})
     endforeach()
 endfunction()

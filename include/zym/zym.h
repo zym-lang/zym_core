@@ -34,11 +34,6 @@ typedef uint64_t ZymValue;
 // Error sentinel for native functions (distinct from NULL_VAL using tag 5)
 #define ZYM_ERROR ((ZymValue)0x7ff8000000000005ULL)
 
-// Control transfer sentinel for native functions (tag 6)
-// Used by continuation operations (capture, abort) to indicate VM state has been
-// modified and normal return value handling should be skipped
-#define ZYM_CONTROL_TRANSFER ((ZymValue)0x7ff8000000000006ULL)
-
 // =============================================================================
 // VM LIFECYCLE
 // =============================================================================
@@ -198,25 +193,30 @@ ZymStatus zym_resume(ZymVM* vm);
 ZymStatus zym_runToCompletion(ZymVM* vm, ZymChunk* chunk);
 ZymStatus zym_callToCompletion(ZymVM* vm, const char* funcName,
                                int argc, ZymValue* argv);
-void zym_setPreemptCallback(ZymVM* vm, ZymValue callback);
 
+#if ZYM_HAS_HOST_GUARD
 // -----------------------------------------------------------------------------
-// PREEMPTION (host side)
+// HOST GUARD (0.4.0: host-only; script has no preemption surface)
 // -----------------------------------------------------------------------------
 // A single countdown drives a small table of independent entries, so a host
-// watchdog, a host UI pump, and a script scheduler coexist without fighting
-// over one global timer. The dispatch loop cost is unchanged: one decrement
-// and one predicted branch. All table work happens on expiry.
+// watchdog and a host UI pump coexist without fighting over one global timer.
+// The dispatch loop cost is one decrement and one predicted branch per
+// instruction. All table work happens on expiry.
 //
-// Authority is the point of the design. Entries registered here are
-// host-owned: script cannot cancel them, retune them, or mask them unless
-// you pass ZYM_PREEMPT_MASKABLE. A host entry with a NULL callback aborts
-// execution on expiry, which is the watchdog shape -- there is no script
-// callback to intercept, mishandle, or loop inside.
+// Authority is the point of the design. Every entry is host-owned and
+// unmaskable: script cannot register, cancel, retune, observe, or shield
+// against any of them. A host entry with a NULL callback aborts execution on
+// expiry, which is the watchdog shape -- there is no script callback to
+// intercept, mishandle, or loop inside.
+//
+// The whole section -- watchdog table, hard stop, memory ceiling -- exists
+// only when the build carries the guard (ZYM_HAS_HOST_GUARD=1). A guard-off
+// build removes the per-instruction check and with it every way to interrupt
+// a run in flight; these declarations disappear so the mistake is caught at
+// compile time.
 
 // ZymPreemptId is declared in config.h alongside ZymVmInfo, which uses it.
 
-#define ZYM_PREEMPT_MASKABLE  (1u << 0) // may be suppressed by a script shield
 #define ZYM_PREEMPT_ONESHOT   (1u << 1) // retire after firing instead of rearming
 
 // Register a host-owned entry firing every `slice` instructions. Pass
@@ -230,39 +230,18 @@ int  zym_preemptRemaining(ZymVM* vm, ZymPreemptId id);   // -1 if unknown
 bool zym_preemptTrigger(ZymVM* vm, ZymPreemptId id);     // fire at next dispatch
 int  zym_preemptCapacity(void);                          // build-time table size
 
-// ---- Reserving slots from script ----------------------------------------
-// The table is shared, so a script that registers greedily can leave the host
-// unable to arm a watchdog or a deadline later. A reserve holds slots back:
-// script's ceiling becomes capacity - reserve, while the host stays free to use
-// any slot. Expressed as a reserve rather than a script quota so it remains
-// correct when ZYM_PREEMPT_MAX_ENTRIES changes with the build target.
-//
-// Settable ONLY before the VM has executed anything; returns false afterwards,
-// and false for a value outside [0, capacity]. That restriction is the point:
-// script must be able to treat its capacity as fixed for the whole run, so that
-// a budget read at the start is still bindable at the end. It also means the
-// reserve can never fail to be satisfied -- at bring-up script holds nothing.
-//
-// A host that discovers mid-run that it needs slots has already lost; decide at
-// bring-up. The reserve lets it bind late without holding a slot speculatively,
-// which otherwise costs an entry that joins every rearm and expiry scan.
-bool zym_setHostPreemptReserve(ZymVM* vm, int slots);
-int  zym_getHostPreemptReserve(const ZymVM* vm);
+// Occupancy: live entries in the table.
+int  zym_preemptCount(const ZymVM* vm);
 
-// Occupancy. `script_owned_only` counts just the entries script registered.
-int  zym_preemptCount(const ZymVM* vm, bool script_owned_only);
-int  zym_preemptScriptCapacity(const ZymVM* vm);   // capacity - reserve
-int  zym_preemptScriptAvailable(const ZymVM* vm);  // what script could still take
-
-// Writes up to `max` live ids into `out` (host and script alike) and returns
-// the total number live, which may exceed `max`. Pass NULL to count only.
+// Writes up to `max` live ids into `out` and returns the total number live,
+// which may exceed `max`. Pass NULL to count only.
 int  zym_preemptIds(const ZymVM* vm, ZymPreemptId* out, int max);
 
 // -----------------------------------------------------------------------------
 // HARD STOP
 // -----------------------------------------------------------------------------
-// Unmaskable and sticky. Checked before any masking logic, so a script
-// shield, an in-flight preempt callback, or an empty entry table cannot
+// Unmaskable and sticky. Checked before anything else, so an in-flight
+// preempt callback or an empty entry table cannot
 // suppress it. Never cleared by the VM: call zym_clearStop() before reusing
 // the VM. Declared for cross-context writes, so it is safe to call from an
 // ISR, a signal handler, or another thread.
@@ -305,9 +284,14 @@ bool zym_isAborting(const ZymVM* vm);
 // the collector's own internal allocations.
 void   zym_setMemoryLimit(ZymVM* vm, size_t bytes);
 size_t zym_getMemoryLimit(const ZymVM* vm);
-size_t zym_memoryUsed(const ZymVM* vm);
 bool   zym_oomPending(const ZymVM* vm);
 void   zym_clearOom(ZymVM* vm);
+
+#endif // ZYM_HAS_HOST_GUARD
+
+// Bytes currently allocated by this VM. Pure telemetry; available in every
+// build, guard or not.
+size_t zym_memoryUsed(const ZymVM* vm);
 
 // -----------------------------------------------------------------------------
 // VM STATE AND CAUSE
@@ -430,8 +414,6 @@ bool zym_isStruct(ZymValue value);
 bool zym_isEnum(ZymValue value);
 bool zym_isFunction(ZymValue value);
 bool zym_isClosure(ZymValue value);
-bool zym_isPromptTag(ZymValue value);
-bool zym_isContinuation(ZymValue value);
 
 // =============================================================================
 // VALUE EXTRACTION (SAFE)
@@ -572,15 +554,15 @@ bool zym_canCallWith(ZymVM* vm, const char* funcName, int argc);
 // -- a native may call back into the same VM -- but re-entrancy is not free,
 // and three properties are the caller's responsibility, not the VM's:
 //
-// 1. NATIVES ARE ATOMIC WITH RESPECT TO SUSPENSION AND CAPTURE. While your C
-//    frame is live, the VM cannot suspend out past it and a continuation
-//    cannot be captured across it: doing either would mean slicing the C
-//    stack, and there is no protocol for a native to be unwound and rebuilt.
-//    Script that runs underneath your frame is still fully preemptible in
-//    place -- a preempt callback fires, runs, and execution continues -- but
-//    anything that has to hand control back to the host cannot cross you.
-//    If your API re-enters the VM, say so in its documentation. Callers who
-//    capture or arm a watchdog across it need to know it is not a plain call.
+// 1. NATIVES ARE ATOMIC WITH RESPECT TO SUSPENSION. While your C frame is
+//    live, the VM cannot suspend out past it: doing so would mean slicing
+//    the C stack, and there is no protocol for a native to be unwound and
+//    rebuilt. Script that runs underneath your frame is still fully
+//    guardable in place -- a preempt callback fires, runs, and execution
+//    continues -- but anything that has to hand control back to the host
+//    cannot cross you. If your API re-enters the VM, say so in its
+//    documentation. Callers who arm a watchdog across it need to know it is
+//    not a plain call.
 //
 // 2. A FAILED VM STAYS FAILED. Calling in while `zym_vmState()` is
 //    ZYM_STATE_FAILED is permitted -- a teardown or a diagnostic is a fair

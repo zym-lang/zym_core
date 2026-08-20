@@ -37,6 +37,14 @@ extern "C" {
  * resolution-trace hook that drives the Phase 4.5 parity test. */
 #define ZYM_HAS_BUILD_TESTING        @_ZYM_ENABLE_BUILD_TESTING_01@
 
+/* Host-armed instruction-count guard. 1 = the dispatch loop carries the
+ * per-instruction countdown that drives the host watchdog table, the hard
+ * stop, and the memory ceiling. 0 = fully trusted build: the check is
+ * absent, execution cannot be interrupted mid-run, and the corresponding
+ * zym_preempt* / zym_requestStop / zym_setMemoryLimit APIs are not
+ * declared. */
+#define ZYM_HAS_HOST_GUARD           @_ZYM_ENABLE_HOST_GUARD_01@
+
 /* ---------------------------------------------------------------------------
  * zymConfigSummary()
  *

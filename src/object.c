@@ -422,40 +422,6 @@ ObjEnumSchema* newEnumSchema(VM* vm, ObjString* name, ObjString** variant_names,
     return schema;
 }
 
-ObjPromptTag* newPromptTag(VM* vm, ObjString* name) {
-    ObjPromptTag* tag = ALLOCATE_OBJ(vm, ObjPromptTag, OBJ_PROMPT_TAG);
-    tag->id = vm->next_prompt_tag_id++;
-    tag->name = name;
-    return tag;
-}
-
-ObjContinuation* newContinuation(VM* vm) {
-    ObjContinuation* cont = ALLOCATE_OBJ(vm, ObjContinuation, OBJ_CONTINUATION);
-    cont->frames = NULL;
-    cont->frame_count = 0;
-    cont->stack = NULL;
-    cont->stack_size = 0;
-    cont->stack_base_offset = 0;
-    cont->spill = NULL;
-    cont->spill_size = 0;
-    cont->spill_base_offset = 0;
-    cont->prompts = NULL;
-    cont->prompt_count = 0;
-    cont->resumes = NULL;
-    cont->resume_count = 0;
-    cont->upvalues = NULL;
-    cont->upvalue_count = 0;
-    cont->frame_base_offset = 0;
-    cont->saved_ip = NULL;
-    cont->saved_chunk = NULL;
-    cont->saved_owner = NULL;
-    cont->prompt_tag = NULL;
-    cont->state = CONT_VALID;
-    cont->return_slot = 0;
-    cont->preempt_shield_depth = 0;
-    return cont;
-}
-
 void printObject(Value value) {
     switch (OBJ_TYPE(value)) {
         case OBJ_STRING:
@@ -495,22 +461,6 @@ void printObject(Value value) {
         case OBJ_ENUM_SCHEMA: {
             ObjEnumSchema* schema = AS_ENUM_SCHEMA(value);
             printf("<enum %s>", schema->name->chars);
-            break;
-        }
-        case OBJ_PROMPT_TAG: {
-            ObjPromptTag* tag = AS_PROMPT_TAG(value);
-            if (tag->name != NULL) {
-                printf("<prompt-tag '%s' #%" PRIu32 ">", tag->name->chars, tag->id);
-            } else {
-                printf("<prompt-tag #%" PRIu32 ">", tag->id);
-            }
-            break;
-        }
-        case OBJ_CONTINUATION: {
-            ObjContinuation* cont = AS_CONTINUATION(value);
-            const char* state_str = cont->state == CONT_VALID ? "valid" :
-                                    cont->state == CONT_CONSUMED ? "consumed" : "invalid";
-            printf("<continuation %s, %d frames>", state_str, cont->frame_count);
             break;
         }
         default:

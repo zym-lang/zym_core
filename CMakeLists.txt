@@ -37,7 +37,6 @@ set(ZYM_CORE_SOURCES
     src/diagnostics.c
     src/sourcemap.c
     src/modules/core_modules.c
-    src/modules/continuation.c
     src/modules/preemption.c
     src/natives/core_natives.c
     src/natives/gc_native.c

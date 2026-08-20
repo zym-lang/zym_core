@@ -217,8 +217,6 @@ static void markRoots(VM* vm) {
     if (vm->entry_file != NULL) {
         markObject(vm, (Obj*)vm->entry_file);
     }
-    markValue(vm, vm->on_preempt_callback);
-
     // Spilled locals. They live on a parallel stack rather than in the frames'
     // register windows, so the value-stack walk above does not reach them --
     // without this a spilled local is invisible to the collector and is freed
@@ -350,11 +348,6 @@ static void markRoots(VM* vm) {
         }
     }
 
-    for (int i = 0; i < vm->prompt_count; i++) {
-        if (vm->prompt_stack[i].tag != NULL) {
-            markObject(vm, (Obj*)vm->prompt_stack[i].tag);
-        }
-    }
 }
 
 static void traceReferences(VM* vm) {
@@ -545,73 +538,6 @@ static void blackenObject(VM* vm, Obj* object) {
             break;
         }
 
-        case OBJ_PROMPT_TAG: {
-            ObjPromptTag* tag = (ObjPromptTag*)object;
-            if (tag->name != NULL) {
-                markObject(vm, (Obj*)tag->name);
-            }
-            break;
-        }
-
-        case OBJ_CONTINUATION: {
-            ObjContinuation* cont = (ObjContinuation*)object;
-
-            if (cont->prompt_tag != NULL) {
-                markObject(vm, (Obj*)cont->prompt_tag);
-            }
-
-            // Keep the resume target's bytecode alive. Marking saved_chunk itself
-            // would be useless -- a Chunk is embedded by value in its ObjFunction
-            // and markChunk only walks constants, so it cannot reach the owner.
-            // Marking the owner is what actually pins the memory. It is NULL for a
-            // host-owned chunk, which no marking can protect; zym_freeChunk
-            // invalidates continuations pointing into those instead.
-            if (cont->saved_owner != NULL) {
-                markObject(vm, (Obj*)cont->saved_owner);
-            }
-
-            for (int i = 0; i < cont->frame_count; i++) {
-                if (cont->frames[i].closure != NULL) {
-                    markObject(vm, (Obj*)cont->frames[i].closure);
-                }
-                if (cont->frames[i].caller_chunk != NULL) {
-                    markChunk(vm, cont->frames[i].caller_chunk);
-                }
-            }
-
-            for (int i = 0; i < cont->stack_size; i++) {
-                markValue(vm, cont->stack[i]);
-            }
-
-            // markRoots covers vm->spill_stack[0, spill_top), but a suspended
-            // continuation's slots are above spill_top and its snapshot is not
-            // that array at all -- this is their only root. Without it a
-            // spilled local holding a heap object is freed while the
-            // continuation waits, and the resumed body reads a dangling
-            // pointer.
-            for (int i = 0; i < cont->spill_size; i++) {
-                markValue(vm, cont->spill[i]);
-            }
-
-            // Same argument as the spill snapshot: markRoots walks
-            // vm->prompt_stack[0, prompt_count), and these entries were taken
-            // OFF that stack when the extent was captured. Nothing else names
-            // their tags, and the resumed body is going to abort/shift to them.
-            for (int i = 0; i < cont->prompt_count; i++) {
-                if (cont->prompts[i].tag != NULL) {
-                    markObject(vm, (Obj*)cont->prompts[i].tag);
-                }
-            }
-
-            // The recorded open upvalues are usually reachable through the
-            // captured stack's closures too, but that is incidental: this
-            // list is the invariant root, and an upvalue whose closure was
-            // dropped after capture must still survive for the relink.
-            for (int i = 0; i < cont->upvalue_count; i++) {
-                markObject(vm, (Obj*)cont->upvalues[i].upvalue);
-            }
-            break;
-        }
     }
 }
 
@@ -764,42 +690,6 @@ void freeObject(VM* vm, Obj* object) {
             FREE(vm, ObjInt64, object);
             break;
 
-        case OBJ_PROMPT_TAG:
-            FREE(vm, ObjPromptTag, object);
-            break;
-
-        case OBJ_CONTINUATION: {
-            ObjContinuation* cont = (ObjContinuation*)object;
-
-            if (cont->frames != NULL && cont->frame_count > 0) {
-                FREE_ARRAY(vm, CallFrame, cont->frames, cont->frame_count);
-            }
-
-            if (cont->stack != NULL && cont->stack_size > 0) {
-                FREE_ARRAY(vm, Value, cont->stack, cont->stack_size);
-            }
-
-            if (cont->spill != NULL && cont->spill_size > 0) {
-                FREE_ARRAY(vm, Value, cont->spill, cont->spill_size);
-            }
-
-            if (cont->prompts != NULL && cont->prompt_count > 0) {
-                FREE_ARRAY(vm, PromptEntry, cont->prompts, cont->prompt_count);
-            }
-
-            // No blacken counterpart: a ResumeContext is two ints, so there is
-            // nothing in here for the GC to reach. It still has to be freed.
-            if (cont->resumes != NULL && cont->resume_count > 0) {
-                FREE_ARRAY(vm, ResumeContext, cont->resumes, cont->resume_count);
-            }
-
-            if (cont->upvalues != NULL && cont->upvalue_count > 0) {
-                FREE_ARRAY(vm, ContUpvalue, cont->upvalues, cont->upvalue_count);
-            }
-
-            FREE(vm, ObjContinuation, object);
-            break;
-        }
     }
 }
 
