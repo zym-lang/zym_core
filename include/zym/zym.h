@@ -218,6 +218,16 @@ ZymStatus zym_callToCompletion(ZymVM* vm, const char* funcName,
 // ZymPreemptId is declared in config.h alongside ZymVmInfo, which uses it.
 
 #define ZYM_PREEMPT_ONESHOT   (1u << 1) // retire after firing instead of rearming
+// On expiry while a fiber is running: instead of suspending the whole VM,
+// force-yield that fiber to its resumer -- the fiber's status becomes
+// "preempted", the resumer's call returns null, and dispatch continues in
+// the resumer immediately (no round trip through the host). Resuming a
+// preempted fiber takes no value and continues at the exact interrupted
+// instruction. If the ROOT context is running when the entry expires, it
+// behaves as a plain watchdog suspension (there is no resumer to park to).
+// Firing under a live host call boundary is the boundary runtime error,
+// exactly as 0.3.x treated suspensions (natives are atomic).
+#define ZYM_PREEMPT_PARK_FIBER (1u << 2)
 
 // Register a host-owned entry firing every `slice` instructions. Pass
 // zym_newNull() as `callback` for an abort-on-expiry watchdog. Returns 0
@@ -610,6 +620,24 @@ ZymValue zym_peekRoot(ZymVM* vm, int depth);  // 0 = top of root stack
 // Report a runtime error from native code
 // This will print the error and set the VM to error state
 void zym_runtimeError(ZymVM* vm, const char* format, ...);
+
+// ---- Host error policy (fiber error system) --------------------------------
+// Fires ONCE at every runtime error's origin, before any unwinding, with
+// the formatted message and whether a script try boundary would catch it.
+// Return ZYM_ERR_PROPAGATE to let script handling proceed (the default when
+// no policy is installed), or ZYM_ERR_FAIL_VM to override script handling
+// and fail the VM exactly as an uncaught error does. Side effects (logging,
+// counters) need no disposition of their own -- do them and PROPAGATE.
+//
+// CONTRACT: the hook runs with the VM frozen mid-error. Read-only queries
+// are legal; re-entering the VM (zym_call and friends) is not -- the same
+// rule class as "natives are atomic". Distinct from zym_setErrorCallback,
+// which is a reporting sink for errors that actually fail the VM; caught
+// errors never reach it.
+typedef ZymErrorDisposition (*ZymErrorPolicy)(ZymVM* vm, const char* message,
+                                              bool would_be_caught,
+                                              void* user_data);
+void zym_setErrorPolicy(ZymVM* vm, ZymErrorPolicy policy, void* user_data);
 
 #ifdef __cplusplus
 }

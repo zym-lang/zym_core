@@ -422,6 +422,37 @@ ObjEnumSchema* newEnumSchema(VM* vm, ObjString* name, ObjString** variant_names,
     return schema;
 }
 
+ObjFiber* newFiber(VM* vm, ObjClosure* fn) {
+    ObjFiber* fiber = ALLOCATE_OBJ(vm, ObjFiber, OBJ_FIBER);
+    // Zero the whole context first: the array allocations below can
+    // trigger a collection, and blackenObject must find a coherent
+    // (empty) fiber, not garbage.
+    memset(&fiber->ctx, 0, sizeof(FiberContext));
+    fiber->fn = fn;
+    fiber->resumer = NULL;
+    fiber->status = FIBER_NEW;
+    fiber->started = false;
+    fiber->called_by_try = false;
+    fiber->error = NULL_VAL;
+    fiber->awaiting_slot = 0;
+
+    pushTempRoot(vm, (Obj*)fiber);
+
+    fiber->ctx.stack = ALLOCATE(vm, Value, FIBER_STACK_INITIAL);
+    fiber->ctx.stack_capacity = FIBER_STACK_INITIAL;
+    for (int i = 0; i < FIBER_STACK_INITIAL; i++) fiber->ctx.stack[i] = NULL_VAL;
+
+    fiber->ctx.frames = ALLOCATE(vm, CallFrame, FIBER_FRAMES_INITIAL);
+    fiber->ctx.frame_capacity = FIBER_FRAMES_INITIAL;
+    memset(fiber->ctx.frames, 0, sizeof(CallFrame) * FIBER_FRAMES_INITIAL);
+
+    // Spill stack stays NULL until the machinery grows it on demand,
+    // exactly like the VM's own.
+
+    popTempRoot(vm);
+    return fiber;
+}
+
 void printObject(Value value) {
     switch (OBJ_TYPE(value)) {
         case OBJ_STRING:
@@ -441,6 +472,9 @@ void printObject(Value value) {
         }
         case OBJ_DISPATCHER:
             printf("<overloaded function>");
+            break;
+        case OBJ_FIBER:
+            printf("<fiber>");
             break;
         case OBJ_STRUCT_SCHEMA: {
             ObjStructSchema* schema = AS_STRUCT_SCHEMA(value);

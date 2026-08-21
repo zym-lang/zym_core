@@ -39,12 +39,26 @@ static const char* ERR_NESTED_COLLECTION_REFS = "Nested collection references no
 #define REG_C(i)  (((i) >> 24) & 0xFF)
 #define REG_Bx(i) ((i) >> 16)
 
+static bool growFramesForPush(VM* vm);
+static void fiberCaptureContext(VM* vm, FiberContext* out);
+static void fiberDeliver(VM* vm, struct ObjFiber* r, Value value);
+static ObjFiber* fiberFindTryBoundary(VM* vm);
+
 void initVM(VM* vm) {
     vm->chunk = NULL;
     vm->ip = NULL;
+    vm->frames = vm->root_frames;
+    vm->frame_capacity = FRAMES_MAX;
     vm->frame_count = 0;
     vm->cur_base = 0;
     vm->current_frame = NULL;
+    vm->current_fiber = NULL;
+    memset(&vm->root_parked, 0, sizeof(vm->root_parked));
+    vm->fiber_error_top = NULL;
+    vm->fiber_error_msg = NULL;
+    vm->fiber_error_msg_len = 0;
+    vm->error_policy = NULL;
+    vm->error_policy_user_data = NULL;
 
     vm->oom_jmp_armed = false;
 
@@ -140,7 +154,7 @@ void freeVM(VM* vm) {
     while (object != NULL) {
         Obj* next = object->next;
 
-        if (object->type < 0 || object->type > OBJ_ENUM_SCHEMA) {
+        if (object->type < 0 || object->type > OBJ_FIBER) {
             fprintf(stderr, "ERROR: Corrupted object detected at %p with invalid type %d during VM cleanup\n",
                     (void*)object, object->type);
             fprintf(stderr, "Stopping cleanup to prevent cascading corruption. This indicates a memory management bug.\n");
@@ -165,6 +179,25 @@ void freeVM(VM* vm) {
     vm->spill_stack = NULL;
     vm->spill_capacity = 0;
     vm->spill_top = 0;
+
+    // The active context's frame storage, when a fiber (heap array) was
+    // running at teardown. Parked fibers' arrays are freed by freeObject;
+    // the root's inline root_frames never is.
+    if (vm->frames != NULL && vm->frames != vm->root_frames) {
+        reallocate(vm, vm->frames, sizeof(CallFrame) * vm->frame_capacity, 0);
+    }
+    vm->frames = NULL;
+    // The root program's parked context, when the VM was torn down while a
+    // fiber was active (ownership: parked arrays belong to root_parked).
+    if (vm->root_parked.ctx.stack != NULL) {
+        reallocate(vm, vm->root_parked.ctx.stack,
+                   sizeof(Value) * vm->root_parked.ctx.stack_capacity, 0);
+    }
+    if (vm->root_parked.ctx.spill_stack != NULL) {
+        reallocate(vm, vm->root_parked.ctx.spill_stack,
+                   sizeof(Value) * vm->root_parked.ctx.spill_capacity, 0);
+    }
+    memset(&vm->root_parked, 0, sizeof(vm->root_parked));
 
     diagsink_free(vm, &vm->diagnostics);
     sfr_free(vm, &vm->source_files);
@@ -217,6 +250,32 @@ void runtimeError(VM* vm, const char* format, ...) {
     int msg_len = vsnprintf(msg_buf, sizeof(msg_buf), format, args);
     va_end(args);
     if (msg_len < 0) msg_len = 0;
+
+    // ---- Fiber-try catch (single error funnel; fiber_design.md decision 1).
+    // Decide catchability FIRST, consult host policy, and if the error is
+    // caught: stash message + boundary, skip all reporting (a caught error
+    // is a script-domain value, not a host event), and let the run loop
+    // perform the unwind after the raising site returns.
+    {
+        ObjFiber* try_top = fiberFindTryBoundary(vm);
+        ZymErrorDisposition d = ZYM_ERR_PROPAGATE;
+        if (vm->error_policy != NULL) {
+            d = vm->error_policy(vm, msg_buf, try_top != NULL,
+                                 vm->error_policy_user_data);
+        }
+        if (try_top != NULL && d == ZYM_ERR_PROPAGATE) {
+            if (vm->fiber_error_msg != NULL) {
+                ZYM_FREE(&vm->allocator, vm->fiber_error_msg,
+                         (size_t)vm->fiber_error_msg_len + 1);
+            }
+            char* copy = (char*)ZYM_ALLOC(&vm->allocator, (size_t)msg_len + 1);
+            memcpy(copy, msg_buf, (size_t)msg_len + 1);
+            vm->fiber_error_msg = copy;
+            vm->fiber_error_msg_len = msg_len;
+            vm->fiber_error_top = try_top;
+            return;
+        }
+    }
 
     // Determine file and line for the error location
     const char* err_file = NULL;
@@ -729,7 +788,7 @@ static bool pushPreemptFrame(VM* vm, PreemptEntry* entry) {
     ObjClosure* closure = AS_CLOSURE(entry->callback);
     ObjFunction* function = closure->function;
 
-    if (vm->frame_count == FRAMES_MAX) {
+    if (vm->frame_count >= vm->frame_capacity && !growFramesForPush(vm)) {
         return false;
     }
 
@@ -861,6 +920,7 @@ static InterpretResult handlePreemption(VM* vm) {
     // 4. A callback-less entry means "stop", so honour it before running any
     //    script. Registration order decides precedence among equals.
     for (int i = 0; i < fired_count; i++) {
+        if (fired[i]->flags & ZYM_PREEMPT_F_PARK_FIBER) continue;
         if (!IS_CLOSURE(fired[i]->callback)) {
             // Settle the entry BEFORE unwinding. Without this its
             // `remaining` stays <= 0, so the host cannot resume: every
@@ -886,6 +946,60 @@ static InterpretResult handlePreemption(VM* vm) {
             }
             return INTERPRET_SUSPENDED;
         }
+    }
+
+    // 4.5 PARK entries: force-yield the running fiber to its resumer and
+    //     continue dispatching -- no host round trip. Ordering is
+    //     deliberate: a genuine watchdog firing the same tick outranks a
+    //     park (above); other fired entries are settled and re-fire on
+    //     their refreshed deadlines, matching the one-action-per-expiry
+    //     precedent.
+    for (int i = 0; i < fired_count; i++) {
+        PreemptEntry* park = fired[i];
+        if (!(park->flags & ZYM_PREEMPT_F_PARK_FIBER)) continue;
+
+        // Settle every fired entry first (rearm or retire), so nothing is
+        // left with an exhausted deadline.
+        for (int j = 0; j < fired_count; j++) {
+            PreemptEntry* e = fired[j];
+            if (e->flags & ZYM_PREEMPT_F_ONESHOT) {
+                e->slice = 0;
+                e->callback = NULL_VAL;
+                vm->preempt_live_count--;
+            } else {
+                e->remaining = e->slice;
+            }
+        }
+
+        if (vm->current_fiber == NULL) {
+            // Nothing to park the root into: behave as a watchdog.
+            vm->vm_cause         = ZYM_CAUSE_PREEMPT;
+            vm->cause_preempt_id = park->id;
+            preemptArm(vm);
+            {
+                int b = preemptBoundaryFrame(vm);
+                if (b >= 0) return preemptBoundaryError(vm, b, "a fiber park");
+            }
+            return INTERPRET_SUSPENDED;
+        }
+
+        // Hand-control-away across a live host boundary is the boundary
+        // error -- 0.3.x doctrine, natives are atomic.
+        {
+            int b = preemptBoundaryFrame(vm);
+            if (b >= 0) return preemptBoundaryError(vm, b, "a fiber park");
+        }
+
+        ObjFiber* f = vm->current_fiber;
+        fiberCaptureContext(vm, &f->ctx);
+        f->awaiting_slot = -1;              // mid-flight: nothing awaits a value
+        f->status = FIBER_PREEMPTED;
+        ObjFiber* r = f->resumer;
+        f->resumer = NULL;
+        fiberDeliver(vm, r, NULL_VAL);      // resumer's call returns null;
+                                            // it reads the status to see why
+        preemptArm(vm);
+        return INTERPRET_OK;                // dispatch continues in the resumer
     }
 
     // 5. Rearm (or retire) each fired entry, then hand control to the first
@@ -948,6 +1062,448 @@ static InterpretResult vm_error(VM* vm, uint32_t* ip, const char* fmt, ...) {
 }
 
 // --- The Core Execution Loop ---
+// ============================================================================
+// Fibers -- context switching machinery (see future/fiber_design.md)
+// ============================================================================
+
+// Grow the ACTIVE context's frame storage for one more push. Root never
+// grows (identical semantics to the historical inline array); fiber
+// arrays double toward FRAMES_MAX.
+static bool growFramesForPush(VM* vm) {
+    if (vm->frames == vm->root_frames) return false;
+    if (vm->frame_capacity >= FRAMES_MAX) return false;
+    int old_cap = vm->frame_capacity;
+    int new_cap = old_cap * 2;
+    if (new_cap > FRAMES_MAX) new_cap = FRAMES_MAX;
+    CallFrame* grown = GROW_ARRAY(vm, CallFrame, vm->frames, old_cap, new_cap);
+    vm->frames = grown;
+    vm->frame_capacity = new_cap;
+    vm->current_frame = vm->frame_count > 0 ? &vm->frames[vm->frame_count - 1] : NULL;
+    return true;
+}
+
+static void fiberCaptureContext(VM* vm, FiberContext* out) {
+    out->stack          = vm->stack;
+    out->stack_top      = vm->stack_top;
+    out->stack_capacity = vm->stack_capacity;
+    out->spill_stack    = vm->spill_stack;
+    out->spill_top      = vm->spill_top;
+    out->spill_capacity = vm->spill_capacity;
+    out->frames         = vm->frames;
+    out->frame_count    = vm->frame_count;
+    out->frame_capacity = vm->frame_capacity;
+    out->cur_base       = vm->cur_base;
+    out->chunk          = vm->chunk;
+    out->ip             = vm->ip;
+    out->open_upvalues  = vm->open_upvalues;
+    out->call_arg_top   = vm->call_arg_top;
+}
+
+static void fiberInstallContext(VM* vm, const FiberContext* in) {
+    vm->stack          = in->stack;
+    vm->stack_top      = in->stack_top;
+    vm->stack_capacity = in->stack_capacity;
+    vm->spill_stack    = in->spill_stack;
+    vm->spill_top      = in->spill_top;
+    vm->spill_capacity = in->spill_capacity;
+    vm->frames         = in->frames;
+    vm->frame_count    = in->frame_count;
+    vm->frame_capacity = in->frame_capacity;
+    vm->cur_base       = in->cur_base;
+    vm->chunk          = in->chunk;
+    vm->ip             = in->ip;
+    vm->open_upvalues  = in->open_upvalues;
+    vm->call_arg_top   = in->call_arg_top;
+    vm->current_frame  = in->frame_count > 0 ? &vm->frames[in->frame_count - 1] : NULL;
+}
+
+// Ownership handoff: after installing a parked context into the VM's
+// fields, the struct's array pointers are vacated so the free paths
+// (freeVM, freeObject) can free whatever is non-NULL without a double.
+static void fiberContextDisown(FiberContext* c) {
+    c->stack = NULL;          c->stack_capacity = 0;   c->stack_top = 0;
+    c->spill_stack = NULL;    c->spill_capacity = 0;   c->spill_top = 0;
+    c->frames = NULL;         c->frame_capacity = 0;   c->frame_count = 0;
+    c->open_upvalues = NULL;
+}
+
+// Decode where the in-flight switch call wants its eventual result and,
+// for a tail-position switch, perform the frame return the inline native
+// tail path would have done -- the parked ip must always be resumable
+// bytecode, and a tail call's post-native pop is C code, not bytecode.
+// On false, a runtimeError has been reported.
+static bool fiberParkCurrent(VM* vm, int* out_awaiting) {
+    // A host call boundary cannot be part of a parked context. The frames
+    // above it only exist because native C code re-entered the VM, and that
+    // C frame is not ours to save: switching away would leave a C caller
+    // waiting on a context that is no longer active, and control could
+    // return to it out of order. A fiber switch parks the WHOLE context, so
+    // any live boundary is always inside the parked extent -- same doctrine
+    // as 0.3.x capture ("natives are atomic"), total extent. The error
+    // teaches the remedies, 0.3.x-style.
+    for (int i = vm->frame_count - 1; i >= 0; i--) {
+        if (vm->frames[i].flags & FRAME_FLAG_API_BOUNDARY) {
+            ObjClosure* cl = vm->frames[i].closure;
+            ObjFunction* fn = (cl != NULL) ? cl->function : NULL;
+            runtimeError(vm,
+                "Cannot switch fibers across a host call: '%.*s' was called "
+                "from native code, and that native's frame cannot be parked "
+                "or resumed. Switch before entering the native, or have it "
+                "not call back into the VM.",
+                fn && fn->name ? fn->name->length : 6,
+                fn && fn->name ? fn->name->chars  : "<anon>");
+            return false;
+        }
+    }
+    if (vm->chunk == NULL || vm->ip <= vm->chunk->code) {
+        runtimeError(vm, "Fiber switch: could not determine call context.");
+        return false;
+    }
+    uint32_t prev = *(vm->ip - 1);
+    int op = prev & 0xFF;
+    int reg_a = (prev >> 8) & 0xFF;
+    int frame_base = vm->current_frame ? vm->current_frame->stack_base : 0;
+
+    if (op == CALL) {
+        *out_awaiting = frame_base + reg_a;
+        return true;
+    }
+    if (op == TAIL_CALL) {
+        CallFrame* frame = vm->current_frame;
+        if (frame == NULL) {
+            runtimeError(vm, "Fiber switch: could not determine call context.");
+            return false;
+        }
+        if (vm->open_upvalues != NULL &&
+            vm->open_upvalues->location > &vm->stack[frame->stack_base]) {
+            closeUpvalues(vm, &vm->stack[frame->stack_base + 1]);
+        }
+        vm->spill_top = frame->spill_base;
+        vm->frame_count--;
+        vm->cur_base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+        vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+        if (frameHoldsPreemptGuard(frame)) frameReleasePreemptGuards(vm, frame);
+        *out_awaiting = frame->stack_base;
+        vm->ip = frame->ip;
+        vm->chunk = frame->caller_chunk;
+        return true;
+    }
+    // CALL_SELF/TAIL_CALL_SELF cannot target a native; CALL_VAR (spread)
+    // sites are not decodable -- launch restriction, shield precedent.
+    runtimeError(vm, "Fiber switch: could not determine call context.");
+    return false;
+}
+
+// Install `r` (NULL = the root program) and deliver `value` into its
+// awaiting slot. The caller has already parked or retired the outgoing
+// context.
+static void fiberDeliver(VM* vm, ObjFiber* r, Value value) {
+    if (r == NULL) {
+        int slot = vm->root_parked.awaiting_slot;
+        fiberInstallContext(vm, &vm->root_parked.ctx);
+        fiberContextDisown(&vm->root_parked.ctx);
+        vm->stack[slot] = value;
+        vm->current_fiber = NULL;
+    } else {
+        int slot = r->awaiting_slot;
+        fiberInstallContext(vm, &r->ctx);
+        fiberContextDisown(&r->ctx);
+        vm->stack[slot] = value;
+        // r stays FIBER_RUNNING: it was the ancestor that resumed us.
+        vm->current_fiber = r;
+    }
+}
+
+// Free a dead fiber's parked arrays immediately (MCU-friendly; the GC
+// would get there eventually). Safe because a dead fiber can never be
+// installed again, and disown keeps freeObject from double-freeing.
+static void fiberReleaseDeadContext(VM* vm, ObjFiber* f) {
+    FiberContext* c = &f->ctx;
+    if (c->stack != NULL)       FREE_ARRAY(vm, Value, c->stack, c->stack_capacity);
+    if (c->spill_stack != NULL) FREE_ARRAY(vm, Value, c->spill_stack, c->spill_capacity);
+    if (c->frames != NULL)      FREE_ARRAY(vm, CallFrame, c->frames, c->frame_capacity);
+    fiberContextDisown(c);
+}
+
+FiberOpResult fiberResume(VM* vm, ObjFiber* target, Value value,
+                          bool has_value, bool as_try, Value* out_direct) {
+    if (target->status == FIBER_RUNNING) {
+        runtimeError(vm, "Cannot resume a running fiber.");
+        return FIBER_OP_ERROR;
+    }
+    if (target->status == FIBER_DEAD) {
+        runtimeError(vm, "Cannot resume a dead fiber.");
+        return FIBER_OP_ERROR;
+    }
+
+    // A guard-parked fiber resumes at the exact interrupted instruction;
+    // nothing in it is awaiting a value, so passing one is a misuse.
+    if (target->status == FIBER_PREEMPTED && has_value) {
+        runtimeError(vm, "Cannot pass a value when resuming a preempted fiber.");
+        return FIBER_OP_ERROR;
+    }
+
+    // The resume edge decides catchability: try marks it, plain call clears
+    // it. Recorded before any state changes so the error walk always sees
+    // the CURRENT edge's flavor.
+    target->called_by_try = as_try;
+
+    // Completion bounce: a fiber parked "after its last frame" (it
+    // tail-yielded from its top frame). Resuming it completes it, and the
+    // resume value IS its return value -- delivered straight back.
+    if (target->started && target->ctx.frame_count == 0) {
+        target->status = FIBER_DEAD;
+        target->fn = NULL;
+        fiberReleaseDeadContext(vm, target);
+        *out_direct = has_value ? value : NULL_VAL;
+        return FIBER_OP_DIRECT;
+    }
+
+    if (target->status == FIBER_NEW) {
+        // Strict arity, checked before any state changes (decision 3).
+        ObjFunction* function = target->fn->function;
+        int argc = has_value ? 1 : 0;
+        if (function->is_variadic) {
+            runtimeError(vm, "Fiber body cannot be a variadic function.");
+            return FIBER_OP_ERROR;
+        }
+        if (function->arity != argc) {
+            runtimeError(vm, "Fiber body expects %d argument%s but resume passed %d.",
+                         function->arity, function->arity == 1 ? "" : "s", argc);
+            return FIBER_OP_ERROR;
+        }
+    }
+
+    int awaiting;
+    if (!fiberParkCurrent(vm, &awaiting)) return FIBER_OP_ERROR;
+
+    ObjFiber* cur = vm->current_fiber;
+    if (cur != NULL) {
+        fiberCaptureContext(vm, &cur->ctx);
+        cur->awaiting_slot = awaiting;
+        // Status stays FIBER_RUNNING: an ancestor in the resume chain.
+    } else {
+        fiberCaptureContext(vm, &vm->root_parked.ctx);
+        vm->root_parked.awaiting_slot = awaiting;
+    }
+    target->resumer = cur;
+
+    ObjFiber* prev_fiber = vm->current_fiber;
+    if (target->status == FIBER_NEW) {
+        ObjClosure* closure = target->fn;
+        ObjFunction* function = closure->function;
+
+        fiberInstallContext(vm, &target->ctx);
+        fiberContextDisown(&target->ctx);
+        // Before ANY allocation below: a collection during the first-call
+        // framing must see the new world (target rooted as current, the
+        // parked previous context marked by ownership).
+        vm->current_fiber = target;
+        target->status = FIBER_RUNNING;
+
+        // First-call framing, mirroring OP(CALL) at callee_slot 0.
+        vm->stack[0] = OBJ_VAL(closure);
+        if (has_value) vm->stack[1] = value;
+        int needed_top = function->max_regs;
+        if (needed_top > vm->stack_capacity) {
+            // FIBER_STACK_INITIAL(64) -> max_regs (<=256): far below
+            // STACK_MAX; growth here cannot legitimately fail.
+            if (!growStackForCall(vm, needed_top, NULL)) {
+                // Undo the half-switch so the VM stays coherent.
+                FiberContext dying;
+                fiberCaptureContext(vm, &dying);
+                target->ctx = dying;
+                target->status = FIBER_NEW;
+                vm->current_fiber = prev_fiber;
+                if (cur != NULL) { fiberInstallContext(vm, &cur->ctx); fiberContextDisown(&cur->ctx); }
+                else { fiberInstallContext(vm, &vm->root_parked.ctx); fiberContextDisown(&vm->root_parked.ctx); }
+                return FIBER_OP_ERROR;
+            }
+        }
+        if (needed_top > vm->stack_top) vm->stack_top = needed_top;
+
+        CallFrame* frame = &vm->frames[vm->frame_count++];
+        frame->closure      = closure;
+        frame->ip           = NULL;   // no caller instruction inside the fiber
+        frame->stack_base   = 0;
+        frame->spill_base   = frameReserveSpills(vm, function->spill_count);
+        frame->caller_chunk = NULL;
+        frame->flags        = 0;
+        frame->arg_count    = (uint16_t)(has_value ? 1 : 0);
+        frame->preempt_id   = 0;
+
+        vm->current_frame = frame;
+        vm->cur_base = 0;
+        vm->chunk = &function->chunk;
+        vm->ip = function->chunk.code;
+        target->started = true;
+    } else {
+        int slot = target->awaiting_slot;
+        bool deliver = (target->status == FIBER_SUSPENDED) && slot >= 0;
+        fiberInstallContext(vm, &target->ctx);
+        fiberContextDisown(&target->ctx);
+        vm->current_fiber = target;
+        target->status = FIBER_RUNNING;
+        // Only a yield-parked fiber has an awaiting slot; a preempted one
+        // continues mid-expression with nothing to receive.
+        if (deliver) vm->stack[slot] = has_value ? value : NULL_VAL;
+    }
+
+    (void)prev_fiber;
+    return FIBER_OP_SWITCHED;
+}
+
+FiberOpResult fiberYield(VM* vm, Value value) {
+    ObjFiber* cur = vm->current_fiber;
+    if (cur == NULL) {
+        runtimeError(vm, "Cannot yield from the root context.");
+        return FIBER_OP_ERROR;
+    }
+    int awaiting;
+    if (!fiberParkCurrent(vm, &awaiting)) return FIBER_OP_ERROR;
+
+    fiberCaptureContext(vm, &cur->ctx);
+    cur->awaiting_slot = awaiting;
+    cur->status = FIBER_SUSPENDED;
+
+    ObjFiber* r = cur->resumer;
+    cur->resumer = NULL;   // consumed; re-recorded by the next resume
+    fiberDeliver(vm, r, value);
+    return FIBER_OP_SWITCHED;
+}
+
+// ---- Fiber error system (fiber_design.md decision 1) -----------------------
+
+// Find the try boundary for an error raised NOW: the nearest fiber on the
+// current resumer chain that was entered via a try-flavored resume. NULL
+// when the error is uncaught: no fiber running, no try on the chain, or a
+// live host call boundary in the current context (natives are atomic --
+// catching would teleport control across a C caller).
+static ObjFiber* fiberFindTryBoundary(VM* vm) {
+    if (vm->current_fiber == NULL) return NULL;
+    for (int i = vm->frame_count - 1; i >= 0; i--) {
+        if (vm->frames[i].flags & FRAME_FLAG_API_BOUNDARY) return NULL;
+    }
+    for (ObjFiber* f = vm->current_fiber; f != NULL; f = f->resumer) {
+        if (f->called_by_try) return f;
+    }
+    return NULL;
+}
+
+// Close a PARKED context's open upvalues in place (closeUpvalues() operates
+// on the ACTIVE list only). The error unwind kills fibers without running
+// their RETs, so every escaped closure must get its cell sealed before the
+// parked stack is freed.
+static void fiberCloseParkedUpvalues(FiberContext* c) {
+    for (ObjUpvalue* uv = c->open_upvalues; uv != NULL; ) {
+        ObjUpvalue* next = uv->next;
+        uv->closed = *uv->location;
+        uv->location = &uv->closed;
+        uv->next = NULL;
+        uv = next;
+    }
+    c->open_upvalues = NULL;
+}
+
+static void fiberReleaseFrameGuards(VM* vm, CallFrame* frames, int count, bool* released) {
+    for (int i = 0; i < count; i++) {
+        if (frameHoldsPreemptGuard(&frames[i])) {
+            frameClearPreemptGuards(vm, &frames[i]);
+            *released = true;
+        }
+    }
+}
+
+// Consume a pending caught error: kill the chain from the current fiber
+// down to the try boundary (each records the error, Wren-style), then
+// install the catcher and deliver null -- the catcher reads Fiber.error()
+// off the dead fiber it try-called. Runs from runChunk/runVM AFTER the
+// raising site has fully returned, so no site-local state writes can
+// clobber the switched context. Returns true if a catch was performed.
+static bool fiberErrorConsumeCatch(VM* vm) {
+    ObjFiber* top = vm->fiber_error_top;
+    if (top == NULL) return false;
+    vm->fiber_error_top = NULL;
+
+    // The error string first, while the (dying) context is still coherent
+    // for a collection.
+    ObjString* err = copyString(vm, vm->fiber_error_msg, vm->fiber_error_msg_len);
+    ZYM_FREE(&vm->allocator, vm->fiber_error_msg, (size_t)vm->fiber_error_msg_len + 1);
+    vm->fiber_error_msg = NULL;
+    vm->fiber_error_msg_len = 0;
+    pushTempRoot(vm, (Obj*)err);
+
+    // The ACTIVE dying context: seal its upvalues, release any guard
+    // bookkeeping its frames hold, and remember its arrays for the free
+    // after the switch.
+    bool released = false;
+    if (vm->open_upvalues != NULL) closeUpvalues(vm, vm->stack);
+    fiberReleaseFrameGuards(vm, vm->frames, vm->frame_count, &released);
+    Value* stack_mem      = vm->stack;
+    int    stack_cap      = vm->stack_capacity;
+    Value* spill_mem      = vm->spill_stack;
+    int    spill_cap      = vm->spill_capacity;
+    CallFrame* frames_mem = vm->frames;
+    int    frames_cap     = vm->frame_capacity;
+
+    ObjFiber* catcher = top->resumer;   // NULL = the root program
+
+    ObjFiber* f = vm->current_fiber;
+    while (f != NULL) {
+        f->error  = OBJ_VAL(err);
+        f->status = FIBER_DEAD;
+        f->fn     = NULL;
+        ObjFiber* next = (f == top) ? NULL : f->resumer;
+        f->resumer = NULL;
+        if (f == vm->current_fiber) {
+            fiberContextDisown(&f->ctx);   // active: arrays freed below
+        } else {
+            fiberCloseParkedUpvalues(&f->ctx);
+            fiberReleaseFrameGuards(vm, f->ctx.frames, f->ctx.frame_count, &released);
+            fiberReleaseDeadContext(vm, f);
+        }
+        f = next;
+    }
+    if (released) preemptArm(vm);
+
+    fiberDeliver(vm, catcher, NULL_VAL);
+    popTempRoot(vm);
+
+    FREE_ARRAY(vm, Value, stack_mem, stack_cap);
+    if (spill_mem != NULL) FREE_ARRAY(vm, Value, spill_mem, spill_cap);
+    FREE_ARRAY(vm, CallFrame, frames_mem, frames_cap);
+    return true;
+}
+
+// Called from the dispatch loop with the dying fiber's last frame already
+// popped and vm->* still holding its context. Installs the resumer and
+// delivers the return value; frees the dying context's arrays.
+static void fiberCompleteCurrent(VM* vm, Value return_value) {
+    ObjFiber* f = vm->current_fiber;
+
+    Value* stack_mem      = vm->stack;
+    int    stack_cap      = vm->stack_capacity;
+    Value* spill_mem      = vm->spill_stack;
+    int    spill_cap      = vm->spill_capacity;
+    CallFrame* frames_mem = vm->frames;
+    int    frames_cap     = vm->frame_capacity;
+
+    ObjFiber* r = f->resumer;
+    f->resumer = NULL;
+    f->status = FIBER_DEAD;
+    f->fn = NULL;
+    fiberContextDisown(&f->ctx);   // active context: already vacated, be sure
+
+    fiberDeliver(vm, r, return_value);
+
+    // Free after the install: the frees can trigger nothing (shrink path),
+    // and nothing references the dying arrays any more.
+    FREE_ARRAY(vm, Value, stack_mem, stack_cap);
+    if (spill_mem != NULL) FREE_ARRAY(vm, Value, spill_mem, spill_cap);
+    FREE_ARRAY(vm, CallFrame, frames_mem, frames_cap);
+}
+
+
 static InterpretResult run(VM* vm) {
 #define JUMP_ENTRY(op) [op] = &&CASE_##op
     static void* dispatch_table[] = {
@@ -1084,6 +1640,12 @@ static InterpretResult run(VM* vm) {
     register uint32_t* ip = vm->ip;
     register Value* stack = vm->stack;
     register int base = vm->cur_base;
+    // Frame storage cache: since fibers, vm->frames is a pointer (per-
+    // context storage), not an inline array. Cache it and its capacity in
+    // locals so CALL/RET pay no dependent load; reloaded wherever stack is
+    // (LOAD_STATE / RELOAD_STACK) and after any frame growth.
+    register CallFrame* frames = vm->frames;
+    register int frame_capacity = frame_capacity;
     register Value* constants = vm->chunk ? vm->chunk->constants.values : NULL;
     register uint32_t instr = 0;
     register Value* bp = stack + base;  // base pointer for direct register access
@@ -1110,7 +1672,8 @@ static InterpretResult run(VM* vm) {
         ? vm->spill_stack + (vm->current_frame ? vm->current_frame->spill_base : 0) \
         : NULL; \
 } while(0)
-#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; RELOAD_SP(); } while(0)
+#define LOAD_STATE()  do { ip = vm->ip; stack = vm->stack; base = vm->cur_base; bp = stack + base; constants = vm->chunk->constants.values; frames = vm->frames; frame_capacity = vm->frame_capacity; RELOAD_SP(); } while(0)
+
 
 #define OP(c) CASE_##c:
 #if ZYM_HAS_HOST_GUARD
@@ -1149,6 +1712,8 @@ static InterpretResult run(VM* vm) {
     stack = vm->stack; \
     bp = stack + base; \
     RELOAD_SP(); \
+    frames = vm->frames; \
+    frame_capacity = vm->frame_capacity; \
 } while(0)
 #define BINARY_OP(op) \
     do { \
@@ -2581,9 +3146,12 @@ static InterpretResult run(VM* vm) {
                 STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
             }
 
-            if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
-                STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
-                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            if (__builtin_expect(vm->frame_count >= frame_capacity, 0)) {
+                if (!growFramesForPush(vm)) {
+                    STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
+                    STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+                }
+                frames = vm->frames; frame_capacity = vm->frame_capacity;
             }
 
             // Calculate required stack size and grow if needed
@@ -2610,7 +3178,7 @@ static InterpretResult run(VM* vm) {
             }
 
             // Push frame
-            CallFrame* frame = &vm->frames[vm->frame_count++];
+            CallFrame* frame = &frames[vm->frame_count++];
             frame->closure      = closure;
             frame->ip           = ip;
             frame->stack_base   = callee_slot;
@@ -2666,6 +3234,15 @@ static InterpretResult run(VM* vm) {
             if (result == ZYM_ERROR) {
                 // Native function reported error via zym_runtimeError
                 return INTERPRET_RUNTIME_ERROR;
+            }
+
+            // Fiber switch: the native installed a different execution
+            // context; reload the loop's cached state and continue there
+            // instead of storing a result (delivery happens at the next
+            // switch, into the awaiting slot).
+            if (__builtin_expect(result == ZYM_FIBER_SWITCH, 0)) {
+                LOAD_STATE();
+                DISPATCH();
             }
 
             // Place result in callee slot
@@ -2724,6 +3301,11 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
+            if (__builtin_expect(result == ZYM_FIBER_SWITCH, 0)) {
+                LOAD_STATE();
+                DISPATCH();
+            }
+
             // Place result in callee slot
             stack[callee_slot] = result;
 
@@ -2751,9 +3333,12 @@ static InterpretResult run(VM* vm) {
                function->arity);
         #endif
 
-        if (__builtin_expect(vm->frame_count >= FRAMES_MAX, 0)) {
-            STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
-            STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+        if (__builtin_expect(vm->frame_count >= frame_capacity, 0)) {
+            if (!growFramesForPush(vm)) {
+                STORE_IP(); runtimeError(vm, "Stack overflow: maximum call depth (%d) reached.", FRAMES_MAX);
+                STORE_STATE(); return INTERPRET_RUNTIME_ERROR;
+            }
+            frames = vm->frames; frame_capacity = vm->frame_capacity;
         }
 
         int needed_top = callee_slot + function->max_regs;
@@ -2768,7 +3353,7 @@ static InterpretResult run(VM* vm) {
             vm->stack_top = needed_top;
         }
 
-        CallFrame* frame = &vm->frames[vm->frame_count++];
+        CallFrame* frame = &frames[vm->frame_count++];
         frame->closure      = closure;
         frame->ip           = ip;
         frame->stack_base   = callee_slot;
@@ -2976,6 +3561,16 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
+            // Fiber switch in tail position: fiberParkCurrent already
+            // performed this frame's tail-return on the outgoing context
+            // (the pop below is C code the parked ip could never resume
+            // into), so skip it entirely and continue in the installed
+            // context.
+            if (__builtin_expect(result == ZYM_FIBER_SWITCH, 0)) {
+                LOAD_STATE();
+                DISPATCH();
+            }
+
             // Tail position: return the native's result from the current frame.
             // Note: close upvalues only for the callee's own locals (stack_base + 1
             // upward). `stack_base` itself is the caller's slot that will receive
@@ -2989,9 +3584,9 @@ static InterpretResult run(VM* vm) {
             }
             vm->spill_top = frame->spill_base;   // release this frame's spills
             vm->frame_count--;
-            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            base = vm->frame_count == 0 ? 0 : frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
-            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            vm->current_frame = vm->frame_count == 0 ? NULL : &frames[vm->frame_count - 1];
             RELOAD_SP();  // returning to caller frame: recompute spill base
 
             // This pops a frame, so it owes the same guard release OP(RET)
@@ -2999,6 +3594,15 @@ static InterpretResult run(VM* vm) {
             // reuses the frame and keeps its flags for the eventual RET.)
             RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
+            // A fiber's LAST frame tail-returned a plain native's result:
+            // the fiber is complete. frame->ip/caller_chunk are NULL for a
+            // fiber's root frame -- restoring them would crash; deliver to
+            // the resumer instead.
+            if (__builtin_expect(vm->frame_count == 0 && vm->current_fiber != NULL, 0)) {
+                fiberCompleteCurrent(vm, result);
+                LOAD_STATE();
+                DISPATCH();
+            }
 
             ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
@@ -3046,6 +3650,13 @@ static InterpretResult run(VM* vm) {
                 return INTERPRET_RUNTIME_ERROR;
             }
 
+            // Same as the native tail path above: the outgoing frame is
+            // already retired by fiberParkCurrent.
+            if (__builtin_expect(result == ZYM_FIBER_SWITCH, 0)) {
+                LOAD_STATE();
+                DISPATCH();
+            }
+
             // Tail position: return the native closure's result from the current frame.
             // See OP(RET) / native tail-return note: `stack_base` is the caller's
             // result slot; only close upvalues at `stack_base + 1` and above so
@@ -3058,14 +3669,23 @@ static InterpretResult run(VM* vm) {
             }
             vm->spill_top = frame->spill_base;   // release this frame's spills
             vm->frame_count--;
-            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            base = vm->frame_count == 0 ? 0 : frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
-            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            vm->current_frame = vm->frame_count == 0 ? NULL : &frames[vm->frame_count - 1];
             RELOAD_SP();  // returning to caller frame: recompute spill base
 
             // Same obligation as the native tail-return path above.
             RELEASE_FRAME_PREEMPT_GUARDS(frame);
 
+            // A fiber's LAST frame tail-returned a plain native's result:
+            // the fiber is complete. frame->ip/caller_chunk are NULL for a
+            // fiber's root frame -- restoring them would crash; deliver to
+            // the resumer instead.
+            if (__builtin_expect(vm->frame_count == 0 && vm->current_fiber != NULL, 0)) {
+                fiberCompleteCurrent(vm, result);
+                LOAD_STATE();
+                DISPATCH();
+            }
 
             ip    = frame->ip;
             vm->chunk = frame->caller_chunk;
@@ -3157,9 +3777,9 @@ static InterpretResult run(VM* vm) {
             // Restore base/current_frame to whatever was active before
             // zym_call_execute pushed this boundary; the C side will
             // overwrite vm->current_frame from its saved snapshot.
-            base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+            base = vm->frame_count == 0 ? 0 : frames[vm->frame_count - 1].stack_base;
             bp = stack + base;
-            vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+            vm->current_frame = vm->frame_count == 0 ? NULL : &frames[vm->frame_count - 1];
             RELEASE_FRAME_PREEMPT_GUARDS(frame);
             STORE_STATE();
             return INTERPRET_OK;
@@ -3168,12 +3788,22 @@ static InterpretResult run(VM* vm) {
         // Now pop the callee frame
         vm->spill_top = frame->spill_base;   // release this frame's spills
         vm->frame_count--;
-        base = vm->frame_count == 0 ? 0 : vm->frames[vm->frame_count - 1].stack_base;
+        base = vm->frame_count == 0 ? 0 : frames[vm->frame_count - 1].stack_base;
         bp = stack + base;
-        vm->current_frame = vm->frame_count == 0 ? NULL : &vm->frames[vm->frame_count - 1];
+        vm->current_frame = vm->frame_count == 0 ? NULL : &frames[vm->frame_count - 1];
         RELOAD_SP();  // returning to caller frame: recompute spill base
 
         RELEASE_FRAME_PREEMPT_GUARDS(frame);
+
+        // A fiber's last frame returned: the fiber is complete. Deliver the
+        // return value to the resumer and continue dispatching there --
+        // run() does NOT exit (that is the root program's RET, guarded at
+        // the top of this opcode).
+        if (__builtin_expect(vm->frame_count == 0 && vm->current_fiber != NULL, 0)) {
+            fiberCompleteCurrent(vm, return_value);
+            LOAD_STATE();
+            DISPATCH();
+        }
 
         // Normal return: restore caller context
         ip    = frame->ip;
@@ -4017,7 +4647,11 @@ static InterpretResult run(VM* vm) {
 }
 
 InterpretResult runVM(VM* vm) {
-    return run(vm);
+    InterpretResult result = run(vm);
+    while (result == INTERPRET_RUNTIME_ERROR && fiberErrorConsumeCatch(vm)) {
+        result = run(vm);
+    }
+    return result;
 }
 
 InterpretResult runChunk(VM* vm, Chunk* chunk) {
@@ -4042,7 +4676,11 @@ InterpretResult runChunk(VM* vm, Chunk* chunk) {
     disassembleChunk(chunk, "Bytecode");
 #endif
 
-    return run(vm);
+    InterpretResult result = run(vm);
+    while (result == INTERPRET_RUNTIME_ERROR && fiberErrorConsumeCatch(vm)) {
+        result = run(vm);
+    }
+    return result;
 }
 
 // Resolve `functionName` against the runtime's three storage paths in
@@ -4157,7 +4795,7 @@ InterpretResult zym_call_execute(VM* vm, int argCount) {
         return INTERPRET_RUNTIME_ERROR;
     }
 
-    if (vm->frame_count == FRAMES_MAX) {
+    if (vm->frame_count >= vm->frame_capacity && !growFramesForPush(vm)) {
         runtimeError(vm, "Stack overflow.");
         vm->api_stack_top = frame_base;
         return INTERPRET_RUNTIME_ERROR;

@@ -225,6 +225,41 @@ static void markRoots(VM* vm) {
         markValue(vm, vm->spill_stack[i]);
     }
 
+    // Fibers. The running fiber object (and through it the whole resumer
+    // chain) is a root; the ROOT program's parked context is stored in the
+    // VM itself rather than in any object, so it is walked here whenever a
+    // fiber is active.
+    if (vm->current_fiber != NULL) {
+        markObject(vm, (Obj*)vm->current_fiber);
+    }
+    // Keyed on the OWNERSHIP invariant, not on current_fiber: mid-switch
+    // (inside fiberResume, before current_fiber is updated) the root is
+    // already parked and its context would otherwise be invisible to a
+    // collection triggered by the first-call framing's allocations.
+    {
+        FiberContext* rc = &vm->root_parked.ctx;
+        if (rc->stack) {
+            for (int i = 0; i < rc->stack_top; i++) markValue(vm, rc->stack[i]);
+        }
+        if (rc->spill_stack) {
+            for (int i = 0; i < rc->spill_top; i++) markValue(vm, rc->spill_stack[i]);
+        }
+        if (rc->frames) {
+            for (int i = 0; i < rc->frame_count; i++) {
+                if (rc->frames[i].closure) markObject(vm, (Obj*)rc->frames[i].closure);
+                if (rc->frames[i].caller_chunk) markChunk(vm, rc->frames[i].caller_chunk);
+            }
+        }
+        for (ObjUpvalue* uv = rc->open_upvalues; uv != NULL; uv = uv->next) {
+            markObject(vm, (Obj*)uv);
+        }
+        // The parked root's CHUNK: the main program's constants (function
+        // templates above all) are reachable through nothing else -- no
+        // closure wraps the root chunk. Without this, running a fiber
+        // sweeps the root program's own functions.
+        if (rc->chunk) markChunk(vm, rc->chunk);
+    }
+
     // Every live preemption entry's callback. The table is the only thing
     // referring to a handler registered as an anonymous closure -- nothing on
     // the stack, in globals, or in a frame holds it once the registering
@@ -538,6 +573,39 @@ static void blackenObject(VM* vm, Obj* object) {
             break;
         }
 
+        case OBJ_FIBER: {
+            // A parked fiber's whole context is a root: registers, spills,
+            // frames' closures and caller chunks, and its open-upvalue list
+            // (the sorted list is per-fiber -- see fiber_context.h). A
+            // RUNNING fiber's ctx pointers are NULL (ownership lives in the
+            // VM fields, which markRoots already walks), so the guards
+            // below make this case a no-op for it.
+            ObjFiber* fiber = (ObjFiber*)object;
+            if (fiber->fn) markObject(vm, (Obj*)fiber->fn);
+            if (fiber->resumer) markObject(vm, (Obj*)fiber->resumer);
+            markValue(vm, fiber->error);
+            FiberContext* c = &fiber->ctx;
+            if (c->stack) {
+                for (int i = 0; i < c->stack_top; i++) markValue(vm, c->stack[i]);
+            }
+            if (c->spill_stack) {
+                for (int i = 0; i < c->spill_top; i++) markValue(vm, c->spill_stack[i]);
+            }
+            if (c->frames) {
+                for (int i = 0; i < c->frame_count; i++) {
+                    if (c->frames[i].closure) markObject(vm, (Obj*)c->frames[i].closure);
+                    if (c->frames[i].caller_chunk) markChunk(vm, c->frames[i].caller_chunk);
+                }
+            }
+            for (ObjUpvalue* uv = c->open_upvalues; uv != NULL; uv = uv->next) {
+                markObject(vm, (Obj*)uv);
+            }
+            // Usually redundant (reachable via fn / frame closures), but a
+            // parked context's chunk pointer must never dangle: mark it.
+            if (c->chunk) markChunk(vm, c->chunk);
+            break;
+        }
+
     }
 }
 
@@ -683,6 +751,20 @@ void freeObject(VM* vm, Obj* object) {
                 FREE_ARRAY(vm, ObjString*, schema->variant_names, schema->variant_count);
             }
             FREE(vm, ObjEnumSchema, object);
+            break;
+        }
+
+        case OBJ_FIBER: {
+            // Frees whatever the ownership invariant left here: a parked
+            // fiber owns its arrays; a running or eagerly-released one has
+            // NULLs (the VM fields / fiberReleaseDeadContext own or freed
+            // them).
+            ObjFiber* fiber = (ObjFiber*)object;
+            FiberContext* c = &fiber->ctx;
+            if (c->stack)       FREE_ARRAY(vm, Value, c->stack, c->stack_capacity);
+            if (c->spill_stack) FREE_ARRAY(vm, Value, c->spill_stack, c->spill_capacity);
+            if (c->frames)      FREE_ARRAY(vm, CallFrame, c->frames, c->frame_capacity);
+            FREE(vm, ObjFiber, object);
             break;
         }
 

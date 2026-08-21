@@ -17,8 +17,8 @@ typedef struct Table {
     Entry* entries;
 } Table;
 typedef struct CallFrame CallFrame;
-typedef struct PromptEntry PromptEntry;
-typedef struct ResumeContext ResumeContext;
+
+#include "./fiber_context.h"
 
 #define isObjType(value, objectType) (IS_OBJ(value) && AS_OBJ(value)->type == objectType)
 #define OBJ_TYPE(value)     (AS_OBJ(value)->type)
@@ -33,6 +33,7 @@ typedef struct ResumeContext ResumeContext;
 #define IS_LIST(value)        isObjType(value, OBJ_LIST)
 #define IS_MAP(value)         isObjType(value, OBJ_MAP)
 #define IS_DISPATCHER(value)  isObjType(value, OBJ_DISPATCHER)
+#define IS_FIBER(value)       isObjType(value, OBJ_FIBER)
 #define IS_STRUCT_SCHEMA(value) isObjType(value, OBJ_STRUCT_SCHEMA)
 #define IS_STRUCT_INSTANCE(value) isObjType(value, OBJ_STRUCT_INSTANCE)
 #define IS_ENUM_SCHEMA(value) isObjType(value, OBJ_ENUM_SCHEMA)
@@ -48,6 +49,7 @@ typedef struct ResumeContext ResumeContext;
 #define AS_LIST(value)        ((ObjList*)AS_OBJ(value))
 #define AS_MAP(value)         ((ObjMap*)AS_OBJ(value))
 #define AS_DISPATCHER(value)  ((ObjDispatcher*)AS_OBJ(value))
+#define AS_FIBER(value)       ((ObjFiber*)AS_OBJ(value))
 #define AS_STRUCT_SCHEMA(value) ((ObjStructSchema*)AS_OBJ(value))
 #define AS_STRUCT_INSTANCE(value) ((ObjStructInstance*)AS_OBJ(value))
 #define AS_ENUM_SCHEMA(value) ((ObjEnumSchema*)AS_OBJ(value))
@@ -67,6 +69,7 @@ typedef enum {
     OBJ_STRUCT_SCHEMA,
     OBJ_STRUCT_INSTANCE,
     OBJ_ENUM_SCHEMA,
+    OBJ_FIBER,
 } ObjType;
 
 struct Obj {
@@ -222,6 +225,43 @@ typedef struct ObjEnumSchema {
     int variant_count;
     ObjString** variant_names;
 } ObjEnumSchema;
+
+// ---- Fibers ---------------------------------------------------------------
+// A fiber owns a full execution context (see fiber_context.h) plus the
+// control links of the symmetric switch mechanism: `resumer` is written by
+// call/resume and consumed by yield/completion. NULL means "the root
+// program" at launch (fibers cannot yet be entered any other way); the
+// transfer-era will need a distinct encoding.
+
+typedef enum {
+    FIBER_NEW,        // created, never run
+    FIBER_RUNNING,    // executing now, or an ancestor in the resume chain
+    FIBER_SUSPENDED,  // parked at a yield; awaiting_slot is meaningful
+    FIBER_PREEMPTED,  // parked BY THE GUARD mid-flight; resume takes no value
+    FIBER_DEAD,       // completed (or failed, once the error system lands)
+} FiberStatus;
+
+typedef struct ObjFiber {
+    Obj obj;
+    FiberContext ctx;          // parked context; arrays NULL while active
+    ObjClosure* fn;            // the body; NULL after the fiber dies
+    struct ObjFiber* resumer;  // who to return to; NULL = root program
+    FiberStatus status;
+    bool started;              // first call has happened
+    // Error system (fiber-try, see fiber_design.md decision 1): set when
+    // this fiber was entered via a try-flavored resume; consulted by the
+    // error unwind to find the catch boundary. `error` records the error
+    // that killed this fiber (NULL_VAL if it died cleanly or is alive) --
+    // every fiber the unwind kills records the SAME error, Wren-style.
+    bool called_by_try;
+    Value error;
+    // Stack slot in ctx.stack where the next incoming value lands: the
+    // callee slot of the call/yield this fiber suspended at (decoded from
+    // the instruction behind the saved ip -- the shield/capture idiom).
+    int awaiting_slot;
+} ObjFiber;
+
+ObjFiber* newFiber(VM* vm, ObjClosure* fn);
 
 ObjFunction* newFunction(VM* vm);
 ObjNativeFunction* newNativeFunction(VM* vm, ObjString* name, int arity, void* func_ptr, NativeDispatcher dispatcher);

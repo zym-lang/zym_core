@@ -42,6 +42,7 @@ set(ZYM_CORE_SOURCES
         ${ZYM_ROOT}/src/sourcemap.c
         ${ZYM_ROOT}/src/modules/core_modules.c
         ${ZYM_ROOT}/src/modules/preemption.c
+        ${ZYM_ROOT}/src/modules/fiber.c
         ${ZYM_ROOT}/src/natives/core_natives.c
         ${ZYM_ROOT}/src/natives/gc_native.c
         ${ZYM_ROOT}/src/natives/conversions.c

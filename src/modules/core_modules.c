@@ -1,5 +1,5 @@
 #include "core_modules.h"
-#include "preemption.h"
+#include "fiber.h"
 #include "../natives/core_natives.h"
 
 // ============================================================================
@@ -7,5 +7,6 @@
 // ============================================================================
 
 void setupCoreModules(VM* vm) {
+    registerFiberModule(vm);
     setupCoreNatives(vm);
 }

@@ -38,6 +38,7 @@ set(ZYM_CORE_SOURCES
     src/sourcemap.c
     src/modules/core_modules.c
     src/modules/preemption.c
+    src/modules/fiber.c
     src/natives/core_natives.c
     src/natives/gc_native.c
     src/natives/conversions.c

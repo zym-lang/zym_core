@@ -180,6 +180,9 @@ static void printValueHelper(VM* vm, FILE* f, Value value, Obj** visited, int de
             case OBJ_DISPATCHER:
                 fprintf(f, "<overloaded function>");
                 break;
+            case OBJ_FIBER:
+                fprintf(f, "<fiber>");
+                break;
             case OBJ_MAP: {
                     ObjMap* map = AS_MAP(value);
                     fprintf(f, "{");
@@ -293,6 +296,8 @@ Value cloneValue(VM* vm, Value value) {
             case OBJ_UPVALUE:
             case OBJ_INT64:
             case OBJ_DISPATCHER:
+                return value;
+            case OBJ_FIBER:
                 return value;
             case OBJ_STRUCT_SCHEMA:
                 return value;
@@ -466,6 +471,7 @@ static Value deepCloneHelper(VM* vm, Value value, CloneMap* visited, int depth) 
         case OBJ_DISPATCHER:
         case OBJ_STRUCT_SCHEMA:
         case OBJ_ENUM_SCHEMA:
+        case OBJ_FIBER:
             return value;
 
         default:

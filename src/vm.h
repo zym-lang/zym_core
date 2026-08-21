@@ -9,6 +9,7 @@
 #include "./allocator.h"
 #include "./source_file.h"
 #include "./diagnostics.h"
+#include "./fiber_context.h"
 #include <signal.h> /* sig_atomic_t for compile cancellation flag */
 #include <setjmp.h> /* non-local exit on unrecoverable allocation failure */
 
@@ -48,6 +49,16 @@
 #define STACK_MAX 65536
 #endif
 #define STACK_INITIAL 256
+// Per-fiber context starting sizes. Small on purpose: a parked fiber's
+// budget is the initial stack + a frames array + header, order 1-1.5KB.
+// Both grow geometrically toward the same ceilings as the root context
+// (STACK_MAX / FRAMES_MAX).
+#ifndef FIBER_STACK_INITIAL
+#define FIBER_STACK_INITIAL 64
+#endif
+#ifndef FIBER_FRAMES_INITIAL
+#define FIBER_FRAMES_INITIAL 16
+#endif
 // ---- Preemption entry table ---------------------------------------------
 // Fixed size, no allocation: registration fails when full. Keeps the MCU
 // profile honest.
@@ -62,6 +73,10 @@
 #endif
 
 #define ZYM_PREEMPT_F_ONESHOT   (1u << 1)  // do not rearm after firing
+#define ZYM_PREEMPT_F_PARK_FIBER (1u << 2) // on expiry: force-yield the
+                                           // running fiber to its resumer
+                                           // (status preempted) instead of
+                                           // suspending the whole VM
 
 typedef struct {
     int32_t  slice;        // rearm value; 0 means the slot is free
@@ -130,10 +145,43 @@ typedef struct VM {
     ValueArray globalSlots;
     Table strings;
 
-    CallFrame frames[FRAMES_MAX];
+    // Frame storage for the ACTIVE context. Points at root_frames for the
+    // root program; at a fiber's own (growable) array while that fiber
+    // runs. Root never grows past FRAMES_MAX -- identical semantics to
+    // the historical inline array.
+    CallFrame* frames;
+    int frame_capacity;
     int frame_count;
     int cur_base;
     CallFrame* current_frame;
+    CallFrame root_frames[FRAMES_MAX];
+
+    // Fibers. current_fiber == NULL means the root program is running.
+    // While a fiber runs, the root's parked context lives in root_parked
+    // (its awaiting slot alongside); the running fiber's ctx array
+    // pointers are NULLed (ownership moved into the VM fields) -- see
+    // fiber_context.h for the ownership invariant.
+    struct ObjFiber* current_fiber;
+    struct {
+        FiberContext ctx;
+        int awaiting_slot;
+    } root_parked;
+
+    // Fiber error system. When runtimeError finds a try boundary on the
+    // resumer chain (and host policy says propagate), it stashes the
+    // message and the boundary here and skips reporting; the run loop
+    // (runChunk/runVM) performs the unwind AFTER the raising site has
+    // returned, then re-enters dispatch in the catcher. Raw allocator
+    // memory, never GC.
+    struct ObjFiber* fiber_error_top;   // try-called fiber whose resumer catches
+    char* fiber_error_msg;
+    int fiber_error_msg_len;
+    // Host error-policy hook (zym_setErrorPolicy). Fires once at every
+    // runtime error's origin, before any unwinding. NOT guard-gated:
+    // error policy exists in every build.
+    ZymErrorDisposition (*error_policy)(struct VM* vm, const char* message,
+                                        bool would_be_caught, void* user_data);
+    void* error_policy_user_data;
 
     Obj* objects;
     ObjUpvalue* open_upvalues;
@@ -306,6 +354,34 @@ bool globalSet(VM* vm, ObjString* name, Value value);
 
 InterpretResult runVM(VM* vm);
 InterpretResult runChunk(VM* vm, Chunk* chunk);
+
+// ---- Fiber switching (vm.c owns the machinery; modules/fiber.c is the
+// script surface) ----------------------------------------------------------
+// The switch sentinel: a native that has installed a different execution
+// context returns this instead of a result; the native-call sites respond
+// with LOAD_STATE() + DISPATCH() rather than storing a value. Internal
+// contract between modules/fiber.c and vm.c only -- never a script value,
+// never public API. (Reuses the NaN tag the removed control-transfer
+// sentinel held, tag 6.)
+#define ZYM_FIBER_SWITCH ((Value)0x7ff8000000000006ULL)
+
+struct ObjFiber;
+
+typedef enum {
+    FIBER_OP_ERROR,     // runtimeError already reported; native returns ZYM_ERROR
+    FIBER_OP_SWITCHED,  // context installed; native returns ZYM_FIBER_SWITCH
+    FIBER_OP_DIRECT,    // no switch happened; native returns *out_direct
+} FiberOpResult;
+
+// Resume `target` with `value` (has_value false when the call passed
+// none). Handles first-call framing, awaiting-slot delivery, and the
+// completion bounce (resuming a started fiber with no frames left).
+FiberOpResult fiberResume(VM* vm, struct ObjFiber* target, Value value,
+                          bool has_value, bool as_try, Value* out_direct);
+
+// Yield `value` from the current fiber to its resumer. Errors from the
+// root context.
+FiberOpResult fiberYield(VM* vm, Value value);
 
 bool zym_call_prepare(VM* vm, const char* functionName, int arity);
 

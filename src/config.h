@@ -19,6 +19,17 @@ typedef struct CompilerConfig {
 
 typedef CompilerConfig ZymCompilerConfig;
 
+// Host error-policy disposition (zym_setErrorPolicy). Returned by the
+// policy hook, which fires once at every runtime error's origin. Only
+// consulted when a try boundary exists (`would_be_caught` true): PROPAGATE
+// lets the fiber-try catch proceed; FAIL_VM overrides script handling and
+// fails the VM exactly as an uncaught error does. For uncaught errors the
+// hook still fires (observation), but the VM fails either way.
+typedef enum {
+    ZYM_ERR_PROPAGATE = 0,
+    ZYM_ERR_FAIL_VM   = 1,
+} ZymErrorDisposition;
+
 typedef enum {
     ZYM_STATUS_OK,
     ZYM_STATUS_COMPILE_ERROR,

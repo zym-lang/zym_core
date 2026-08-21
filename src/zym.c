@@ -66,6 +66,13 @@ void zym_setErrorCallback(ZymVM* vm, ZymErrorCallback callback, void* user_data)
     vm->error_user_data = user_data;
 }
 
+void zym_setErrorPolicy(ZymVM* vm, ZymErrorPolicy policy, void* user_data)
+{
+    if (vm == NULL) return;
+    vm->error_policy = policy;
+    vm->error_policy_user_data = user_data;
+}
+
 // =============================================================================
 // STRUCTURED DIAGNOSTICS (Phase 1.3)
 // =============================================================================
@@ -1341,7 +1348,8 @@ ZymPreemptId zym_preemptRegister(ZymVM* vm, int slice,
                                  ZymValue callback, uint32_t flags) {
     if (vm == NULL) return 0;
     uint8_t f = 0;
-    if (flags & ZYM_PREEMPT_ONESHOT) f |= ZYM_PREEMPT_F_ONESHOT;
+    if (flags & ZYM_PREEMPT_ONESHOT)    f |= ZYM_PREEMPT_F_ONESHOT;
+    if (flags & ZYM_PREEMPT_PARK_FIBER) f |= ZYM_PREEMPT_F_PARK_FIBER;
     return preemptRegister(vm, slice, callback, f);
 }
 
@@ -1809,6 +1817,7 @@ const char* zym_typeName(ZymValue value) {
             case OBJ_STRUCT_SCHEMA: return "struct_schema";
             case OBJ_STRUCT_INSTANCE: return "struct";
             case OBJ_ENUM_SCHEMA: return "enum_schema";
+            case OBJ_FIBER: return "fiber";
             case OBJ_DISPATCHER: return "dispatcher";
             default: return "unknown";
         }
@@ -1988,6 +1997,10 @@ static bool valueToStringHelper(VM* vm, Value value, char** buffer, size_t* buf_
             }
             case OBJ_DISPATCHER: {
                 APPEND("<dispatcher>", 12);
+                break;
+            }
+            case OBJ_FIBER: {
+                APPEND("<fiber>", 7);
                 break;
             }
             default: {
